@@ -1,0 +1,33 @@
+[project]
+name = "gist"
+version = "0.1.0"
+description = "Local-first therapy session transcription and clinical note generation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0.0",
+    "faster-whisper>=1.0.0",
+    "mlx-lm>=0.31.0",
+    "transformers>=5.0.0,<5.13.0",
+    "huggingface-hub>=0.20.0",
+    "tqdm>=4.60.0",
+]
+
+[project.scripts]
+gist = "gist.__main__:cli"
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gist"]
+
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.21.0",
+]

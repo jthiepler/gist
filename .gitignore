@@ -1,0 +1,35 @@
+.DS_Store
+
+# Node / Svelte
+node_modules
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Python
+.venv
+__pycache__/
+*.pyc
+*.pyo
+/dist
+
+# PyInstaller sidecar build output
+/dist/counselor-sidecar
+/dist/gist-sidecar
+/src-tauri/resources/counselor-sidecar
+/src-tauri/resources/gist-sidecar
+
+# Rust / Tauri
+/src-tauri/target
+/src-tauri/gen
+
+# Logs
+*.log
+
+# Test scratch
+test*.md
