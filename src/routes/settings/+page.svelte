@@ -1,33 +1,40 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listModels, downloadModel, getSetting, setSetting } from "$lib/rpc";
+  import {
+    listModels, downloadModel, getSetting, setSetting,
+    isRunning, startSidecar, stopSidecar,
+  } from "$lib/rpc";
   import { sidecarRunning, progressPercent, progressStage } from "$lib/stores";
-  import { isRunning, startSidecar, stopSidecar } from "$lib/rpc";
+  import { ensureSidecar } from "$lib/ensureSidecar";
   import type { ModelsResult } from "$lib/types";
-  import ProgressBar from "$lib/components/ProgressBar.svelte";
-  import Card from "$lib/components/Card.svelte";
 
   let models = $state<ModelsResult | null>(null);
   let downloading = $state("");
   let defaultFormat = $state("soap");
-  let selectedLlm = $state("qwen-3.5-4b");
-  let selectedTranscription = $state("whisper-base");
+  let thinking = $state(false);
+  let selectedLlm = $state("");
+  let selectedTranscription = $state("");
   let error = $state("");
   let saved = $state(false);
+  let showDebug = $state(false);
 
   onMount(async () => {
-    try {
-      const running = await isRunning();
-      sidecarRunning.set(running);
-    } catch {}
+    const ok = await ensureSidecar();
+    if (!ok) {
+      error = "Failed to start the processing engine.";
+      return;
+    }
 
     try {
       models = await listModels();
-    } catch {
-      // Sidecar not running
-    }
+      if (models && Object.keys(models.llm).length > 0) {
+        selectedLlm = Object.keys(models.llm)[0];
+      }
+      if (models && Object.keys(models.transcription).length > 0) {
+        selectedTranscription = Object.keys(models.transcription)[0];
+      }
+    } catch {}
 
-    // Load saved settings
     try {
       const fmt = await getSetting("default_format");
       if (fmt) defaultFormat = fmt;
@@ -35,6 +42,8 @@
       if (llm) selectedLlm = llm;
       const tr = await getSetting("default_transcription");
       if (tr) selectedTranscription = tr;
+      const th = await getSetting("thinking");
+      if (th !== null) thinking = th === "true";
     } catch {}
   });
 
@@ -43,15 +52,8 @@
     progressPercent.set(0);
     progressStage.set("Starting download...");
 
-    const ok = await ensureSidecarStart();
-    if (!ok) {
-      downloading = "";
-      return;
-    }
-
     try {
       await downloadModel(model, kind);
-      error = "";
       saved = true;
       setTimeout(() => saved = false, 3000);
     } catch (e) {
@@ -63,178 +65,204 @@
     }
   }
 
-  async function ensureSidecarStart(): Promise<boolean> {
-    try {
-      const running = await isRunning();
-      if (running) {
-        sidecarRunning.set(true);
-        return true;
-      }
-      await startSidecar();
-      sidecarRunning.set(true);
-      return true;
-    } catch (e) {
-      error = String(e);
-      return false;
-    }
-  }
-
-  async function handleStart() {
-    try {
-      await startSidecar();
-      sidecarRunning.set(true);
-      if (!models) {
-        models = await listModels();
-      }
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function handleStop() {
-    try {
-      await stopSidecar();
-      sidecarRunning.set(false);
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function saveSettings() {
+  async function savePreferences() {
     try {
       await setSetting("default_format", defaultFormat);
       await setSetting("default_llm", selectedLlm);
       await setSetting("default_transcription", selectedTranscription);
+      await setSetting("thinking", thinking.toString());
       saved = true;
       setTimeout(() => saved = false, 3000);
     } catch (e) {
       error = String(e);
     }
   }
+
+  async function handleRestart() {
+    try {
+      await stopSidecar();
+      sidecarRunning.set(false);
+      await startSidecar();
+      sidecarRunning.set(true);
+    } catch (e) {
+      error = String(e);
+    }
+  }
 </script>
 
-<div class="page-header">
+<div class="workspace-header">
   <h2>Settings</h2>
-  <p>Configure models and preferences</p>
 </div>
 
 {#if error}
-  <div class="card" style="border-color: var(--error);">
-    <p style="color: var(--error); font-size: 13px;">{error}</p>
-  </div>
+  <div class="error-banner">{error}</div>
 {/if}
 
 {#if saved}
-  <div class="card" style="border-color: var(--success);">
-    <p style="color: var(--success); font-size: 13px;">Saved.</p>
-  </div>
+  <div class="success-banner">Saved.</div>
 {/if}
 
-<Card title="Sidecar">
-  <div class="toggle-row">
-    <span style="font-size: 13px;">Status: {$sidecarRunning ? "Running" : "Stopped"}</span>
-    {#if $sidecarRunning}
-      <button class="btn btn-danger" onclick={handleStop}>Stop Sidecar</button>
-    {:else}
-      <button class="btn btn-primary" onclick={handleStart}>Start Sidecar</button>
+<!-- Models -->
+<div class="settings-section">
+  <h3>Models</h3>
+
+  {#if models}
+    <div style="margin-bottom: 24px;">
+      <div class="settings-row" style="border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px; margin-bottom: 8px;">
+        <strong style="font-size: 13px; color: var(--text-muted);">LLM</strong>
+      </div>
+      <table class="model-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Backend</th>
+            <th>Size</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each Object.entries(models.llm) as [name, info]}
+            <tr>
+              <td>{info.display}</td>
+              <td>{info.backend}</td>
+              <td>{info.size_gb} GB</td>
+              <td>
+                <button
+                  class="btn btn-sm"
+                  onclick={() => handleDownload(name, "llm")}
+                  disabled={downloading === name}
+                >
+                  {downloading === name ? "Downloading..." : "Download"}
+                </button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+
+    <div>
+      <div class="settings-row" style="border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px; margin-bottom: 8px;">
+        <strong style="font-size: 13px; color: var(--text-muted);">Transcription</strong>
+      </div>
+      <table class="model-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Backend</th>
+            <th>Size</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each Object.entries(models.transcription) as [name, info]}
+            <tr>
+              <td>{info.display}</td>
+              <td>{info.backend}</td>
+              <td>{info.size_gb} GB</td>
+              <td>
+                <button
+                  class="btn btn-sm"
+                  onclick={() => handleDownload(name, "transcription")}
+                  disabled={downloading === name}
+                >
+                  {downloading === name ? "Downloading..." : "Download"}
+                </button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+
+    {#if downloading}
+      <div style="margin-top: 16px;">
+        <div class="progress-bar">
+          <div class="progress-bar-fill" style="width: {$progressPercent}%;"></div>
+        </div>
+        <div class="progress-label">{$progressStage} ({$progressPercent}%)</div>
+      </div>
+    {/if}
+  {:else}
+    <p class="text-muted">Loading models...</p>
+  {/if}
+</div>
+
+<!-- Preferences -->
+<div class="settings-section">
+  <h3>Preferences</h3>
+
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Default Note Format</div>
+      <div class="setting-desc">Used when creating new sessions</div>
+    </div>
+    <select bind:value={defaultFormat} style="width: 180px;">
+      <option value="soap">SOAP</option>
+      <option value="cbt">CBT</option>
+      <option value="intake">Intake</option>
+    </select>
+  </div>
+
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Reasoning (Thinking)</div>
+      <div class="setting-desc">Enables extended reasoning before generating the note</div>
+    </div>
+    <div class="toggle" class:active={thinking} onclick={() => thinking = !thinking}>
+      <div class="toggle-knob"></div>
+    </div>
+  </div>
+
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Default LLM Model</div>
+      <div class="setting-desc">Used for note generation</div>
+    </div>
+    <select bind:value={selectedLlm} style="width: 180px;">
+      {#if models}
+        {#each Object.entries(models.llm) as [name, info]}
+          <option value={name}>{info.display}</option>
+        {/each}
+      {/if}
+    </select>
+  </div>
+
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Default Transcription Model</div>
+      <div class="setting-desc">Used for audio transcription</div>
+    </div>
+    <select bind:value={selectedTranscription} style="width: 180px;">
+      {#if models}
+        {#each Object.entries(models.transcription) as [name, info]}
+          <option value={name}>{info.display}</option>
+        {/each}
+      {/if}
+    </select>
+  </div>
+
+  <div style="margin-top: 16px;">
+    <button class="btn btn-primary" onclick={savePreferences}>Save Preferences</button>
+  </div>
+</div>
+
+<!-- Debug -->
+<div class="settings-section">
+  <div class="debug-section">
+    <button class="debug-toggle" onclick={() => showDebug = !showDebug}>
+      <span>Advanced</span>
+      <span>{showDebug ? "▾" : "▸"}</span>
+    </button>
+
+    {#if showDebug}
+      <div class="debug-content">
+        <div class="debug-row">
+          <span class="status-dot" class:running={$sidecarRunning} class:stopped={!$sidecarRunning}></span>
+          <span>Engine: {$sidecarRunning ? "Running" : "Stopped"}</span>
+          <button class="btn btn-sm" onclick={handleRestart} style="margin-left: auto;">Restart</button>
+        </div>
+      </div>
     {/if}
   </div>
-</Card>
-
-{#if models}
-  <Card title="LLM Models">
-    <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-      <thead>
-        <tr style="border-bottom: 1px solid var(--border); text-align: left;">
-          <th style="padding: 8px 12px;">Name</th>
-          <th style="padding: 8px 12px;">Backend</th>
-          <th style="padding: 8px 12px;">Size</th>
-          <th style="padding: 8px 12px;">Action</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each Object.entries(models.llm) as [name, info]}
-          <tr style="border-bottom: 1px solid var(--border);">
-            <td style="padding: 8px 12px;">{info.display}</td>
-            <td style="padding: 8px 12px;">{info.backend}</td>
-            <td style="padding: 8px 12px;">{info.size_gb} GB</td>
-            <td style="padding: 8px 12px;">
-              <button
-                class="btn btn-sm"
-                onclick={() => handleDownload(name, "llm")}
-                disabled={downloading === name}
-              >
-                {downloading === name ? "Downloading..." : "Download"}
-              </button>
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  </Card>
-
-  <Card title="Transcription Models">
-    <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-      <thead>
-        <tr style="border-bottom: 1px solid var(--border); text-align: left;">
-          <th style="padding: 8px 12px;">Name</th>
-          <th style="padding: 8px 12px;">Backend</th>
-          <th style="padding: 8px 12px;">Size</th>
-          <th style="padding: 8px 12px;">Action</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each Object.entries(models.transcription) as [name, info]}
-          <tr style="border-bottom: 1px solid var(--border);">
-            <td style="padding: 8px 12px;">{info.display}</td>
-            <td style="padding: 8px 12px;">{info.backend}</td>
-            <td style="padding: 8px 12px;">{info.size_gb} GB</td>
-            <td style="padding: 8px 12px;">
-              <button
-                class="btn btn-sm"
-                onclick={() => handleDownload(name, "transcription")}
-                disabled={downloading === name}
-              >
-                {downloading === name ? "Downloading..." : "Download"}
-              </button>
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  </Card>
-
-  <ProgressBar visible={!!downloading} />
-{/if}
-
-<Card title="Preferences">
-  <div class="form-group">
-    <label for="def-format">Default Note Format</label>
-    <select id="def-format" bind:value={defaultFormat}>
-      <option value="soap">SOAP Note</option>
-      <option value="cbt">CBT Note</option>
-      <option value="intake">Intake Note</option>
-    </select>
-  </div>
-  <div class="form-group">
-    <label for="def-llm">Default LLM Model</label>
-    <select id="def-llm" bind:value={selectedLlm}>
-      {#if models}
-        {#each Object.entries(models.llm) as [name, info]}
-          <option value={name}>{info.display}</option>
-        {/each}
-      {/if}
-    </select>
-  </div>
-  <div class="form-group">
-    <label for="def-tr">Default Transcription Model</label>
-    <select id="def-tr" bind:value={selectedTranscription}>
-      {#if models}
-        {#each Object.entries(models.transcription) as [name, info]}
-          <option value={name}>{info.display}</option>
-        {/each}
-      {/if}
-    </select>
-  </div>
-  <button class="btn btn-primary" onclick={saveSettings}>Save Preferences</button>
-</Card>
+</div>

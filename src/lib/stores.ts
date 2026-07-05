@@ -1,14 +1,15 @@
 import { writable } from "svelte/store";
-import type { Patient, Session } from "./types";
+import type { Patient } from "./types";
 
-export const currentPatient = writable<Patient | null>(null);
-export const currentSession = writable<Session | null>(null);
+// Patient list — shared between sidebar and workspace
+export const patients = writable<Patient[]>([]);
+
+// Currently selected patient ID (derived from URL, but stored for sidebar highlight)
+export const selectedPatientId = writable<string | null>(null);
+
+// Sidecar — internal only, not shown in main UI
 export const sidecarRunning = writable<boolean>(false);
-export const transcribing = writable<boolean>(false);
-export const generating = writable<boolean>(false);
 
+// Transcription / generation progress
 export const progressPercent = writable<number>(0);
 export const progressStage = writable<string>("");
-
-// Patient name lookup cache (avoids N+1 queries)
-export const patientMap = writable<Record<string, Patient>>({});
