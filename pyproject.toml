@@ -11,6 +11,8 @@ dependencies = [
     "transformers>=5.0.0,<5.13.0",
     "huggingface-hub>=0.20.0",
     "tqdm>=4.60.0",
+    "mlx-audio[stt]>=0.4.4",
+    "cffi<2",  # mlx-audio's transitive cffi 2.x breaks against bundled llvm
 ]
 
 [project.scripts]

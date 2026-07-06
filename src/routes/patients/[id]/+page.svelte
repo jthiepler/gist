@@ -1,10 +1,13 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { confirm } from "@tauri-apps/plugin-dialog";
   import { page } from "$app/stores";
+  import { goto } from "$app/navigation";
   import { patients } from "$lib/stores";
   import { generateNote } from "$lib/rpc";
   import { ensureSidecar } from "$lib/ensureSidecar";
-  import { progressPercent, progressStage } from "$lib/stores";
+  import { progressPercent, progressStage, currentOperation } from "$lib/stores";
+  import { loadSettings } from "$lib/settings";
   import type { Patient, Session } from "$lib/types";
   import SessionCard from "$lib/components/SessionCard.svelte";
   import NewSessionPanel from "$lib/components/NewSessionPanel.svelte";
@@ -52,7 +55,7 @@
   );
 
   async function deleteSession(session: Session) {
-    if (!confirm(`Delete session from ${session.date}?`)) return;
+    if (!(await confirm(`Delete session from ${session.date}?`))) return;
     try {
       await invoke("delete_session", { id: session.id });
       sessions = sessions.filter((s) => s.id !== session.id);
@@ -65,28 +68,43 @@
     if (!session.transcript) return;
     generatingNoteFor = session.id;
     error = "";
+
+    // Load settings
+    const settings = await loadSettings();
+    const llm = settings.defaultLlm;
+    const thinking = settings.thinking;
+
+    const opId = `gen-note-${session.id}`;
+    currentOperation.set(opId);
     progressPercent.set(30);
     progressStage.set("Generating note...");
 
     try {
       const format = session.note_format || "soap";
-      const result = await generateNote(session.transcript, format);
+      const result = await generateNote(
+        session.transcript,
+        format,
+        llm || undefined,
+        thinking
+      );
       await invoke("update_session", {
         data: {
           id: session.id,
           note: result.note,
           note_format: format,
+          llm_model: llm || null,
         },
       });
       sessions = sessions.map((s) =>
         s.id === session.id
-          ? { ...s, note: result.note, note_format: format }
+          ? { ...s, note: result.note, note_format: format, llm_model: llm || null }
           : s
       );
     } catch (e) {
       error = `Note generation failed: ${e}`;
     } finally {
       generatingNoteFor = null;
+      currentOperation.set(null);
       progressStage.set("");
       progressPercent.set(0);
     }
@@ -121,6 +139,18 @@
       error = String(e);
     } finally {
       savingName = false;
+    }
+  }
+
+  async function deletePatient() {
+    if (!patient) return;
+    if (!(await confirm(`Delete "${patient.name}"? All related sessions and notes will be permanently deleted. This cannot be undone.`, { title: "Delete patient", kind: "warning" }))) return;
+    try {
+      await invoke("delete_patient", { id: patient.id });
+      patients.update((list) => list.filter((p) => p.id !== patient.id));
+      goto("/");
+    } catch (e) {
+      error = String(e);
     }
   }
 </script>
@@ -173,7 +203,12 @@
   {/if}
 
   <div class="workspace-toolbar">
-    <div></div>
+    <button class="btn-ghost btn-sm delete-patient-btn" onclick={deletePatient} title="Delete patient" aria-label="Delete patient">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="3 6 5 6 21 6"/>
+        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+      </svg>
+    </button>
     {#if !showNewSession}
       <button class="btn btn-primary" onclick={() => showNewSession = true}>
         + New Session
@@ -199,6 +234,7 @@
       {#each sessions as session (session.id)}
         <SessionCard
           {session}
+          isGenerating={generatingNoteFor === session.id}
           onGenerateNote={generateNoteForSession}
           onDelete={deleteSession}
         />

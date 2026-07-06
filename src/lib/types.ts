@@ -23,6 +23,8 @@ export interface SidecarProgress {
   type: "progress";
   percent: number;
   stage: string;
+  eta_seconds?: number;
+  audio_duration?: number;
 }
 
 export interface ModelInfo {

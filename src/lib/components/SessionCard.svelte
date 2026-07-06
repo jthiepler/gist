@@ -4,10 +4,12 @@
 
   let {
     session,
+    isGenerating = false,
     onGenerateNote,
     onDelete,
   }: {
     session: Session;
+    isGenerating?: boolean;
     onGenerateNote: (session: Session) => void;
     onDelete: (session: Session) => void;
   } = $props();
@@ -37,7 +39,7 @@
   );
 </script>
 
-<div class="session-card">
+<div class="session-card" class:generating={isGenerating}>
   <div class="session-card-header">
     <div class="session-date">{formattedDate}</div>
     <div class="session-meta">
@@ -50,7 +52,7 @@
       {#if session.language}
         <span>{session.language}</span>
       {/if}
-      <button class="btn-ghost btn-sm" onclick={() => onDelete(session)} style="margin-left: 8px;">Delete</button>
+      <button class="btn-ghost btn-sm delete-session-btn" onclick={() => onDelete(session)} disabled={isGenerating}>Delete</button>
     </div>
   </div>
 
@@ -59,7 +61,7 @@
       class="session-tab"
       class:active={activeTab === "note"}
       onclick={() => activeTab = "note"}
-      disabled={!session.note && !session.transcript}
+      disabled={(!session.note && !session.transcript) || isGenerating}
     >
       Note
     </button>
@@ -67,19 +69,24 @@
       class="session-tab"
       class:active={activeTab === "transcript"}
       onclick={() => activeTab = "transcript"}
-      disabled={!session.transcript}
+      disabled={!session.transcript || isGenerating}
     >
       Transcript
     </button>
   </div>
 
   <div class="session-card-body">
-    {#if activeTab === "note"}
+    {#if isGenerating}
+      <div class="spinner-container">
+        <div class="spinner"></div>
+        <p class="text-muted spinner-message">Generating note...</p>
+      </div>
+    {:else if activeTab === "note"}
       {#if session.note}
         <div class="markdown-content">{@html renderedNote}</div>
       {:else if session.transcript}
-        <div style="text-align: center; padding: 20px;">
-          <p class="text-muted" style="margin-bottom: 12px;">No note generated yet.</p>
+        <div class="spinner-container">
+          <p class="text-muted empty-message">No note generated yet.</p>
           <button class="btn btn-primary" onclick={() => onGenerateNote(session)}>
             Generate Note
           </button>

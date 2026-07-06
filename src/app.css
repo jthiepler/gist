@@ -237,6 +237,18 @@ body {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 20px;
+  gap: 8px;
+}
+
+.delete-patient-btn {
+  color: var(--text-light);
+  padding: 6px;
+}
+
+.delete-patient-btn:hover,
+.btn-ghost.delete-patient-btn:hover {
+  color: var(--error);
+  background: #FEF2F2;
 }
 
 /* ── Buttons ─────────────────────────────────────────────────────────────── */
@@ -373,6 +385,41 @@ body {
   padding: 16px 20px;
   max-height: 500px;
   overflow-y: auto;
+}
+
+.session-card.generating {
+  opacity: 0.85;
+}
+
+.spinner {
+  width: 24px;
+  height: 24px;
+  border: 2.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  margin: 0 auto;
+  animation: spin 0.7s linear infinite;
+}
+
+.spinner-container {
+  text-align: center;
+  padding: 20px;
+}
+
+.spinner-message {
+  margin-top: 12px;
+}
+
+.empty-message {
+  margin-bottom: 12px;
+}
+
+.delete-session-btn {
+  margin-left: 8px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .session-content {
@@ -590,6 +637,12 @@ textarea {
 .progress-label {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.progress-eta {
+  margin-left: 6px;
+  color: var(--text-muted);
+  opacity: 0.8;
 }
 
 /* ── Empty State ─────────────────────────────────────────────────────────── */
@@ -827,4 +880,76 @@ textarea {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-light);
+}
+
+/* ── Dark Mode ────────────────────────────────────────────────────────────── */
+
+.dark {
+  --bg: #0F1115;
+  --bg-subtle: #16181D;
+  --bg-hover: #1E2128;
+  --bg-sidebar: #0F1115;
+  --text: #E4E6EB;
+  --text-muted: #8B8F98;
+  --text-light: #5C6068;
+  --border: #2A2D35;
+  --border-subtle: #1E2128;
+  --accent: #3B82F6;
+  --accent-hover: #2563EB;
+  --accent-light: #172234;
+  --error: #F87171;
+  --success: #22C55E;
+}
+
+.dark .btn:hover {
+  background: var(--bg-hover);
+}
+
+.dark .btn-danger:hover {
+  background: #2A1517;
+  border-color: var(--error);
+}
+
+.dark .delete-patient-btn:hover {
+  background: #2A1517;
+}
+
+.dark .error-banner {
+  background: #2A1517;
+  border-color: #5C2024;
+}
+
+.dark .success-banner {
+  background: #14281C;
+  border-color: #1B4332;
+}
+
+.dark .markdown-content code {
+  background: var(--bg-subtle);
+}
+
+.dark .markdown-content pre {
+  background: var(--bg-subtle);
+}
+
+.dark .markdown-content blockquote {
+  border-left-color: var(--border);
+}
+
+.dark .markdown-content th {
+  background: var(--bg-subtle);
+}
+
+.dark input,
+.dark select,
+.dark textarea {
+  background: var(--bg-subtle);
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #2A2D35;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #3A3D45;
 }

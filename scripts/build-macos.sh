@@ -25,6 +25,10 @@ uv run pyinstaller \
     --collect-all tokenizers \
     --collect-all numpy \
     --collect-all mlx \
+    --collect-all mlx_audio \
+    --collect-all scipy \
+    --collect-all miniaudio \
+    --collect-all sentencepiece \
     --runtime-hook gist/_runtime_hook.py \
     --exclude torch \
     --exclude torchvision \
@@ -37,8 +41,6 @@ uv run pyinstaller \
     --exclude flax \
     --exclude jax \
     --exclude librosa \
-    --exclude soundfile \
-    --exclude scipy \
     run_sidecar.py
 
 echo "=== Build complete: dist/gist-sidecar/ ==="

@@ -22,6 +22,14 @@ tmp_ret = collect_all('numpy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('mlx')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('mlx_audio')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('scipy')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('miniaudio')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('sentencepiece')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
@@ -33,7 +41,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=['gist/_runtime_hook.py'],
-    excludes=['torch', 'torchvision', 'torchaudio', 'onnx', 'onnxruntime', 'tensorflow', 'keras', 'tf2onnx', 'flax', 'jax', 'librosa', 'soundfile', 'scipy'],
+    excludes=['torch', 'torchvision', 'torchaudio', 'onnx', 'onnxruntime', 'tensorflow', 'keras', 'tf2onnx', 'flax', 'jax', 'librosa'],
     noarchive=False,
     optimize=0,
 )

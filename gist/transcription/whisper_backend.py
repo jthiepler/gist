@@ -18,13 +18,16 @@ class WhisperBackend(TranscriptionBackend):
 
     def load(self, model_path: str):
         log.info("Loading Whisper model from %s", model_path)
+        from .. import _MAX_THREADS
+
         self.model = WhisperModel(
             model_path,
             device="cpu",
             compute_type="int8",
             num_workers=2,
+            cpu_threads=_MAX_THREADS,
         )
-        log.info("Whisper model loaded")
+        log.info("Whisper model loaded (cpu_threads=%d)", _MAX_THREADS)
 
     def transcribe(
         self,

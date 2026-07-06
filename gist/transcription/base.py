@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 
 @dataclass
@@ -21,7 +21,7 @@ class TranscriptResult:
     language: str = ""
 
 
-ProgressCallback = Callable[[int, str], None]
+ProgressCallback = Callable[..., None]
 
 
 class TranscriptionBackend(ABC):

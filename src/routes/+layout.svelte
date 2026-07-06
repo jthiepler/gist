@@ -3,7 +3,8 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { isRunning, startSidecar, onProgress } from "$lib/rpc";
-  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage } from "$lib/stores";
+  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressAudioDuration, darkMode } from "$lib/stores";
+  import { loadDarkMode } from "$lib/settings";
   import { page } from "$app/stores";
   import type { Patient } from "$lib/types";
   import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -41,7 +42,21 @@
     unlisten = await onProgress((data) => {
       progressPercent.set(data.percent);
       progressStage.set(data.stage);
+      progressEta.set(data.eta_seconds ?? null);
+      progressAudioDuration.set(data.audio_duration ?? null);
     });
+
+    // Load dark mode setting
+    await loadDarkMode();
+  });
+
+  // Apply dark mode class to <html>
+  $effect(() => {
+    if ($darkMode) {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
   });
 
   onDestroy(() => {

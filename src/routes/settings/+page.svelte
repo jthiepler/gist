@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
-    listModels, downloadModel, getSetting, setSetting,
+    listModels, downloadModel,
     isRunning, startSidecar, stopSidecar,
   } from "$lib/rpc";
-  import { sidecarRunning, progressPercent, progressStage } from "$lib/stores";
+  import { sidecarRunning, progressPercent, progressStage, darkMode } from "$lib/stores";
+  import { loadSettings, saveSettings } from "$lib/settings";
   import { ensureSidecar } from "$lib/ensureSidecar";
   import type { ModelsResult } from "$lib/types";
 
@@ -35,16 +36,12 @@
       }
     } catch {}
 
-    try {
-      const fmt = await getSetting("default_format");
-      if (fmt) defaultFormat = fmt;
-      const llm = await getSetting("default_llm");
-      if (llm) selectedLlm = llm;
-      const tr = await getSetting("default_transcription");
-      if (tr) selectedTranscription = tr;
-      const th = await getSetting("thinking");
-      if (th !== null) thinking = th === "true";
-    } catch {}
+    const s = await loadSettings();
+    if (s.defaultFormat) defaultFormat = s.defaultFormat;
+    if (s.defaultLlm) selectedLlm = s.defaultLlm;
+    if (s.defaultTranscription) selectedTranscription = s.defaultTranscription;
+    thinking = s.thinking;
+    darkMode.set(s.darkMode);
   });
 
   async function handleDownload(model: string, kind: string) {
@@ -67,10 +64,13 @@
 
   async function savePreferences() {
     try {
-      await setSetting("default_format", defaultFormat);
-      await setSetting("default_llm", selectedLlm);
-      await setSetting("default_transcription", selectedTranscription);
-      await setSetting("thinking", thinking.toString());
+      await saveSettings({
+        defaultFormat,
+        defaultLlm: selectedLlm,
+        defaultTranscription: selectedTranscription,
+        thinking,
+        darkMode: $darkMode,
+      });
       saved = true;
       setTimeout(() => saved = false, 3000);
     } catch (e) {
@@ -210,6 +210,16 @@
       <div class="setting-desc">Enables extended reasoning before generating the note</div>
     </div>
     <div class="toggle" class:active={thinking} onclick={() => thinking = !thinking}>
+      <div class="toggle-knob"></div>
+    </div>
+  </div>
+
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Dark Mode</div>
+      <div class="setting-desc">Toggle between light and dark appearance</div>
+    </div>
+    <div class="toggle" class:active={$darkMode} onclick={() => darkMode.set(!$darkMode)}>
       <div class="toggle-knob"></div>
     </div>
   </div>

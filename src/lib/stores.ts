@@ -10,6 +10,12 @@ export const selectedPatientId = writable<string | null>(null);
 // Sidecar — internal only, not shown in main UI
 export const sidecarRunning = writable<boolean>(false);
 
-// Transcription / generation progress
+// Progress — includes an operation ID so concurrent operations don't clobber
 export const progressPercent = writable<number>(0);
 export const progressStage = writable<string>("");
+export const progressEta = writable<number | null>(null);
+export const progressAudioDuration = writable<number | null>(null);
+export const currentOperation = writable<string | null>(null);
+
+// Dark mode
+export const darkMode = writable<boolean>(false);

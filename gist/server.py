@@ -26,8 +26,18 @@ def _send(obj: Dict[str, Any]):
     sys.stdout.flush()
 
 
-def _send_progress(percent: int, stage: str):
-    _send({"type": "progress", "percent": percent, "stage": stage})
+def _send_progress(
+    percent: int,
+    stage: str,
+    eta_seconds: Optional[float] = None,
+    audio_duration: Optional[float] = None,
+):
+    msg = {"type": "progress", "percent": percent, "stage": stage}
+    if eta_seconds is not None:
+        msg["eta_seconds"] = round(eta_seconds, 1)
+    if audio_duration is not None and audio_duration > 0:
+        msg["audio_duration"] = round(audio_duration, 1)
+    _send(msg)
 
 
 def _handle_transcribe(params: Dict[str, Any]):
@@ -35,8 +45,16 @@ def _handle_transcribe(params: Dict[str, Any]):
     model = params.get("model", DEFAULT_TRANSCRIPTION)
     language = params.get("language")
 
-    def progress(pct, stage):
-        _send_progress(pct, stage)
+    # audio_duration is static for the whole transcription — send it once
+    # on the first progress tick instead of repeating it on every message.
+    duration_sent = False
+
+    def progress(pct, stage, eta_seconds=None, audio_duration=None, **_kw):
+        nonlocal duration_sent
+        include_duration = audio_duration if not duration_sent else None
+        _send_progress(pct, stage, eta_seconds=eta_seconds, audio_duration=include_duration)
+        if audio_duration is not None:
+            duration_sent = True
 
     try:
         result = transcribe_audio(

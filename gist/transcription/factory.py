@@ -9,5 +9,9 @@ def create_transcription_backend(backend_type: str) -> TranscriptionBackend:
         from .whisper_backend import WhisperBackend
 
         return WhisperBackend()
+    elif backend_type == "parakeet":
+        from .parakeet_backend import ParakeetBackend
+
+        return ParakeetBackend()
     else:
         raise ValueError(f"Unknown transcription backend: {backend_type}")

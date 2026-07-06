@@ -1,6 +1,15 @@
-"""PyInstaller runtime hook: fix MLX metallib path resolution."""
+"""PyInstaller runtime hook: fix MLX metallib path resolution + limit CPU threads."""
 import os
 import sys
+
+# Limit CPU threads before any numerical library imports.
+# Inline copy of gist/_thread_limit.py — runtime hooks execute before the
+# gist package is fully importable in the bundled environment.
+_max_threads = max(1, (os.cpu_count() or 4) // 2)
+os.environ.setdefault("OMP_NUM_THREADS", str(_max_threads))
+os.environ.setdefault("MKL_NUM_THREADS", str(_max_threads))
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(_max_threads))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_max_threads))
 
 def _fix_mlx_path():
     # In PyInstaller bundle, _internal/mlx/lib/ contains libmlx.dylib and mlx.metallib
