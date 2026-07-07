@@ -1,7 +1,7 @@
 """Intake assessment format."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 from ..llm.base import ChatMessage
 from .base import ClinicalFormat
@@ -11,14 +11,8 @@ class IntakeFormat(ClinicalFormat):
     name = "intake"
     description = "Initial intake assessment \u2014 comprehensive first-session evaluation"
 
-    def build_messages(
-        self, transcript: str, language: Optional[str] = None
-    ) -> List[ChatMessage]:
-        lang_instr = self._language_instruction(language)
-
-        system_prompt = f"""You are a clinical note-taking assistant for licensed therapists. Generate an intake assessment from an initial therapy session transcript.
-
-{lang_instr}
+    def build_messages(self, transcript: str) -> List[ChatMessage]:
+        system_prompt = """You are a clinical note-taking assistant for licensed therapists. Generate an intake assessment from an initial therapy session transcript.
 
 Rules:
 - Base all clinical statements ONLY on what the client says in the transcript.

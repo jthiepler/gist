@@ -17,6 +17,16 @@ export interface Session {
   llm_model: string | null;
   transcription_model: string | null;
   created_at: string;
+  notes: SessionNote[];
+}
+
+export interface SessionNote {
+  id: string;
+  session_id: string;
+  format: string;
+  note: string | null;
+  llm_model: string | null;
+  created_at: string;
 }
 
 export interface SidecarProgress {
@@ -31,6 +41,8 @@ export interface ModelInfo {
   display: string;
   backend: string;
   size_gb: number;
+  description: string;
+  downloaded: boolean;
 }
 
 export interface ModelsResult {
@@ -38,7 +50,11 @@ export interface ModelsResult {
   transcription: Record<string, ModelInfo>;
 }
 
-export interface NoteFormat {
+export interface NoteFormatTemplate {
+  id: string;
   name: string;
-  description: string;
+  prompt: string;
+  is_builtin: boolean;
+  hidden: boolean;
+  created_at: string;
 }

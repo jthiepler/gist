@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Optional
 
 from .llm.factory import auto_detect_backend, create_backend
 from .config import DEFAULT_OPENAI_ENDPOINT
-from .models import resolve_model
+from .models import DEFAULT_TRANSCRIPTION, resolve_model
 from .transcription.base import ProgressCallback, TranscriptResult
 from .transcription.factory import create_transcription_backend
 
@@ -20,15 +21,17 @@ def _probe_audio_duration(audio_path: str) -> float:
         import miniaudio
         info = miniaudio.get_file_info(audio_path)
         return float(info.duration)
-    except Exception:
+    except Exception as e:
+        log.warning("Audio duration probe failed: %s", e)
         return 0.0
 
 
 def transcribe_audio(
     audio_path: str,
-    model_name: str = "whisper-base",
+    model_name: str = DEFAULT_TRANSCRIPTION,
     language: Optional[str] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> TranscriptResult:
     spec = resolve_model(model_name, "transcription")
     backend = create_transcription_backend(spec.backend)
@@ -52,6 +55,8 @@ def transcribe_audio(
     def _wrapped(pct: int, stage: str):
         if not progress_callback:
             return
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Transcription cancelled")
         nonlocal prev_time, prev_pct, smoothed_rate
         now = time.monotonic()
 
@@ -83,7 +88,7 @@ def transcribe_audio(
         progress_callback(1, "transcribing", eta_seconds=None, audio_duration=audio_duration)
 
     result = backend.transcribe(
-        audio_path, language=language, progress_callback=_wrapped
+        audio_path, language=language, progress_callback=_wrapped, cancel_event=cancel_event
     )
     backend.cleanup()
 
@@ -98,12 +103,12 @@ def generate_note(
     endpoint: str = DEFAULT_OPENAI_ENDPOINT,
     max_tokens: int = 16384,
     thinking: bool = True,
-    language: Optional[str] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    prompt: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     from .formats.registry import get_format
-
-    fmt = get_format(format_name)
+    from .llm.base import ChatMessage
 
     if not backend_type:
         backend_type = auto_detect_backend()
@@ -120,12 +125,25 @@ def generate_note(
     if progress_callback:
         progress_callback(30, "generating")
 
-    messages = fmt.build_messages(transcript, language=language)
+    if cancel_event and cancel_event.is_set():
+        raise InterruptedError("Note generation cancelled")
+
+    if prompt:
+        system_prompt = prompt
+        user_prompt = f"Generate a {format_name} note from this therapy session transcript:\n\n{transcript}"
+        messages = [
+            ChatMessage(role="system", content=system_prompt),
+            ChatMessage(role="user", content=user_prompt),
+        ]
+    else:
+        fmt = get_format(format_name)
+        messages = fmt.build_messages(transcript)
 
     note = llm.generate(
         messages=messages,
         max_tokens=max_tokens,
         thinking=thinking,
+        cancel_event=cancel_event,
     )
 
     llm.cleanup()

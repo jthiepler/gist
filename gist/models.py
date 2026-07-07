@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,7 @@ class ModelSpec:
     hf_repo: str
     size_gb: float = 0.0
     default: bool = False
+    description: str = ""
 
 
 LLM_MODELS: Dict[str, ModelSpec] = {
@@ -23,6 +24,7 @@ LLM_MODELS: Dict[str, ModelSpec] = {
         hf_repo="mlx-community/Qwen3.5-4B-OptiQ-4bit",
         size_gb=2.5,
         default=True,
+        description="Fast and reliable — 4B params",
     ),
     "qwen-3.5-9b": ModelSpec(
         name="qwen-3.5-9b",
@@ -30,6 +32,7 @@ LLM_MODELS: Dict[str, ModelSpec] = {
         backend="mlx",
         hf_repo="mlx-community/Qwen3.5-9B-OptiQ-4bit",
         size_gb=5.5,
+        description="Superior quality, slower — 9B params",
     ),
 }
 
@@ -41,6 +44,7 @@ TRANSCRIPTION_MODELS: Dict[str, ModelSpec] = {
         hf_repo="mlx-community/parakeet-tdt-0.6b-v3",
         size_gb=2.3,
         default=True,
+        description="Fast, accurate — Apple Silicon native",
     ),
     "whisper-base": ModelSpec(
         name="whisper-base",
@@ -48,6 +52,7 @@ TRANSCRIPTION_MODELS: Dict[str, ModelSpec] = {
         backend="whisper",
         hf_repo="Systran/faster-whisper-base",
         size_gb=0.15,
+        description="Fastest, lower accuracy",
     ),
     "whisper-large-v3": ModelSpec(
         name="whisper-large-v3",
@@ -55,6 +60,7 @@ TRANSCRIPTION_MODELS: Dict[str, ModelSpec] = {
         backend="whisper",
         hf_repo="Systran/faster-whisper-large-v3",
         size_gb=3.0,
+        description="Highest accuracy, slower",
     ),
 }
 

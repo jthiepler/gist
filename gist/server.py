@@ -3,21 +3,27 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import sys
+import threading
 from typing import Any, Dict, Optional
 
-from .downloader import download_model
+from .downloader import download_model, is_model_downloaded, delete_model
 from .formats.registry import get_format, list_formats
 from .models import (
     DEFAULT_LLM,
     DEFAULT_TRANSCRIPTION,
     LLM_MODELS,
     TRANSCRIPTION_MODELS,
-    resolve_model,
 )
 from .pipeline import generate_note, transcribe_audio
 
 log = logging.getLogger(__name__)
+
+# Cancellation event — set by "cancel" messages, cleared before each operation
+_cancel_event = threading.Event()
+# Request queue — stdin reader thread puts messages here, main thread processes
+_request_queue: "queue.Queue[Optional[dict]]" = queue.Queue()
 
 
 def _send(obj: Dict[str, Any]):
@@ -40,13 +46,35 @@ def _send_progress(
     _send(msg)
 
 
+def _stdin_reader():
+    """Background thread: reads stdin, puts messages in queue, handles cancel/exit."""
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as e:
+            _send({"type": "error", "message": f"Invalid JSON: {e}"})
+            continue
+        if not isinstance(msg, dict):
+            _send({"type": "error", "message": f"Expected JSON object, got {type(msg).__name__}"})
+            continue
+        msg_type = msg.get("type", "")
+        if msg_type == "cancel":
+            _cancel_event.set()
+            # Don't queue — it's a control message
+        else:
+            _request_queue.put(msg)
+    # stdin closed — signal main thread to exit
+    _request_queue.put(None)
+
+
 def _handle_transcribe(params: Dict[str, Any]):
     audio_file = params.get("audio_file", "")
     model = params.get("model", DEFAULT_TRANSCRIPTION)
     language = params.get("language")
 
-    # audio_duration is static for the whole transcription — send it once
-    # on the first progress tick instead of repeating it on every message.
     duration_sent = False
 
     def progress(pct, stage, eta_seconds=None, audio_duration=None, **_kw):
@@ -62,6 +90,7 @@ def _handle_transcribe(params: Dict[str, Any]):
             model_name=model,
             language=language,
             progress_callback=progress,
+            cancel_event=_cancel_event,
         )
         _send({
             "type": "result",
@@ -73,6 +102,8 @@ def _handle_transcribe(params: Dict[str, Any]):
             "duration": result.duration,
             "language": result.language,
         })
+    except InterruptedError:
+        _send({"type": "error", "message": "Transcription cancelled"})
     except Exception as e:
         log.exception("Transcription failed")
         _send({"type": "error", "message": str(e)})
@@ -85,7 +116,7 @@ def _handle_generate_note(params: Dict[str, Any]):
     backend_type = params.get("backend")
     max_tokens = params.get("max_tokens", 16384)
     thinking = params.get("thinking", True)
-    language = params.get("language")
+    prompt = params.get("prompt")
 
     def progress(pct, stage):
         _send_progress(pct, stage)
@@ -98,10 +129,13 @@ def _handle_generate_note(params: Dict[str, Any]):
             backend_type=backend_type,
             max_tokens=max_tokens,
             thinking=thinking,
-            language=language,
             progress_callback=progress,
+            prompt=prompt,
+            cancel_event=_cancel_event,
         )
         _send({"type": "result", "note": note, "format": format_name})
+    except InterruptedError:
+        _send({"type": "error", "message": "Note generation cancelled"})
     except Exception as e:
         log.exception("Note generation failed")
         _send({"type": "error", "message": str(e)})
@@ -116,33 +150,44 @@ def _handle_download_model(params: Dict[str, Any]):
 
     try:
         _send_progress(0, f"starting download of {model_name}")
-        download_model(model_name, kind=kind)
+        download_model(model_name, kind=kind, progress_callback=progress, cancel_event=_cancel_event)
         _send({"type": "result", "ok": True, "model": model_name})
+    except InterruptedError:
+        _send({"type": "error", "message": "Download cancelled"})
     except Exception as e:
         log.exception("Download failed")
+        _send({"type": "error", "message": str(e)})
+
+
+def _handle_delete_model(params: Dict[str, Any]):
+    model_name = params.get("model", DEFAULT_LLM)
+    kind = params.get("kind", "llm")
+
+    try:
+        delete_model(model_name, kind=kind)
+        _send({"type": "result", "ok": True, "model": model_name})
+    except Exception as e:
+        log.exception("Delete failed")
         _send({"type": "error", "message": str(e)})
 
 
 def run_server():
     log.info("JSON-RPC server started (stdin/stdout)")
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    reader = threading.Thread(target=_stdin_reader, daemon=True)
+    reader.start()
 
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError as e:
-            _send({"type": "error", "message": f"Invalid JSON: {e}"})
-            continue
-
-        if not isinstance(msg, dict):
-            _send({"type": "error", "message": f"Expected JSON object, got {type(msg).__name__}"})
-            continue
+    while True:
+        msg = _request_queue.get()  # blocks until a message arrives
+        if msg is None:
+            # stdin closed
+            break
 
         msg_type = msg.get("type", "")
         params = msg.get("params", msg)
+
+        # Clear cancel event before each operation
+        _cancel_event.clear()
 
         if msg_type == "ping":
             _send({"type": "pong"})
@@ -155,6 +200,8 @@ def run_server():
                     "display": spec.display,
                     "backend": spec.backend,
                     "size_gb": spec.size_gb,
+                    "description": spec.description,
+                    "downloaded": is_model_downloaded(name, "llm"),
                 }
                 for name, spec in LLM_MODELS.items()
             }
@@ -163,6 +210,8 @@ def run_server():
                     "display": spec.display,
                     "backend": spec.backend,
                     "size_gb": spec.size_gb,
+                    "description": spec.description,
+                    "downloaded": is_model_downloaded(name, "transcription"),
                 }
                 for name, spec in TRANSCRIPTION_MODELS.items()
             }
@@ -175,6 +224,8 @@ def run_server():
             _handle_generate_note(params)
         elif msg_type == "download_model":
             _handle_download_model(params)
+        elif msg_type == "delete_model":
+            _handle_delete_model(params)
         else:
             _send({"type": "error", "message": f"Unknown message type: {msg_type}"})
 

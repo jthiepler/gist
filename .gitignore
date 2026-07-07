@@ -19,9 +19,7 @@ __pycache__/
 /dist
 
 # PyInstaller sidecar build output
-/dist/counselor-sidecar
 /dist/gist-sidecar
-/src-tauri/resources/counselor-sidecar
 /src-tauri/resources/gist-sidecar
 
 # Rust / Tauri

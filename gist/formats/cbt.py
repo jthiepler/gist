@@ -1,7 +1,7 @@
 """CBT session note format."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 from ..llm.base import ChatMessage
 from .base import ClinicalFormat
@@ -11,14 +11,8 @@ class CBTFormat(ClinicalFormat):
     name = "cbt"
     description = "CBT session note \u2014 Cognitive Behavioral Therapy format"
 
-    def build_messages(
-        self, transcript: str, language: Optional[str] = None
-    ) -> List[ChatMessage]:
-        lang_instr = self._language_instruction(language)
-
-        system_prompt = f"""You are a clinical note-taking assistant for licensed therapists. Generate a CBT session note from a therapy session transcript.
-
-{lang_instr}
+    def build_messages(self, transcript: str) -> List[ChatMessage]:
+        system_prompt = """You are a clinical note-taking assistant for licensed therapists. Generate a CBT session note from a therapy session transcript.
 
 Rules:
 - Base all clinical statements ONLY on what the client says in the transcript.

@@ -75,13 +75,12 @@ def transcribe(audio_file, output, model, language):
 @click.option("-t", "--transcript", "transcript_file", type=click.Path(exists=True), help="Read transcript from file (default: read from stdin).")
 @click.option("-f", "--format", "format_name", default="soap", help="Note format: soap, cbt, intake (default: soap)")
 @click.option("-o", "--output", type=click.Path(), help="Write note to file (default: stdout).")
-@click.option("--language", help="Language code for note output (e.g. en, de). Default: auto-detect from transcript.")
 @click.option("--model", default=DEFAULT_LLM, help=f"LLM model (default: {DEFAULT_LLM}). Use 'gist models' to list.")
 @click.option("--backend", type=click.Choice(["mlx", "openai"]), help="Override backend (mlx, openai). Default: auto-detected from model.")
 @click.option("--endpoint", default=DEFAULT_OPENAI_ENDPOINT, help=f"OpenAI-compatible endpoint (default: {DEFAULT_OPENAI_ENDPOINT})")
 @click.option("--max-tokens", default=16384, help="Maximum tokens for LLM generation (default: 16384)")
 @click.option("--thinking/--no-thinking", default=True, help="Enable or disable chain-of-thought reasoning (default: enabled)")
-def note(transcript_file, format_name, output, language, model, backend, endpoint, max_tokens, thinking):
+def note(transcript_file, format_name, output, model, backend, endpoint, max_tokens, thinking):
     """Generate a clinical note from a transcript."""
     from .formats.registry import get_format
     from .pipeline import generate_note as _generate_note
@@ -104,7 +103,6 @@ def note(transcript_file, format_name, output, language, model, backend, endpoin
         endpoint=endpoint,
         max_tokens=max_tokens,
         thinking=thinking,
-        language=language,
     )
 
     if output:

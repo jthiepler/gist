@@ -2,19 +2,33 @@
   import "../app.css";
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { isRunning, startSidecar, onProgress } from "$lib/rpc";
-  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressAudioDuration, darkMode } from "$lib/stores";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { isRunning, startSidecar, onProgress, cancelSidecar } from "$lib/rpc";
+  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressBase, progressScale, darkMode, sidecarBusy, activeOperation } from "$lib/stores";
+  import { get } from "svelte/store";
   import { loadDarkMode } from "$lib/settings";
   import { page } from "$app/stores";
   import type { Patient } from "$lib/types";
-  import type { UnlistenFn } from "@tauri-apps/api/event";
 
   let { children } = $props();
 
-  let unlisten: UnlistenFn | null = null;
+  let unlistenProgress: UnlistenFn | null = null;
+  let unlistenState: UnlistenFn | null = null;
   let showAddForm = $state(false);
   let newName = $state("");
   let addError = $state("");
+
+  function formatEta(seconds: number): string {
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    if (seconds < 3600) {
+      const m = Math.floor(seconds / 60);
+      const s = Math.round(seconds % 60);
+      return s > 0 ? `${m}m ${s}s` : `${m}m`;
+    }
+    const h = Math.floor(seconds / 3600);
+    const m = Math.round((seconds % 3600) / 60);
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
 
   onMount(async () => {
     // Auto-start sidecar silently
@@ -39,11 +53,25 @@
     }
 
     // Global progress listener
-    unlisten = await onProgress((data) => {
-      progressPercent.set(data.percent);
+    unlistenProgress = await onProgress((data) => {
+      const base = get(progressBase);
+      const scale = get(progressScale);
+      progressPercent.set(base + Math.round((data.percent / 100) * scale));
       progressStage.set(data.stage);
       progressEta.set(data.eta_seconds ?? null);
-      progressAudioDuration.set(data.audio_duration ?? null);
+    });
+
+    // Sidecar busy state listener
+    unlistenState = await listen<{ busy: boolean }>("sidecar-state", (event) => {
+      sidecarBusy.set(event.payload.busy);
+      if (!event.payload.busy) {
+        activeOperation.set({ type: null, label: "" });
+        progressPercent.set(0);
+        progressStage.set("");
+        progressEta.set(null);
+        progressBase.set(0);
+        progressScale.set(100);
+      }
     });
 
     // Load dark mode setting
@@ -60,7 +88,8 @@
   });
 
   onDestroy(() => {
-    unlisten?.();
+    unlistenProgress?.();
+    unlistenState?.();
   });
 
   // Sync selectedPatientId from URL
@@ -83,8 +112,17 @@
     }
   }
 
+  async function handleCancel() {
+    try {
+      await cancelSidecar();
+    } catch (e) {
+      console.error("Cancel failed:", e);
+    }
+  }
+
   let pathname = $derived($page.url.pathname);
   const isSettings = $derived(pathname === "/settings");
+  const isTemplates = $derived(pathname === "/templates");
 </script>
 
 <div class="app-shell">
@@ -133,12 +171,8 @@
         </button>
       {/if}
 
-      <a href="/settings" class="settings-link" class:active={isSettings}>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-        </svg>
-      </a>
+      <a href="/templates" class="footer-link" class:active={isTemplates}>Templates</a>
+      <a href="/settings" class="footer-link" class:active={isSettings}>Settings</a>
     </div>
   </aside>
 
@@ -146,3 +180,20 @@
     {@render children()}
   </main>
 </div>
+
+{#if $sidecarBusy}
+  <div class="progress-card">
+    <div class="progress-card-header">
+      <span class="progress-card-title">
+        {$activeOperation.label || $progressStage || "Working..."}
+      </span>
+      <button class="progress-card-cancel" onclick={handleCancel}>Cancel</button>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-bar-fill" style="width: {$progressPercent}%;"></div>
+    </div>
+    {#if $progressEta != null && $progressEta > 0}
+      <div class="progress-card-eta">~{formatEta($progressEta)} remaining</div>
+    {/if}
+  </div>
+{/if}

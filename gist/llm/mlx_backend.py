@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from typing import List
+import threading
+from typing import List, Optional
 
 import mlx.core as mx
 from mlx_lm import load, stream_generate
@@ -39,6 +40,7 @@ class MLXBackend(LLMBackend):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         thinking: bool = False,
+        cancel_event: Optional[threading.Event] = None,
     ) -> str:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -64,6 +66,8 @@ class MLXBackend(LLMBackend):
             max_tokens=max_tokens,
             sampler=sampler,
         ):
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Generation cancelled")
             text_parts.append(response.text)
 
         return "".join(text_parts).strip()

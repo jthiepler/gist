@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import List
+import threading
+from typing import List, Optional
 
 import urllib.request
 
@@ -31,6 +32,7 @@ class OpenAICompatBackend(LLMBackend):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         thinking: bool = False,
+        cancel_event: Optional[threading.Event] = None,
     ) -> str:
         body = {
             "model": self.model,

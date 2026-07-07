@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,7 @@ class WhisperBackend(TranscriptionBackend):
         audio_path: str,
         language: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> TranscriptResult:
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -55,6 +57,8 @@ class WhisperBackend(TranscriptionBackend):
         total_duration = info.duration
 
         for i, seg in enumerate(segments):
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Transcription cancelled")
             text_parts.append(seg.text)
             segment_list.append(
                 Segment(start=seg.start, end=seg.end, text=seg.text.strip())

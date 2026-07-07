@@ -3,11 +3,11 @@ use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 // ── Database ──────────────────────────────────────────────────────────────
@@ -28,7 +28,29 @@ fn map_session(row: &Row) -> rusqlite::Result<Session> {
         llm_model: row.get(9)?,
         transcription_model: row.get(10)?,
         created_at: row.get(11)?,
+        notes: Vec::new(),
     })
+}
+
+fn fetch_session_notes(conn: &Connection, session_id: &str) -> Vec<SessionNote> {
+    let mut stmt = match conn.prepare(
+        "SELECT id, session_id, format, note, llm_model, created_at FROM session_notes WHERE session_id = ?1 ORDER BY format ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![session_id], |row| {
+        Ok(SessionNote {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            format: row.get(2)?,
+            note: row.get(3)?,
+            llm_model: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 struct Database {
@@ -66,9 +88,70 @@ impl Database {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS note_formats (
+                id TEXT PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                prompt TEXT NOT NULL,
+                is_builtin INTEGER DEFAULT 0,
+                hidden INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_notes (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                format TEXT NOT NULL,
+                note TEXT,
+                llm_model TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, format)
             );",
         )
         .map_err(|e| e.to_string())?;
+
+        // Migration: add hidden column if missing (for existing DBs)
+        let _ = conn.execute("ALTER TABLE note_formats ADD COLUMN hidden INTEGER DEFAULT 0", []);
+
+        // Migration: move existing session.note → session_notes
+        let migrated: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_notes", [], |row| row.get(0))
+            .unwrap_or(0);
+        if migrated == 0 {
+            let mut stmt = conn
+                .prepare("SELECT id, note, note_format, llm_model, created_at FROM sessions WHERE note IS NOT NULL")
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<(String, String, String, Option<String>, String)> = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            for (sid, note, fmt, llm, created) in rows {
+                let nid = Uuid::new_v4().to_string();
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO session_notes (id, session_id, format, note, llm_model, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![nid, sid, fmt, note, llm, created],
+                );
+            }
+        }
+
+        // Seed default formats if table is empty
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM note_formats", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if count == 0 {
+            let now = Local::now().to_rfc3339();
+            for (name, prompt) in DEFAULT_FORMATS {
+                let id = Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO note_formats (id, name, prompt, is_builtin, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
+                    params![id, name, prompt, now],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
         Ok(Database { conn })
     }
 }
@@ -95,6 +178,28 @@ struct Session {
     note_format: Option<String>,
     llm_model: Option<String>,
     transcription_model: Option<String>,
+    created_at: String,
+    #[serde(default)]
+    notes: Vec<SessionNote>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SessionNote {
+    id: String,
+    session_id: String,
+    format: String,
+    note: Option<String>,
+    llm_model: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct NoteFormatTemplate {
+    id: String,
+    name: String,
+    prompt: String,
+    is_builtin: bool,
+    hidden: bool,
     created_at: String,
 }
 
@@ -135,25 +240,158 @@ struct UpdateSession {
     transcription_model: Option<String>,
 }
 
-// ── Sidecar ───────────────────────────────────────────────────────────────
-
-struct SidecarHandles {
-    stdin: ChildStdin,
-    stdout: ChildStdout,
-    child: Child,
+#[derive(Debug, Deserialize)]
+struct CreateNoteFormat {
+    name: String,
+    prompt: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateNoteFormat {
+    id: String,
+    name: String,
+    prompt: String,
+}
+
+// ── Default Format Prompts ────────────────────────────────────────────────
+
+const SOAP_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a SOAP note from a therapy session transcript.
+
+Rules:
+- Base all clinical statements ONLY on what the client says in the transcript.
+- When information for a section is absent from the transcript, write "Insufficient information in transcript."
+- Do NOT fabricate or hallucinate diagnoses, symptoms, or history.
+- Use person-first language (e.g., "client with anxiety" not "anxious client").
+- Remove any identifying information (names, locations, dates) and replace with [deidentified].
+- If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
+- Use professional clinical terminology appropriate to the discipline.
+- Maintain client dignity and avoid judgmental language.
+
+Output format:
+
+**Subjective:**
+- Chief complaint / reason for session (client's own words)
+- Symptoms reported (affect, mood, concerns)
+- Relevant client statements (paraphrased, quoted)
+
+**Objective:**
+- Therapist observations (appearance, behavior, affect, engagement)
+- Interventions used (CBT, MI, ACT, etc.)
+- Client response to interventions
+
+**Assessment:**
+- Clinical impressions (supported by transcript evidence)
+- Progress toward treatment goals
+- Risk assessment (if applicable)
+
+**Plan:**
+- Next session focus
+- Homework or between-session tasks
+- Referrals or coordination (if indicated)"#;
+
+const CBT_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a CBT session note from a therapy session transcript.
+
+Rules:
+- Base all clinical statements ONLY on what the client says in the transcript.
+- When information for a section is absent, write "Insufficient information in transcript."
+- Do NOT fabricate or hallucinate diagnoses, symptoms, or history.
+- Remove any identifying information and replace with [deidentified].
+- If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
+
+Output format:
+
+**Session Overview:**
+- Session number / phase of treatment (if discernible)
+- Presenting concerns and session focus
+
+**Cognitive Conceptualization:**
+- Automatic thoughts identified
+- Cognitive distortions noted
+- Core beliefs / schemas addressed
+
+**Behavioral Interventions:**
+- Behavioral activation tasks
+- Exposure work (if applicable)
+- Homework review
+
+**Cognitive Interventions:**
+- Socratic dialogue / guided discovery
+- Cognitive restructuring
+- Behavioral experiments discussed
+
+**Progress and Plan:**
+- Progress toward goals
+- Homework assigned
+- Next session focus"#;
+
+const INTAKE_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate an intake assessment from an initial therapy session transcript.
+
+Rules:
+- Base all clinical statements ONLY on what the client says in the transcript.
+- When information for a section is absent from the transcript, write "Insufficient information in transcript."
+- Do NOT fabricate or hallucinate diagnoses, symptoms, history, or demographics.
+- Remove any identifying information and replace with [deidentified].
+- If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
+- This is an initial assessment; do not assume prior treatment relationship.
+
+Output format:
+
+**Presenting Problem:**
+- Reason for seeking treatment (client's description)
+- Onset, duration, and context of symptoms
+- Previous treatment history (if discussed)
+
+**Mental Status:**
+- Appearance and behavior
+- Mood and affect
+- Thought process and content
+- Cognitive functioning
+
+**Risk Assessment:**
+- Suicidal ideation (presence, plan, intent, means)
+- Self-harm behaviors
+- Risk to others
+- Protective factors
+
+**Clinical Impressions:**
+- Preliminary observations (supported by transcript)
+- Areas for further assessment
+- Differential considerations
+
+**Initial Plan:**
+- Recommended treatment approach
+- Frequency and duration
+- Immediate safety plan (if indicated)
+- Coordination of care (if indicated)"#;
+
+const DEFAULT_FORMATS: &[(&str, &str)] = &[
+    ("soap", SOAP_PROMPT),
+    ("cbt", CBT_PROMPT),
+    ("intake", INTAKE_PROMPT),
+];
+
+// ── Sidecar ───────────────────────────────────────────────────────────────
+
 struct SidecarState {
-    handles: Option<SidecarHandles>,
+    request_tx: Option<mpsc::UnboundedSender<String>>,
+    response_tx: Option<oneshot::Sender<Result<Value, String>>>,
+    child: Option<Child>,
     started: bool,
+    busy: bool,
+}
+
+type SharedSidecarState = Arc<Mutex<SidecarState>>;
+
+fn emit_sidecar_state(app: &AppHandle, busy: bool) {
+    let _ = app.emit("sidecar-state", serde_json::json!({ "busy": busy }));
 }
 
 // ── Sidecar Commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn start_sidecar(app: AppHandle, state: State<'_, Mutex<SidecarState>>) -> Result<String, String> {
+async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> Result<String, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
-    if s.handles.is_some() {
+    if s.started {
         return Err("Sidecar already running".into());
     }
 
@@ -179,7 +417,6 @@ async fn start_sidecar(app: AppHandle, state: State<'_, Mutex<SidecarState>>) ->
     };
 
     // MLX needs to find libmlx.dylib via DYLD_FALLBACK_LIBRARY_PATH
-    // The metallib is loaded relative to the dylib location
     let mlx_lib_dir = sidecar_path.parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("_internal/mlx/lib");
@@ -190,7 +427,6 @@ async fn start_sidecar(app: AppHandle, state: State<'_, Mutex<SidecarState>>) ->
         format!("{}:{}", mlx_lib_dir.display(), dyld_path)
     };
 
-    // Redirect stderr to a log file for debugging
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let log_path = app_dir.join("sidecar.log");
     let stderr = std::fs::OpenOptions::new()
@@ -214,92 +450,37 @@ async fn start_sidecar(app: AppHandle, state: State<'_, Mutex<SidecarState>>) ->
     let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
 
-    s.handles = Some(SidecarHandles {
-        stdin,
-        stdout,
-        child,
-    });
-    s.started = true;
+    let (req_tx, req_rx) = mpsc::unbounded_channel::<String>();
 
-    Ok("Sidecar started".into())
-}
-
-#[tauri::command]
-async fn stop_sidecar(state: State<'_, Mutex<SidecarState>>) -> Result<String, String> {
-    let mut s = state.lock().map_err(|e| e.to_string())?;
-    if let Some(handles) = s.handles.take() {
-        s.started = false;
-        let mut stdin = handles.stdin;
-        let mut child = handles.child;
-        let _ = writeln!(stdin, r#"{{"type":"exit"}}"#);
-        let _ = stdin.flush();
-
-        // Try graceful shutdown, then force kill after 5 seconds
-        let start = std::time::Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if start.elapsed() > Duration::from_secs(5) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    break;
-                }
+    // Writer task: owns stdin, drains request channel
+    std::thread::spawn(move || {
+        let mut stdin = stdin;
+        let mut rx = req_rx;
+        while let Some(line) = rx.blocking_recv() {
+            if writeln!(stdin, "{}", line).is_err() {
+                break;
+            }
+            if stdin.flush().is_err() {
+                break;
             }
         }
-        Ok("Sidecar stopped".into())
-    } else {
-        Err("No sidecar running".into())
-    }
-}
+        // stdin dropped here → sidecar gets EOF on its stdin
+    });
 
-#[tauri::command]
-async fn rpc_call(
-    app: AppHandle,
-    state: State<'_, Mutex<SidecarState>>,
-    request: String,
-) -> Result<Value, String> {
-    let handles = {
-        let mut s = state.lock().map_err(|e| e.to_string())?;
-        s.handles.take().ok_or("Sidecar not running")?
-    };
-
+    // Reader task: owns stdout, emits progress, routes responses
     let app_clone = app.clone();
-    let (result, returned_handles) = tokio::task::spawn_blocking(move || {
-        let mut stdin = handles.stdin;
-        let mut stdout = handles.stdout;
-        let mut child = handles.child;
-
-        if let Err(e) = writeln!(stdin, "{}", request) {
-            return (Err(format!("Write error: {}", e)), None);
-        }
-        if let Err(e) = stdin.flush() {
-            return (Err(format!("Flush error: {}", e)), None);
-        }
-
-        let reader = BufReader::new(&mut stdout);
+    let state_clone: SharedSidecarState = state.inner().clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(e) => {
-                    // stdout read error — sidecar likely died. Kill + reap child.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return (Err(format!("Read error: {}", e)), None);
-                }
+                Err(_) => break,  // EOF or error → sidecar died
             };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-
-            // Skip non-JSON lines (stray prints) instead of failing
             let parsed: Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -310,45 +491,145 @@ async fn rpc_call(
                     let _ = app_clone.emit("sidecar-progress", &parsed);
                 }
                 Some("result") | Some("pong") => {
-                    let handles = Some(SidecarHandles { stdin, stdout, child });
-                    return (Ok(parsed), handles);
+                    let resp_tx = {
+                        if let Ok(mut s) = state_clone.lock() {
+                            s.response_tx.take()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(tx) = resp_tx {
+                        let _ = tx.send(Ok(parsed));
+                    }
+                    if let Ok(mut s) = state_clone.lock() {
+                        s.busy = false;
+                    }
+                    emit_sidecar_state(&app_clone, false);
                 }
                 Some("error") => {
                     let msg = parsed
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown error");
-                    // Sidecar is still alive after an error — restore handles
-                    let handles = Some(SidecarHandles { stdin, stdout, child });
-                    return (Err(msg.into()), handles);
+                        .unwrap_or("Unknown error")
+                        .to_string();
+                    let resp_tx = {
+                        if let Ok(mut s) = state_clone.lock() {
+                            s.response_tx.take()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(tx) = resp_tx {
+                        let _ = tx.send(Err(msg));
+                    }
+                    if let Ok(mut s) = state_clone.lock() {
+                        s.busy = false;
+                    }
+                    emit_sidecar_state(&app_clone, false);
                 }
                 _ => {}
             }
         }
 
-        // EOF on stdout — sidecar died. Kill + reap child to avoid zombie.
-        let _ = child.kill();
-        let _ = child.wait();
-        (Err("Sidecar closed connection unexpectedly".into()), None)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    {
-        let mut s = state.lock().map_err(|e| e.to_string())?;
-        if let Some(h) = returned_handles {
-            s.handles = Some(h);
-        } else {
-            // Sidecar died — clear started flag
+        // EOF on stdout — sidecar died
+        if let Ok(mut s) = state_clone.lock() {
             s.started = false;
+            s.busy = false;
+            if let Some(tx) = s.response_tx.take() {
+                let _ = tx.send(Err("Sidecar closed connection unexpectedly".into()));
+            }
         }
-    }
+        emit_sidecar_state(&app_clone, false);
+    });
 
-    result
+    s.request_tx = Some(req_tx);
+    s.child = Some(child);
+    s.started = true;
+    s.busy = false;
+
+    Ok("Sidecar started".into())
 }
 
 #[tauri::command]
-async fn is_running(state: State<'_, Mutex<SidecarState>>) -> Result<bool, String> {
+async fn stop_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> Result<String, String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    s.started = false;
+    s.busy = false;
+    s.request_tx.take();  // drop → writer task exits, stdin closes
+
+    if let Some(tx) = s.response_tx.take() {
+        let _ = tx.send(Err("Sidecar stopped".into()));
+    }
+
+    if let Some(mut child) = s.child.take() {
+        // Try graceful kill, then force kill after 5 seconds
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    emit_sidecar_state(&app, false);
+    Ok("Sidecar stopped".into())
+}
+
+#[tauri::command]
+async fn rpc_call(
+    app: AppHandle,
+    state: State<'_, SharedSidecarState>,
+    request: String,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        if !s.started {
+            return Err("Sidecar not running".into());
+        }
+        if s.busy {
+            return Err("sidecar_busy".into());
+        }
+        let req_tx = match &s.request_tx {
+            Some(tx) => tx.clone(),
+            None => return Err("Sidecar not running".into()),
+        };
+        s.busy = true;
+        s.response_tx = Some(tx);
+
+        if req_tx.send(request).is_err() {
+            s.busy = false;
+            s.response_tx.take();
+            return Err("Failed to send request to sidecar".into());
+        }
+    }
+
+    emit_sidecar_state(&app, true);
+
+    match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            let mut s = state.lock().map_err(|e| e.to_string())?;
+            s.busy = false;
+            emit_sidecar_state(&app, false);
+            Err("Sidecar response channel closed".into())
+        }
+        Err(_) => {
+            let mut s = state.lock().map_err(|e| e.to_string())?;
+            s.busy = false;
+            emit_sidecar_state(&app, false);
+            Err("Sidecar operation timed out".into())
+        }
+    }
+}
+
+#[tauri::command]
+async fn cancel_sidecar(state: State<'_, SharedSidecarState>) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    if let Some(tx) = &s.request_tx {
+        let _ = tx.send(r#"{"type":"cancel"}"#.to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn is_running(state: State<'_, SharedSidecarState>) -> Result<bool, String> {
     match state.lock() {
         Ok(s) => Ok(s.started),
         Err(e) => Err(e.to_string()),
@@ -433,7 +714,7 @@ async fn list_sessions(
         (format!("SELECT {} FROM sessions ORDER BY date DESC", SESSION_COLUMNS), false)
     };
     let mut stmt = db.conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let sessions: Vec<Session> = if has_param {
+    let mut sessions: Vec<Session> = if has_param {
         stmt.query_map(params![patient_id], map_session)
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
@@ -444,6 +725,9 @@ async fn list_sessions(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
     };
+    for s in &mut sessions {
+        s.notes = fetch_session_notes(&db.conn, &s.id);
+    }
     Ok(sessions)
 }
 
@@ -471,6 +755,7 @@ async fn create_session(db: State<'_, Mutex<Database>>, data: CreateSession) -> 
         llm_model: None,
         transcription_model: None,
         created_at: now,
+        notes: Vec::new(),
     })
 }
 
@@ -513,7 +798,10 @@ async fn get_session(db: State<'_, Mutex<Database>>, id: String) -> Result<Optio
     let mut stmt = db.conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt.query_map(params![id], map_session).map_err(|e| e.to_string())?;
     match rows.next() {
-        Some(Ok(session)) => Ok(Some(session)),
+        Some(Ok(mut session)) => {
+            session.notes = fetch_session_notes(&db.conn, &session.id);
+            Ok(Some(session))
+        }
         Some(Err(e)) => Err(e.to_string()),
         None => Ok(None),
     }
@@ -524,6 +812,74 @@ async fn delete_session(db: State<'_, Mutex<Database>>, id: String) -> Result<()
     let db = db.lock().map_err(|e| e.to_string())?;
     db.conn
         .execute("DELETE FROM sessions WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn create_session_note(
+    db: State<'_, Mutex<Database>>,
+    session_id: String,
+    format: String,
+    note: String,
+    llm_model: Option<String>,
+) -> Result<SessionNote, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let id = Uuid::new_v4().to_string();
+    let now = Local::now().to_rfc3339();
+    db.conn.execute(
+        "INSERT INTO session_notes (id, session_id, format, note, llm_model, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id, format) DO UPDATE SET note = ?4, llm_model = ?5",
+        params![id, session_id, format, note, llm_model, now],
+    )
+    .map_err(|e| e.to_string())?;
+    // Fetch the actual row back so id/created_at are correct on conflict
+    let row = db.conn
+        .query_row(
+            "SELECT id, session_id, format, note, llm_model, created_at FROM session_notes WHERE session_id = ?1 AND format = ?2",
+            params![session_id, format],
+            |row| Ok(SessionNote {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                format: row.get(2)?,
+                note: row.get(3)?,
+                llm_model: row.get(4)?,
+                created_at: row.get(5)?,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(row)
+}
+
+#[tauri::command]
+async fn get_patient_formats(db: State<'_, Mutex<Database>>, patient_id: String) -> Result<Vec<String>, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let key = format!("patient_formats_{}", patient_id);
+    let mut stmt = db.conn
+        .prepare("SELECT value FROM settings WHERE key = ?1")
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    match rows.next() {
+        Some(Ok(v)) => {
+            let formats: Vec<String> = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            Ok(formats)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+#[tauri::command]
+async fn set_patient_formats(db: State<'_, Mutex<Database>>, patient_id: String, formats: Vec<String>) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let key = format!("patient_formats_{}", patient_id);
+    let value = formats.join(",");
+    db.conn
+        .execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -553,6 +909,141 @@ async fn set_setting(db: State<'_, Mutex<Database>>, key: String, value: String)
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
             params![key, value],
         )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── Note Format Templates ─────────────────────────────────────────────────
+
+fn map_note_format(row: &Row) -> rusqlite::Result<NoteFormatTemplate> {
+    Ok(NoteFormatTemplate {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        prompt: row.get(2)?,
+        is_builtin: row.get::<_, i64>(3)? != 0,
+        hidden: row.get::<_, i64>(4)? != 0,
+        created_at: row.get(5)?,
+    })
+}
+
+#[tauri::command]
+async fn list_note_formats(db: State<'_, Mutex<Database>>) -> Result<Vec<NoteFormatTemplate>, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = db.conn
+        .prepare("SELECT id, name, prompt, is_builtin, hidden, created_at FROM note_formats ORDER BY hidden ASC, is_builtin DESC, name ASC")
+        .map_err(|e| e.to_string())?;
+    let formats = stmt
+        .query_map([], map_note_format)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(formats)
+}
+
+#[tauri::command]
+async fn create_note_format(db: State<'_, Mutex<Database>>, data: CreateNoteFormat) -> Result<NoteFormatTemplate, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let id = Uuid::new_v4().to_string();
+    let now = Local::now().to_rfc3339();
+    db.conn
+        .execute(
+            "INSERT INTO note_formats (id, name, prompt, is_builtin, hidden, created_at) VALUES (?1, ?2, ?3, 0, 0, ?4)",
+            params![id, data.name, data.prompt, now],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(NoteFormatTemplate {
+        id,
+        name: data.name,
+        prompt: data.prompt,
+        is_builtin: false,
+        hidden: false,
+        created_at: now,
+    })
+}
+
+#[tauri::command]
+async fn update_note_format(db: State<'_, Mutex<Database>>, data: UpdateNoteFormat) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    // Get old name to cascade rename in session_notes
+    let old_name: Option<String> = tx
+        .query_row("SELECT name FROM note_formats WHERE id = ?1", params![data.id], |row| row.get(0))
+        .ok();
+    let affected = tx
+        .execute(
+            "UPDATE note_formats SET name = ?1, prompt = ?2 WHERE id = ?3",
+            params![data.name, data.prompt, data.id],
+        )
+        .map_err(|e| e.to_string())?;
+    if affected == 0 {
+        return Err("Format not found".into());
+    }
+    // Cascade rename session_notes if name changed
+    if let Some(old) = old_name {
+        if old != data.name {
+            tx.execute(
+                "UPDATE session_notes SET format = ?1 WHERE format = ?2",
+                params![data.name, old],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    // Refuse to delete built-in formats — they can only be reset or hidden.
+    let is_builtin: i64 = db.conn
+        .query_row("SELECT is_builtin FROM note_formats WHERE id = ?1", params![id], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if is_builtin != 0 {
+        return Err("Built-in formats cannot be deleted. Use Reset or Hide instead.".into());
+    }
+    // Refuse to delete if session_notes reference this format
+    let name: String = db.conn
+        .query_row("SELECT name FROM note_formats WHERE id = ?1", params![id], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let note_count: i64 = db.conn
+        .query_row("SELECT COUNT(*) FROM session_notes WHERE format = ?1", params![name], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if note_count > 0 {
+        return Err(format!(
+            "Cannot delete format '{}' — {} session note(s) reference it. Remove those notes first.",
+            name, note_count
+        ));
+    }
+    db.conn
+        .execute("DELETE FROM note_formats WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn reset_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let name: String = db.conn
+        .query_row("SELECT name FROM note_formats WHERE id = ?1", params![id], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let default_prompt = DEFAULT_FORMATS.iter().find(|(n, _)| *n == name).map(|(_, p)| *p);
+    match default_prompt {
+        Some(prompt) => {
+            db.conn
+                .execute("UPDATE note_formats SET prompt = ?1 WHERE id = ?2", params![prompt, id])
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        None => Err(format!("No default prompt for format '{}'", name)),
+    }
+}
+
+#[tauri::command]
+async fn toggle_note_format_hidden(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.conn
+        .execute("UPDATE note_formats SET hidden = NOT hidden WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -594,7 +1085,13 @@ pub fn run() {
                     e
                 })?;
             app.manage(Mutex::new(db));
-            app.manage(Mutex::new(SidecarState { handles: None, started: false }));
+            app.manage(Arc::new(Mutex::new(SidecarState {
+                request_tx: None,
+                response_tx: None,
+                child: None,
+                started: false,
+                busy: false,
+            })));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -602,6 +1099,7 @@ pub fn run() {
             stop_sidecar,
             rpc_call,
             is_running,
+            cancel_sidecar,
             list_patients,
             create_patient,
             update_patient,
@@ -611,9 +1109,18 @@ pub fn run() {
             update_session,
             get_session,
             delete_session,
+            create_session_note,
+            get_patient_formats,
+            set_patient_formats,
             get_setting,
             set_setting,
             pick_audio_file,
+            list_note_formats,
+            create_note_format,
+            update_note_format,
+            delete_note_format,
+            reset_note_format,
+            toggle_note_format_hidden,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
+import threading
 
 
 @dataclass
@@ -24,6 +25,7 @@ class LLMBackend(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         thinking: bool = False,
+        cancel_event: Optional[threading.Event] = None,
     ) -> str:
         ...
 

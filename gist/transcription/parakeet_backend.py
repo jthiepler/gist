@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +30,7 @@ class ParakeetBackend(TranscriptionBackend):
         audio_path: str,
         language: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> TranscriptResult:
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -49,6 +51,8 @@ class ParakeetBackend(TranscriptionBackend):
             overlap_duration=_OVERLAP_SECONDS,
             stream=True,
         ):
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Transcription cancelled")
             new_text = getattr(chunk, "text", "") or ""
             if new_text:
                 text_parts.append(new_text)

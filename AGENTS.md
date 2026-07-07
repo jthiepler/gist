@@ -72,7 +72,7 @@ CLI + JSON-RPC server for transcription and clinical note generation.
 
 ### Default Models
 - LLM: qwen-3.5-4b (MLX, ~2.5 GB)
-- Transcription: whisper-base (~150 MB)
+- Transcription: parakeet-tdt-0.6b-v3 (~230 MB)
 
 ### Backends
 - LLM: MLX (macOS) or OpenAI-compatible (debug)

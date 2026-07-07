@@ -14,8 +14,14 @@ export const sidecarRunning = writable<boolean>(false);
 export const progressPercent = writable<number>(0);
 export const progressStage = writable<string>("");
 export const progressEta = writable<number | null>(null);
-export const progressAudioDuration = writable<number | null>(null);
+export const progressBase = writable<number>(0);
+export const progressScale = writable<number>(100);
 export const currentOperation = writable<string | null>(null);
+
+// Sidecar busy state — true when an operation is in flight
+export const sidecarBusy = writable<boolean>(false);
+// Active operation descriptor for the persistent progress banner
+export const activeOperation = writable<{ type: string | null; label: string }>({ type: null, label: "" });
 
 // Dark mode
 export const darkMode = writable<boolean>(false);

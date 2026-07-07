@@ -13,13 +13,11 @@ dependencies = [
     "tqdm>=4.60.0",
     "mlx-audio[stt]>=0.4.4",
     "cffi<2",  # mlx-audio's transitive cffi 2.x breaks against bundled llvm
+    "miniaudio>=1.59",
 ]
 
 [project.scripts]
 gist = "gist.__main__:cli"
-
-[project.optional-dependencies]
-openai = ["openai>=1.0.0"]
 
 [build-system]
 requires = ["hatchling"]
