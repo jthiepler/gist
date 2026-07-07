@@ -20,7 +20,7 @@ __pycache__/
 
 # PyInstaller sidecar build output
 /dist/gist-sidecar
-/src-tauri/resources/gist-sidecar
+/src-tauri/resources/
 
 # Rust / Tauri
 /src-tauri/target
