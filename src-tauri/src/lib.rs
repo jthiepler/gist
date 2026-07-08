@@ -10,6 +10,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+mod audio;
+
 // ── Database ──────────────────────────────────────────────────────────────
 
 const SESSION_COLUMNS: &str = "id, patient_id, date, audio_file, duration_seconds, transcript, language, note, note_format, llm_model, transcription_model, created_at";
@@ -709,9 +711,9 @@ async fn list_sessions(
 ) -> Result<Vec<Session>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let (sql, has_param) = if patient_id.is_some() {
-        (format!("SELECT {} FROM sessions WHERE patient_id = ?1 ORDER BY date DESC", SESSION_COLUMNS), true)
+        (format!("SELECT {} FROM sessions WHERE patient_id = ?1 ORDER BY created_at DESC", SESSION_COLUMNS), true)
     } else {
-        (format!("SELECT {} FROM sessions ORDER BY date DESC", SESSION_COLUMNS), false)
+        (format!("SELECT {} FROM sessions ORDER BY created_at DESC", SESSION_COLUMNS), false)
     };
     let mut stmt = db.conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut sessions: Vec<Session> = if has_param {
@@ -1070,6 +1072,37 @@ async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
     }
 }
 
+// ── Audio Recording ───────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_audio_devices() -> Result<Vec<audio::AudioDeviceInfo>, String> {
+    audio::list_audio_devices().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn start_recording(
+    app: AppHandle,
+    mic_device: Option<String>,
+    system_device: Option<String>,
+) -> Result<(), String> {
+    audio::recorder::start_recording(app, mic_device, system_device).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stop_recording(app: AppHandle) -> Result<audio::recorder::StopRecordingResult, String> {
+    audio::recorder::stop_recording(app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn is_recording() -> bool {
+    audio::recorder::is_recording()
+}
+
+#[tauri::command]
+async fn get_recording_state() -> audio::recorder::RecordingStatePayload {
+    audio::recorder::get_recording_state()
+}
+
 // ── App Entry ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1121,6 +1154,11 @@ pub fn run() {
             delete_note_format,
             reset_note_format,
             toggle_note_format_hidden,
+            list_audio_devices,
+            start_recording,
+            stop_recording,
+            is_recording,
+            get_recording_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

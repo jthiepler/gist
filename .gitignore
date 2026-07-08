@@ -31,3 +31,6 @@ __pycache__/
 
 # Test scratch
 test*.md
+
+# Reference codebase
+/meetily

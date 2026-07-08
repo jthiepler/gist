@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
-import type { Patient } from "./types";
+import type { Patient, Session } from "./types";
+import type { RecordingContext } from "./processSession";
 
 // Patient list — shared between sidebar and workspace
 export const patients = writable<Patient[]>([]);
@@ -25,3 +26,21 @@ export const activeOperation = writable<{ type: string | null; label: string }>(
 
 // Dark mode
 export const darkMode = writable<boolean>(false);
+
+// Recording state
+export const isRecording = writable<boolean>(false);
+ export const recordingElapsed = writable<number>(0);
+export const recordingLevel = writable<number>(0);
+
+// Recording context — saved when starting a recording so the layout can
+// trigger transcription + note generation when recording stops, even if
+// the NewSessionPanel component has been unmounted.
+export const recordingContext = writable<RecordingContext | null>(null);
+
+// Pending session — set by the layout after processing a recording,
+// consumed by the patient page to prepend to its session list.
+export const pendingSession = writable<Session | null>(null);
+
+// Live session update — fires at each step of processing (transcript saved,
+// each note generated) so the patient page can update in real time.
+export const sessionUpdate = writable<Session | null>(null);

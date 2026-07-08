@@ -3,8 +3,9 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { isRunning, startSidecar, onProgress, cancelSidecar } from "$lib/rpc";
-  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressBase, progressScale, darkMode, sidecarBusy, activeOperation } from "$lib/stores";
+  import { isRunning, startSidecar, onProgress, cancelSidecar, checkIsRecording, getRecordingState, stopRecording, onRecordingTick, onRecordingStopped } from "$lib/rpc";
+  import { processSessionFromAudio } from "$lib/processSession";
+  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressBase, progressScale, darkMode, sidecarBusy, activeOperation, isRecording, recordingElapsed, recordingLevel, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
   import { get } from "svelte/store";
   import { loadDarkMode } from "$lib/settings";
   import { page } from "$app/stores";
@@ -14,6 +15,9 @@
 
   let unlistenProgress: UnlistenFn | null = null;
   let unlistenState: UnlistenFn | null = null;
+  let unlistenRecTick: UnlistenFn | null = null;
+  let unlistenRecStopped: UnlistenFn | null = null;
+  let recordingPollInterval: ReturnType<typeof setInterval> | null = null;
   let showAddForm = $state(false);
   let newName = $state("");
   let addError = $state("");
@@ -76,6 +80,58 @@
 
     // Load dark mode setting
     await loadDarkMode();
+
+    // Recording state sync — recover state after navigation/reload
+    try {
+      const state = await getRecordingState();
+      if (state.is_recording) {
+        isRecording.set(true);
+        recordingElapsed.set(state.elapsed_seconds);
+      }
+    } catch (e) {
+      console.error("Failed to sync recording state:", e);
+    }
+
+    // Recording tick listener
+    unlistenRecTick = await onRecordingTick((data) => {
+      recordingElapsed.set(data.elapsed_seconds);
+      recordingLevel.set(data.level);
+    });
+
+    // Recording stopped listener — triggers transcription + note generation
+    unlistenRecStopped = await onRecordingStopped(async (data) => {
+      isRecording.set(false);
+      recordingElapsed.set(0);
+      recordingLevel.set(0);
+
+      const ctx = get(recordingContext);
+      if (!ctx) {
+        return;
+      }
+      recordingContext.set(null);
+
+      try {
+        const session = await processSessionFromAudio(data.file_path, ctx);
+        pendingSession.set(session);
+        sessionUpdate.set(null);
+      } catch (e) {
+        console.error("Session processing failed:", e);
+      }
+    });
+
+    // Fallback polling (every 1s) in case events are missed
+    recordingPollInterval = setInterval(async () => {
+      try {
+        const running = await checkIsRecording();
+        if (running !== $isRecording) {
+          isRecording.set(running);
+          if (running) {
+            const state = await getRecordingState();
+            recordingElapsed.set(state.elapsed_seconds);
+          }
+        }
+      } catch {}
+    }, 1000);
   });
 
   // Apply dark mode class to <html>
@@ -90,6 +146,9 @@
   onDestroy(() => {
     unlistenProgress?.();
     unlistenState?.();
+    unlistenRecTick?.();
+    unlistenRecStopped?.();
+    if (recordingPollInterval) clearInterval(recordingPollInterval);
   });
 
   // Sync selectedPatientId from URL
@@ -118,6 +177,22 @@
     } catch (e) {
       console.error("Cancel failed:", e);
     }
+  }
+
+  async function handleStopRecording() {
+    try {
+      await stopRecording();
+    } catch (e) {
+      console.error("Stop recording failed:", e);
+    }
+  }
+
+  function formatElapsed(seconds: number): string {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    return `${m}:${String(s).padStart(2, "0")}`;
   }
 
   let pathname = $derived($page.url.pathname);
@@ -195,5 +270,20 @@
     {#if $progressEta != null && $progressEta > 0}
       <div class="progress-card-eta">~{formatEta($progressEta)} remaining</div>
     {/if}
+  </div>
+{/if}
+
+{#if $isRecording}
+  <div class="recording-card">
+    <div class="recording-card-header">
+      <span class="recording-card-title">
+        <span class="recording-dot"></span>
+        REC {formatElapsed($recordingElapsed)}
+      </span>
+      <button class="recording-card-stop" onclick={handleStopRecording}>Stop</button>
+    </div>
+    <div class="recording-level-bar">
+      <div class="recording-level-fill" style="width: {Math.min($recordingLevel * 100, 100)}%;"></div>
+    </div>
   </div>
 {/if}

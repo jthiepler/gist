@@ -121,3 +121,63 @@ export async function resetNoteFormat(id: string): Promise<void> {
 export async function toggleNoteFormatHidden(id: string): Promise<void> {
   return invoke<void>("toggle_note_format_hidden", { id });
 }
+
+// ── Audio Recording ─────────────────────────────────────────────────────────
+
+export interface AudioDevice {
+  name: string;
+  device_type: string; // "input" | "output"
+}
+
+export interface RecordingStateInfo {
+  is_recording: boolean;
+  elapsed_seconds: number;
+  has_recording: boolean;
+  file_path: string | null;
+}
+
+export interface StopRecordingResult {
+  file_path: string;
+  duration_seconds: number;
+}
+
+export interface RecordingTickPayload {
+  elapsed_seconds: number;
+  level: number;
+}
+
+export interface RecordingStoppedPayload {
+  file_path: string;
+  duration_seconds: number;
+}
+
+export async function listAudioDevices(): Promise<AudioDevice[]> {
+  return invoke<AudioDevice[]>("list_audio_devices");
+}
+
+export async function startRecording(micDevice?: string, systemDevice?: string): Promise<void> {
+  await invoke<void>("start_recording", {
+    micDevice: micDevice || null,
+    systemDevice: systemDevice || null,
+  });
+}
+
+export async function stopRecording(): Promise<StopRecordingResult> {
+  return invoke<StopRecordingResult>("stop_recording");
+}
+
+export async function checkIsRecording(): Promise<boolean> {
+  return invoke<boolean>("is_recording");
+}
+
+export async function getRecordingState(): Promise<RecordingStateInfo> {
+  return invoke<RecordingStateInfo>("get_recording_state");
+}
+
+export async function onRecordingTick(callback: (data: RecordingTickPayload) => void): Promise<UnlistenFn> {
+  return listen<RecordingTickPayload>("recording-tick", (event) => callback(event.payload));
+}
+
+export async function onRecordingStopped(callback: (data: RecordingStoppedPayload) => void): Promise<UnlistenFn> {
+  return listen<RecordingStoppedPayload>("recording-stopped", (event) => callback(event.payload));
+}

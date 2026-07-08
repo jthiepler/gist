@@ -1,9 +1,10 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { confirm } from "@tauri-apps/plugin-dialog";
+  import { untrack } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
-  import { patients, sidecarBusy, activeOperation } from "$lib/stores";
+  import { patients, sidecarBusy, activeOperation, isRecording, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
   import { generateNote, listNoteFormats, getPatientFormats, createSessionNote } from "$lib/rpc";
   import { progressPercent, progressStage, progressBase, progressScale, currentOperation } from "$lib/stores";
   import { loadSettings } from "$lib/settings";
@@ -47,6 +48,43 @@
     })();
 
     return () => { stale = true; };
+  });
+
+  // Keep New Session panel open while a recording is in progress for this patient
+  $effect(() => {
+    if ($isRecording && $recordingContext?.patientId === patientId) {
+      showNewSession = true;
+    }
+  });
+
+  // Upsert a session into the list without triggering reactive loops
+  function upsertSession(s: Session) {
+    const exists = untrack(() => sessions.some((x) => x.id === s.id));
+    if (exists) {
+      sessions = untrack(() =>
+        sessions.map((x) => (x.id === s.id ? s : x)),
+      );
+    } else {
+      sessions = untrack(() => [s, ...sessions]);
+    }
+  }
+
+  // Live-update: fires at each step of processing (transcript saved, each note)
+  $effect(() => {
+    const s = $sessionUpdate;
+    if (s && s.patient_id === patientId) {
+      upsertSession(s);
+    }
+  });
+
+  // Watch for sessions processed by the layout (from recording-stopped)
+  $effect(() => {
+    const s = $pendingSession;
+    if (s && s.patient_id === patientId) {
+      upsertSession(s);
+      pendingSession.set(null);
+      showNewSession = false;
+    }
   });
 
   let lastSessionDate = $derived(
