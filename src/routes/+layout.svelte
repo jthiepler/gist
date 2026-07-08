@@ -3,9 +3,9 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { isRunning, startSidecar, onProgress, cancelSidecar, checkIsRecording, getRecordingState, stopRecording, onRecordingTick, onRecordingStopped } from "$lib/rpc";
+  import { isRunning, startSidecar, onProgress, cancelSidecar, checkIsRecording, getRecordingState, stopRecording, pauseRecording, resumeRecording, onRecordingTick, onRecordingStopped } from "$lib/rpc";
   import { processSessionFromAudio } from "$lib/processSession";
-  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressBase, progressScale, darkMode, sidecarBusy, activeOperation, isRecording, recordingElapsed, recordingLevel, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
+  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressBase, progressScale, darkMode, sidecarBusy, activeOperation, isRecording, recordingPaused, recordingElapsed, recordingLevel, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
   import { get } from "svelte/store";
   import { loadDarkMode } from "$lib/settings";
   import { page } from "$app/stores";
@@ -86,6 +86,7 @@
       const state = await getRecordingState();
       if (state.is_recording) {
         isRecording.set(true);
+        recordingPaused.set(state.is_paused);
         recordingElapsed.set(state.elapsed_seconds);
       }
     } catch (e) {
@@ -95,12 +96,14 @@
     // Recording tick listener
     unlistenRecTick = await onRecordingTick((data) => {
       recordingElapsed.set(data.elapsed_seconds);
+      recordingPaused.set(data.is_paused);
       recordingLevel.set(data.level);
     });
 
     // Recording stopped listener — triggers transcription + note generation
     unlistenRecStopped = await onRecordingStopped(async (data) => {
       isRecording.set(false);
+      recordingPaused.set(false);
       recordingElapsed.set(0);
       recordingLevel.set(0);
 
@@ -125,10 +128,13 @@
         const running = await checkIsRecording();
         if (running !== $isRecording) {
           isRecording.set(running);
-          if (running) {
-            const state = await getRecordingState();
-            recordingElapsed.set(state.elapsed_seconds);
-          }
+        }
+        if (running) {
+          const state = await getRecordingState();
+          recordingPaused.set(state.is_paused);
+          recordingElapsed.set(state.elapsed_seconds);
+        } else {
+          recordingPaused.set(false);
         }
       } catch {}
     }, 1000);
@@ -184,6 +190,21 @@
       await stopRecording();
     } catch (e) {
       console.error("Stop recording failed:", e);
+    }
+  }
+
+  async function handleToggleRecordingPause() {
+    try {
+      if ($recordingPaused) {
+        await resumeRecording();
+        recordingPaused.set(false);
+      } else {
+        await pauseRecording();
+        recordingPaused.set(true);
+        recordingLevel.set(0);
+      }
+    } catch (e) {
+      console.error("Pause/resume recording failed:", e);
     }
   }
 
@@ -246,7 +267,7 @@
         </button>
       {/if}
 
-      <a href="/templates" class="footer-link" class:active={isTemplates}>Templates</a>
+      <a href="/templates" class="footer-link" class:active={isTemplates}>Note Formats</a>
       <a href="/settings" class="footer-link" class:active={isSettings}>Settings</a>
     </div>
   </aside>
@@ -277,10 +298,15 @@
   <div class="recording-card">
     <div class="recording-card-header">
       <span class="recording-card-title">
-        <span class="recording-dot"></span>
-        REC {formatElapsed($recordingElapsed)}
+        <span class="recording-dot" class:paused={$recordingPaused}></span>
+        {$recordingPaused ? "Paused" : "REC"} {formatElapsed($recordingElapsed)}
       </span>
-      <button class="recording-card-stop" onclick={handleStopRecording}>Stop</button>
+      <div class="recording-card-actions">
+        <button class="recording-card-pause" onclick={handleToggleRecordingPause}>
+          {$recordingPaused ? "Resume" : "Pause"}
+        </button>
+        <button class="recording-card-stop" onclick={handleStopRecording}>Stop</button>
+      </div>
     </div>
     <div class="recording-level-bar">
       <div class="recording-level-fill" style="width: {Math.min($recordingLevel * 100, 100)}%;"></div>

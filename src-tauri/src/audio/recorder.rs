@@ -5,10 +5,9 @@ use crate::audio::mixer::Mixer;
 use crate::audio::wav_writer::StreamingWavWriter;
 use anyhow::Result;
 use serde::Serialize;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
@@ -18,9 +17,10 @@ struct RecordingState {
     tap: Option<CoreAudioTapHandle>,
     mixer: Mixer,
     wav_writer: Option<StreamingWavWriter>,
-    start_time: Instant,
+    active_started_at: Option<Instant>,
+    accumulated_elapsed: Duration,
+    is_paused: bool,
     file_path: String,
-    sample_rate: u32,
     tick_handle: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
@@ -34,11 +34,13 @@ const TARGET_SAMPLE_RATE: u32 = 48000;
 pub struct RecordingTickPayload {
     pub elapsed_seconds: f64,
     pub level: f32,
+    pub is_paused: bool,
 }
 
 #[derive(Clone, Serialize)]
 pub struct RecordingStatePayload {
     pub is_recording: bool,
+    pub is_paused: bool,
     pub elapsed_seconds: f64,
     pub has_recording: bool,
     pub file_path: Option<String>,
@@ -51,9 +53,14 @@ pub fn is_recording() -> bool {
 pub fn get_recording_state() -> RecordingStatePayload {
     let recorder = RECORDER.lock().unwrap();
     let elapsed = if let Some(ref state) = *recorder {
-        state.start_time.elapsed().as_secs_f64()
+        recorded_elapsed(state).as_secs_f64()
     } else {
         0.0
+    };
+    let is_paused = if let Some(ref state) = *recorder {
+        state.is_paused
+    } else {
+        false
     };
     let file_path = if let Some(ref state) = *recorder {
         Some(state.file_path.clone())
@@ -62,6 +69,7 @@ pub fn get_recording_state() -> RecordingStatePayload {
     };
     RecordingStatePayload {
         is_recording: IS_RECORDING.load(Ordering::Acquire),
+        is_paused,
         elapsed_seconds: elapsed,
         has_recording: recorder.is_some(),
         file_path,
@@ -89,9 +97,9 @@ pub fn start_recording(
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let file_path = recordings_dir.join(format!("recording_{}.wav", timestamp));
 
-    let mut wav_writer = StreamingWavWriter::create(&file_path, TARGET_SAMPLE_RATE)?;
+    let wav_writer = StreamingWavWriter::create(&file_path, TARGET_SAMPLE_RATE)?;
 
-    let mut mixer = Mixer::new(TARGET_SAMPLE_RATE);
+    let mixer = Mixer::new(TARGET_SAMPLE_RATE);
 
     // Start mic capture
     let mic = match devices::resolve_input_device(mic_device.as_deref()) {
@@ -137,9 +145,10 @@ pub fn start_recording(
         tap,
         mixer,
         wav_writer: Some(wav_writer),
-        start_time: Instant::now(),
+        active_started_at: Some(Instant::now()),
+        accumulated_elapsed: Duration::ZERO,
+        is_paused: false,
         file_path: file_path_str.clone(),
-        sample_rate: TARGET_SAMPLE_RATE,
         tick_handle: None,
     };
 
@@ -166,13 +175,19 @@ pub fn start_recording(
             let payload = {
                 let mut recorder = RECORDER.lock().unwrap();
                 if let Some(ref mut state) = *recorder {
-                    let mixed = drain_and_write(state);
-                    let level = compute_level(&mixed);
+                    let level = if state.is_paused {
+                        drain_and_discard(state);
+                        0.0
+                    } else {
+                        let mixed = drain_and_write(state);
+                        compute_level(&mixed)
+                    };
 
-                    let elapsed = state.start_time.elapsed().as_secs_f64();
+                    let elapsed = recorded_elapsed(state).as_secs_f64();
                     RecordingTickPayload {
                         elapsed_seconds: elapsed,
                         level,
+                        is_paused: state.is_paused,
                     }
                 } else {
                     break;
@@ -194,7 +209,15 @@ pub fn start_recording(
     Ok(())
 }
 
-fn drain_and_write(state: &mut RecordingState) -> Vec<f32> {
+fn recorded_elapsed(state: &RecordingState) -> Duration {
+    state.accumulated_elapsed
+        + state
+            .active_started_at
+            .map(|started_at| started_at.elapsed())
+            .unwrap_or(Duration::ZERO)
+}
+
+fn drain_inputs(state: &mut RecordingState) {
     if let Some(ref mut mic) = state.mic {
         let mic_samples = mic.drain();
         if !mic_samples.is_empty() {
@@ -208,14 +231,24 @@ fn drain_and_write(state: &mut RecordingState) -> Vec<f32> {
             state.mixer.add_sys(&sys_samples);
         }
     }
+}
+
+fn drain_and_discard(state: &mut RecordingState) {
+    drain_inputs(state);
+    let _ = state.mixer.drain_mixed();
+}
+
+fn drain_and_write(state: &mut RecordingState) -> Vec<f32> {
+    drain_inputs(state);
 
     let mixed = state.mixer.drain_mixed();
     if !mixed.is_empty() {
+        let should_flush = recorded_elapsed(state).as_secs() % 5 == 0;
         if let Some(ref mut writer) = state.wav_writer {
             if let Err(e) = writer.write_samples(&mixed) {
                 eprintln!("Recorder: WAV write error: {}", e);
             }
-            if state.start_time.elapsed().as_secs() % 5 == 0 {
+            if should_flush {
                 let _ = writer.flush();
             }
         }
@@ -233,6 +266,66 @@ fn compute_level(samples: &[f32]) -> f32 {
     // Normal speech at a comfortable distance produces ~0.01–0.05 RMS;
     // sqrt maps that to ~0.1–0.22, which is clearly visible on the bar.
     (rms.sqrt() * 3.0).min(1.0)
+}
+
+pub fn pause_recording(app: AppHandle) -> Result<()> {
+    if !IS_RECORDING.load(Ordering::Acquire) {
+        anyhow::bail!("No recording in progress");
+    }
+
+    let payload = {
+        let mut recorder = RECORDER.lock().unwrap();
+        let state = recorder
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("No recording state found"))?;
+
+        if !state.is_paused {
+            drain_and_write(state);
+            if let Some(started_at) = state.active_started_at.take() {
+                state.accumulated_elapsed += started_at.elapsed();
+            }
+            state.is_paused = true;
+        }
+
+        RecordingTickPayload {
+            elapsed_seconds: recorded_elapsed(state).as_secs_f64(),
+            level: 0.0,
+            is_paused: true,
+        }
+    };
+
+    let _ = app.emit("recording-paused", serde_json::json!({}));
+    let _ = app.emit("recording-tick", payload);
+    Ok(())
+}
+
+pub fn resume_recording(app: AppHandle) -> Result<()> {
+    if !IS_RECORDING.load(Ordering::Acquire) {
+        anyhow::bail!("No recording in progress");
+    }
+
+    let payload = {
+        let mut recorder = RECORDER.lock().unwrap();
+        let state = recorder
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("No recording state found"))?;
+
+        if state.is_paused {
+            drain_and_discard(state);
+            state.active_started_at = Some(Instant::now());
+            state.is_paused = false;
+        }
+
+        RecordingTickPayload {
+            elapsed_seconds: recorded_elapsed(state).as_secs_f64(),
+            level: 0.0,
+            is_paused: false,
+        }
+    };
+
+    let _ = app.emit("recording-resumed", serde_json::json!({}));
+    let _ = app.emit("recording-tick", payload);
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -262,7 +355,14 @@ pub fn stop_recording(app: AppHandle) -> Result<StopRecordingResult> {
 
         // Final drain
         let mut state = state;
-        drain_and_write(&mut state);
+        if state.is_paused {
+            drain_and_discard(&mut state);
+        } else {
+            drain_and_write(&mut state);
+            if let Some(started_at) = state.active_started_at.take() {
+                state.accumulated_elapsed += started_at.elapsed();
+            }
+        }
 
         if let Some(writer) = state.wav_writer.take() {
             writer.finalize()?;
@@ -272,7 +372,7 @@ pub fn stop_recording(app: AppHandle) -> Result<StopRecordingResult> {
             mic.stop();
         }
 
-        let duration = state.start_time.elapsed().as_secs_f64();
+        let duration = state.accumulated_elapsed.as_secs_f64();
         (state.file_path.clone(), duration)
     };
 

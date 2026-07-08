@@ -46,8 +46,4 @@ impl Mixer {
             mixed
         }
     }
-
-    pub fn has_data(&self) -> bool {
-        !self.mic_buffer.is_empty() || !self.sys_buffer.is_empty()
-    }
 }

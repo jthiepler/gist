@@ -29,7 +29,8 @@ export const darkMode = writable<boolean>(false);
 
 // Recording state
 export const isRecording = writable<boolean>(false);
- export const recordingElapsed = writable<number>(0);
+export const recordingPaused = writable<boolean>(false);
+export const recordingElapsed = writable<number>(0);
 export const recordingLevel = writable<number>(0);
 
 // Recording context — saved when starting a recording so the layout can
@@ -41,6 +42,6 @@ export const recordingContext = writable<RecordingContext | null>(null);
 // consumed by the patient page to prepend to its session list.
 export const pendingSession = writable<Session | null>(null);
 
-// Live session update — fires at each step of processing (transcript saved,
+// Live session update — fires at each step of processing (source material saved,
 // each note generated) so the patient page can update in real time.
 export const sessionUpdate = writable<Session | null>(null);

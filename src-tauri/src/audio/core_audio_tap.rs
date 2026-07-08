@@ -27,35 +27,15 @@ struct AudioContext {
 
 pub struct CoreAudioTapHandle {
     consumer: HeapCons<f32>,
-    sample_rate: u32,
     #[cfg(target_os = "macos")]
     _device: ca::hardware::StartedDevice<ca::AggregateDevice>,
     #[cfg(target_os = "macos")]
     _ctx: Box<AudioContext>,
     #[cfg(target_os = "macos")]
     _tap: ca::TapGuard,
-    #[cfg(target_os = "macos")]
-    waker_state: Arc<Mutex<WakerState>>,
-    #[cfg(target_os = "macos")]
-    current_sample_rate: Arc<AtomicU32>,
 }
 
 impl CoreAudioTapHandle {
-    pub fn sample_rate(&self) -> u32 {
-        #[cfg(target_os = "macos")]
-        {
-            self.current_sample_rate.load(Ordering::Acquire)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.sample_rate
-        }
-    }
-
-    pub fn try_pop(&mut self) -> Option<f32> {
-        self.consumer.try_pop()
-    }
-
     pub fn pop_batch(&mut self, max: usize) -> Vec<f32> {
         let mut batch = Vec::with_capacity(max);
         for _ in 0..max {
@@ -155,12 +135,9 @@ impl CoreAudioTapHandle {
 
         Ok(CoreAudioTapHandle {
             consumer,
-            sample_rate: tap_sample_rate,
             _device: started_device,
             _ctx: ctx,
             _tap: tap,
-            waker_state,
-            current_sample_rate,
         })
     }
 }

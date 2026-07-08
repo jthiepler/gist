@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { SidecarProgress, ModelsResult, NoteFormatTemplate, SessionNote } from "./types";
+import type { SidecarProgress, ModelsResult, NoteFormatTemplate, Session, SessionInput, SessionNote } from "./types";
 
 export async function startSidecar(): Promise<string> {
   return invoke<string>("start_sidecar");
@@ -45,7 +45,7 @@ export async function transcribe(
 }
 
 export async function generateNote(
-  transcript: string,
+  sourceMaterial: string,
   format: string,
   model?: string,
   thinking?: boolean,
@@ -53,7 +53,7 @@ export async function generateNote(
 ): Promise<{ note: string; format: string }> {
   return rpcCall({
     type: "generate_note",
-    transcript,
+    transcript: sourceMaterial,
     format,
     model: model || undefined,
     thinking: thinking ?? true,
@@ -98,6 +98,41 @@ export async function createSessionNote(
   return invoke<SessionNote>("create_session_note", { sessionId, format, note, llmModel });
 }
 
+export async function createSessionInput(data: {
+  session_id: string;
+  kind: string;
+  source: string;
+  title: string;
+  text: string;
+  audio_file?: string | null;
+  duration_seconds?: number | null;
+  language?: string | null;
+  transcription_model?: string | null;
+  include_in_notes?: boolean;
+}): Promise<SessionInput> {
+  return invoke<SessionInput>("create_session_input", { data });
+}
+
+export async function updateSessionInput(data: {
+  id: string;
+  title?: string;
+  text?: string;
+  include_in_notes?: boolean;
+}): Promise<SessionInput> {
+  return invoke<SessionInput>("update_session_input", { data });
+}
+
+export async function updateSession(data: {
+  id: string;
+  date: string;
+}): Promise<void> {
+  return invoke<void>("update_session", { data });
+}
+
+export async function getSession(id: string): Promise<Session | null> {
+  return invoke<Session | null>("get_session", { id });
+}
+
 export async function listNoteFormats(): Promise<NoteFormatTemplate[]> {
   return invoke<NoteFormatTemplate[]>("list_note_formats");
 }
@@ -131,6 +166,7 @@ export interface AudioDevice {
 
 export interface RecordingStateInfo {
   is_recording: boolean;
+  is_paused: boolean;
   elapsed_seconds: number;
   has_recording: boolean;
   file_path: string | null;
@@ -144,6 +180,7 @@ export interface StopRecordingResult {
 export interface RecordingTickPayload {
   elapsed_seconds: number;
   level: number;
+  is_paused: boolean;
 }
 
 export interface RecordingStoppedPayload {
@@ -164,6 +201,14 @@ export async function startRecording(micDevice?: string, systemDevice?: string):
 
 export async function stopRecording(): Promise<StopRecordingResult> {
   return invoke<StopRecordingResult>("stop_recording");
+}
+
+export async function pauseRecording(): Promise<void> {
+  await invoke<void>("pause_recording");
+}
+
+export async function resumeRecording(): Promise<void> {
+  await invoke<void>("resume_recording");
 }
 
 export async function checkIsRecording(): Promise<boolean> {

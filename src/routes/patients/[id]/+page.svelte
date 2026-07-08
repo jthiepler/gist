@@ -1,11 +1,12 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { confirm } from "@tauri-apps/plugin-dialog";
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import { patients, sidecarBusy, activeOperation, isRecording, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
   import { generateNote, listNoteFormats, getPatientFormats, createSessionNote } from "$lib/rpc";
+  import { formatInputsForNoteGeneration, hasNoteSourceMaterial } from "$lib/sessionInputs";
   import { progressPercent, progressStage, progressBase, progressScale, currentOperation } from "$lib/stores";
   import { loadSettings } from "$lib/settings";
   import type { Patient, Session } from "$lib/types";
@@ -19,7 +20,9 @@
   let generatingNoteFor = $state<string | null>(null);
   let editingName = $state(false);
   let editName = $state("");
+  let editNameInput = $state<HTMLInputElement | null>(null);
   let savingName = $state(false);
+  let showPatientMenu = $state(false);
 
   const patientId = $derived($page.params.id ?? "");
 
@@ -69,7 +72,7 @@
     }
   }
 
-  // Live-update: fires at each step of processing (transcript saved, each note)
+  // Live-update: fires at each step of processing (source material saved, each note)
   $effect(() => {
     const s = $sessionUpdate;
     if (s && s.patient_id === patientId) {
@@ -107,8 +110,11 @@
     }
   }
 
-  async function generateNoteForSession(session: Session) {
-    if (!session.transcript) return;
+  async function generateNoteForSession(
+    session: Session,
+    options: { regenerateExisting?: boolean } = {}
+  ) {
+    if (!hasNoteSourceMaterial(session)) return;
     if ($sidecarBusy) {
       error = "Another operation is in progress. Please wait or cancel it first.";
       return;
@@ -127,12 +133,13 @@
       formatsToGenerate = ["soap"];
     }
 
-    // Filter out formats that already have notes for this session
     const existingFormats = new Set(session.notes.map((n) => n.format));
-    const missing = formatsToGenerate.filter((f) => !existingFormats.has(f)).sort((a, b) => a.localeCompare(b));
+    const formatsToRefresh = formatsToGenerate
+      .filter((f) => options.regenerateExisting || !existingFormats.has(f))
+      .sort((a, b) => a.localeCompare(b));
 
-    if (missing.length === 0) {
-      error = "All selected formats already have notes for this session.";
+    if (formatsToRefresh.length === 0) {
+      error = "All selected note formats already exist for this session.";
       generatingNoteFor = null;
       return;
     }
@@ -142,20 +149,24 @@
     progressBase.set(0);
     progressScale.set(100);
     progressPercent.set(30);
-    progressStage.set("Generating notes...");
-    activeOperation.set({ type: "generate_note", label: "Generating notes..." });
+    progressStage.set(options.regenerateExisting ? "Updating documentation..." : "Creating documentation...");
+    activeOperation.set({
+      type: "generate_note",
+      label: options.regenerateExisting ? "Updating documentation..." : "Creating documentation...",
+    });
+    const noteSourceMaterial = formatInputsForNoteGeneration(session);
 
     // Load templates for prompts
     let templates = await listNoteFormats();
 
-    const totalNotes = missing.length;
+    const totalNotes = formatsToRefresh.length;
     const basePct = 30;
     const noteRange = 70;
     let updatedNotes = [...session.notes];
 
     try {
-      for (let i = 0; i < missing.length; i++) {
-        const fmtName = missing[i];
+      for (let i = 0; i < formatsToRefresh.length; i++) {
+        const fmtName = formatsToRefresh[i];
         const label = `Generating ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
         progressStage.set(label);
         activeOperation.set({ type: "generate_note", label });
@@ -166,14 +177,17 @@
 
         const tmpl = templates.find((t) => t.name === fmtName);
         const result = await generateNote(
-          session.transcript!,
+          noteSourceMaterial,
           fmtName,
           llm || undefined,
           thinking,
           tmpl?.prompt
         );
         const sn = await createSessionNote(session.id, fmtName, result.note, llm || null);
-        updatedNotes = [...updatedNotes, sn].sort((a, b) => a.format.localeCompare(b.format));
+        updatedNotes = [
+          ...updatedNotes.filter((note) => note.format !== sn.format),
+          sn,
+        ].sort((a, b) => a.format.localeCompare(b.format));
         // Live-update sessions list so user sees progress
         sessions = sessions.map((s) =>
           s.id === session.id ? { ...s, notes: updatedNotes } : s
@@ -202,15 +216,24 @@
     showNewSession = false;
   }
 
-  function startEditName() {
+  function updateSessionInList(session: Session) {
+    sessions = sessions.map((s) => (s.id === session.id ? session : s));
+  }
+
+  async function startEditName() {
     if (!patient) return;
+    showPatientMenu = false;
     editName = patient.name;
     editingName = true;
+    await tick();
+    editNameInput?.focus();
+    editNameInput?.select();
   }
 
   function cancelEditName() {
     editingName = false;
     editName = "";
+    showPatientMenu = false;
   }
 
   async function saveEditName() {
@@ -231,6 +254,7 @@
 
   async function deletePatient() {
     if (!patient) return;
+    showPatientMenu = false;
     if (!(await confirm(`Delete "${patient.name}"? All related sessions and notes will be permanently deleted. This cannot be undone.`, { title: "Delete patient", kind: "warning" }))) return;
     try {
       await invoke("delete_patient", { id: patient.id });
@@ -252,6 +276,7 @@
       {#if editingName}
         <div class="name-edit-row">
           <input
+            bind:this={editNameInput}
             bind:value={editName}
             class="name-edit-input"
             onkeydown={(e) => {
@@ -259,7 +284,6 @@
               if (e.key === 'Escape') cancelEditName();
             }}
             disabled={savingName}
-            autofocus
           />
           <button class="btn btn-sm btn-primary" onclick={saveEditName} disabled={savingName || !editName.trim()}>
             Save
@@ -269,20 +293,31 @@
       {:else}
         <div class="name-display-row">
           <h2>{patient.name}</h2>
-          <button class="btn-ghost btn-sm edit-name-btn" onclick={startEditName} title="Edit name" aria-label="Edit name">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-            </svg>
-          </button>
         </div>
       {/if}
-      <button class="btn btn-sm btn-danger delete-patient-btn" onclick={deletePatient} title="Delete patient" aria-label="Delete patient">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="3 6 5 6 21 6"/>
-          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-        </svg>
-      </button>
+      {#if !editingName}
+        <div class="patient-menu">
+          <button
+            class="icon-btn patient-menu-trigger"
+            onclick={() => showPatientMenu = !showPatientMenu}
+            title="Patient actions"
+            aria-label="Patient actions"
+            aria-expanded={showPatientMenu}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="1"/>
+              <circle cx="19" cy="12" r="1"/>
+              <circle cx="5" cy="12" r="1"/>
+            </svg>
+          </button>
+          {#if showPatientMenu}
+            <div class="patient-menu-popover">
+              <button class="patient-menu-item" onclick={startEditName}>Edit name</button>
+              <button class="patient-menu-item danger" onclick={deletePatient}>Delete patient</button>
+            </div>
+          {/if}
+        </div>
+      {/if}
     </div>
     <div class="header-meta">
       {#if lastSessionDate}
@@ -315,8 +350,8 @@
 
   {#if sessions.length === 0 && !showNewSession}
     <div class="empty-state">
-      <div class="empty-title">No Sessions</div>
-      <div class="empty-desc">Click "+ New Session" to transcribe an audio recording and generate a note.</div>
+        <div class="empty-title">No sessions yet</div>
+        <div class="empty-desc">Start by recording a session, uploading audio, pasting a transcript, or adding a clinician note.</div>
     </div>
   {:else}
     <div class="session-list">
@@ -326,6 +361,7 @@
           isGenerating={generatingNoteFor === session.id}
           onGenerateNote={generateNoteForSession}
           onDelete={deleteSession}
+          onChange={updateSessionInList}
         />
       {/each}
     </div>

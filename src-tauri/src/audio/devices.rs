@@ -47,8 +47,3 @@ pub fn resolve_input_device(name: Option<&str>) -> anyhow::Result<cpal::Device> 
     host.default_input_device()
         .ok_or_else(|| anyhow::anyhow!("No default input device available"))
 }
-
-pub fn default_output_device_name() -> Option<String> {
-    let host = cpal::default_host();
-    host.default_output_device().and_then(|d| d.name().ok())
-}

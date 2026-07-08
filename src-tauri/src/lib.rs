@@ -14,24 +14,48 @@ mod audio;
 
 // ── Database ──────────────────────────────────────────────────────────────
 
-const SESSION_COLUMNS: &str = "id, patient_id, date, audio_file, duration_seconds, transcript, language, note, note_format, llm_model, transcription_model, created_at";
+const SESSION_COLUMNS: &str = "id, patient_id, date, created_at";
 
 fn map_session(row: &Row) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
         patient_id: row.get(1)?,
         date: row.get(2)?,
-        audio_file: row.get(3)?,
-        duration_seconds: row.get(4)?,
-        transcript: row.get(5)?,
-        language: row.get(6)?,
-        note: row.get(7)?,
-        note_format: row.get(8)?,
-        llm_model: row.get(9)?,
-        transcription_model: row.get(10)?,
-        created_at: row.get(11)?,
+        created_at: row.get(3)?,
+        inputs: Vec::new(),
         notes: Vec::new(),
     })
+}
+
+fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Vec<SessionInput> {
+    let mut stmt = match conn.prepare(
+        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, language, transcription_model, include_in_notes, created_at, updated_at
+         FROM session_inputs
+         WHERE session_id = ?1
+         ORDER BY created_at ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![session_id], |row| {
+        Ok(SessionInput {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            kind: row.get(2)?,
+            source: row.get(3)?,
+            title: row.get(4)?,
+            text: row.get(5)?,
+            audio_file: row.get(6)?,
+            duration_seconds: row.get(7)?,
+            language: row.get(8)?,
+            transcription_model: row.get(9)?,
+            include_in_notes: row.get::<_, i64>(10)? != 0,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 fn fetch_session_notes(conn: &Connection, session_id: &str) -> Vec<SessionNote> {
@@ -77,15 +101,22 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
                 date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_inputs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                text TEXT NOT NULL,
                 audio_file TEXT,
                 duration_seconds REAL,
-                transcript TEXT,
                 language TEXT,
-                note TEXT,
-                note_format TEXT,
-                llm_model TEXT,
                 transcription_model TEXT,
-                created_at TEXT NOT NULL
+                include_in_notes INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -111,32 +142,7 @@ impl Database {
         )
         .map_err(|e| e.to_string())?;
 
-        // Migration: add hidden column if missing (for existing DBs)
         let _ = conn.execute("ALTER TABLE note_formats ADD COLUMN hidden INTEGER DEFAULT 0", []);
-
-        // Migration: move existing session.note → session_notes
-        let migrated: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session_notes", [], |row| row.get(0))
-            .unwrap_or(0);
-        if migrated == 0 {
-            let mut stmt = conn
-                .prepare("SELECT id, note, note_format, llm_model, created_at FROM sessions WHERE note IS NOT NULL")
-                .map_err(|e| e.to_string())?;
-            let rows: Vec<(String, String, String, Option<String>, String)> = stmt
-                .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            for (sid, note, fmt, llm, created) in rows {
-                let nid = Uuid::new_v4().to_string();
-                let _ = conn.execute(
-                    "INSERT OR IGNORE INTO session_notes (id, session_id, format, note, llm_model, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![nid, sid, fmt, note, llm, created],
-                );
-            }
-        }
 
         // Seed default formats if table is empty
         let count: i64 = conn
@@ -152,6 +158,12 @@ impl Database {
                 )
                 .map_err(|e| e.to_string())?;
             }
+        }
+        for (name, prompt) in DEFAULT_FORMATS {
+            let _ = conn.execute(
+                "UPDATE note_formats SET prompt = ?1 WHERE name = ?2 AND is_builtin = 1",
+                params![prompt, name],
+            );
         }
 
         Ok(Database { conn })
@@ -172,17 +184,28 @@ struct Session {
     id: String,
     patient_id: String,
     date: String,
-    audio_file: Option<String>,
-    duration_seconds: Option<f64>,
-    transcript: Option<String>,
-    language: Option<String>,
-    note: Option<String>,
-    note_format: Option<String>,
-    llm_model: Option<String>,
-    transcription_model: Option<String>,
     created_at: String,
     #[serde(default)]
+    inputs: Vec<SessionInput>,
+    #[serde(default)]
     notes: Vec<SessionNote>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SessionInput {
+    id: String,
+    session_id: String,
+    kind: String,
+    source: String,
+    title: String,
+    text: String,
+    audio_file: Option<String>,
+    duration_seconds: Option<f64>,
+    language: Option<String>,
+    transcription_model: Option<String>,
+    include_in_notes: bool,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -220,26 +243,46 @@ struct UpdatePatient {
 struct CreateSession {
     patient_id: String,
     date: String,
-    audio_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateSession {
     id: String,
+    date: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionInput {
+    session_id: String,
+    kind: String,
+    source: String,
+    title: String,
+    text: String,
     #[serde(default)]
-    transcript: Option<String>,
-    #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
-    note_format: Option<String>,
+    audio_file: Option<String>,
     #[serde(default)]
     duration_seconds: Option<f64>,
     #[serde(default)]
-    llm_model: Option<String>,
+    language: Option<String>,
     #[serde(default)]
     transcription_model: Option<String>,
+    #[serde(default = "default_include_in_notes")]
+    include_in_notes: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSessionInput {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    include_in_notes: Option<bool>,
+}
+
+fn default_include_in_notes() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,11 +300,13 @@ struct UpdateNoteFormat {
 
 // ── Default Format Prompts ────────────────────────────────────────────────
 
-const SOAP_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a SOAP note from a therapy session transcript.
+const SOAP_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a SOAP note from labeled clinical source materials.
 
 Rules:
-- Base all clinical statements ONLY on what the client says in the transcript.
-- When information for a section is absent from the transcript, write "Insufficient information in transcript."
+- Source materials may include a Session Transcript and/or Clinician Note.
+- Base client statements ONLY on the Session Transcript.
+- Use the Clinician Note only for therapist observations, interventions, corrections, clinical context, and plan details.
+- When information for a section is absent from the source materials, write "Insufficient information in source materials."
 - Do NOT fabricate or hallucinate diagnoses, symptoms, or history.
 - Use person-first language (e.g., "client with anxiety" not "anxious client").
 - Remove any identifying information (names, locations, dates) and replace with [deidentified].
@@ -291,11 +336,13 @@ Output format:
 - Homework or between-session tasks
 - Referrals or coordination (if indicated)"#;
 
-const CBT_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a CBT session note from a therapy session transcript.
+const CBT_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a CBT session note from labeled clinical source materials.
 
 Rules:
-- Base all clinical statements ONLY on what the client says in the transcript.
-- When information for a section is absent, write "Insufficient information in transcript."
+- Source materials may include a Session Transcript and/or Clinician Note.
+- Base client statements ONLY on the Session Transcript.
+- Use the Clinician Note only for therapist observations, interventions, corrections, clinical context, and plan details.
+- When information for a section is absent, write "Insufficient information in source materials."
 - Do NOT fabricate or hallucinate diagnoses, symptoms, or history.
 - Remove any identifying information and replace with [deidentified].
 - If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
@@ -326,11 +373,13 @@ Output format:
 - Homework assigned
 - Next session focus"#;
 
-const INTAKE_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate an intake assessment from an initial therapy session transcript.
+const INTAKE_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate an intake assessment from labeled clinical source materials.
 
 Rules:
-- Base all clinical statements ONLY on what the client says in the transcript.
-- When information for a section is absent from the transcript, write "Insufficient information in transcript."
+- Source materials may include a Session Transcript and/or Clinician Note.
+- Base client statements ONLY on the Session Transcript.
+- Use the Clinician Note only for therapist observations, interventions, corrections, clinical context, and plan details.
+- When information for a section is absent from the source materials, write "Insufficient information in source materials."
 - Do NOT fabricate or hallucinate diagnoses, symptoms, history, or demographics.
 - Remove any identifying information and replace with [deidentified].
 - If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
@@ -728,6 +777,7 @@ async fn list_sessions(
             .map_err(|e| e.to_string())?
     };
     for s in &mut sessions {
+        s.inputs = fetch_session_inputs(&db.conn, &s.id);
         s.notes = fetch_session_notes(&db.conn, &s.id);
     }
     Ok(sessions)
@@ -740,23 +790,16 @@ async fn create_session(db: State<'_, Mutex<Database>>, data: CreateSession) -> 
     let now = Local::now().to_rfc3339();
     db.conn
         .execute(
-            "INSERT INTO sessions (id, patient_id, date, audio_file, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, data.patient_id, data.date, data.audio_file, now],
+            "INSERT INTO sessions (id, patient_id, date, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, data.patient_id, data.date, now],
         )
         .map_err(|e| e.to_string())?;
     Ok(Session {
         id,
         patient_id: data.patient_id,
         date: data.date,
-        audio_file: data.audio_file,
-        duration_seconds: None,
-        transcript: None,
-        language: None,
-        note: None,
-        note_format: None,
-        llm_model: None,
-        transcription_model: None,
         created_at: now,
+        inputs: Vec::new(),
         notes: Vec::new(),
     })
 }
@@ -766,25 +809,8 @@ async fn update_session(db: State<'_, Mutex<Database>>, data: UpdateSession) -> 
     let db = db.lock().map_err(|e| e.to_string())?;
     let affected = db.conn
         .execute(
-            "UPDATE sessions SET
-                transcript = COALESCE(?1, transcript),
-                language = COALESCE(?2, language),
-                note = COALESCE(?3, note),
-                note_format = COALESCE(?4, note_format),
-                duration_seconds = COALESCE(?5, duration_seconds),
-                llm_model = COALESCE(?6, llm_model),
-                transcription_model = COALESCE(?7, transcription_model)
-             WHERE id = ?8",
-            params![
-                data.transcript,
-                data.language,
-                data.note,
-                data.note_format,
-                data.duration_seconds,
-                data.llm_model,
-                data.transcription_model,
-                data.id
-            ],
+            "UPDATE sessions SET date = ?1 WHERE id = ?2",
+            params![data.date, data.id],
         )
         .map_err(|e| e.to_string())?;
     if affected == 0 {
@@ -801,6 +827,7 @@ async fn get_session(db: State<'_, Mutex<Database>>, id: String) -> Result<Optio
     let mut rows = stmt.query_map(params![id], map_session).map_err(|e| e.to_string())?;
     match rows.next() {
         Some(Ok(mut session)) => {
+            session.inputs = fetch_session_inputs(&db.conn, &session.id);
             session.notes = fetch_session_notes(&db.conn, &session.id);
             Ok(Some(session))
         }
@@ -816,6 +843,98 @@ async fn delete_session(db: State<'_, Mutex<Database>>, id: String) -> Result<()
         .execute("DELETE FROM sessions WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+async fn create_session_input(
+    db: State<'_, Mutex<Database>>,
+    data: CreateSessionInput,
+) -> Result<SessionInput, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let id = Uuid::new_v4().to_string();
+    let now = Local::now().to_rfc3339();
+    db.conn
+        .execute(
+            "INSERT INTO session_inputs (
+                id, session_id, kind, source, title, text, audio_file, duration_seconds,
+                language, transcription_model, include_in_notes, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+            params![
+                id,
+                data.session_id,
+                data.kind,
+                data.source,
+                data.title,
+                data.text,
+                data.audio_file,
+                data.duration_seconds,
+                data.language,
+                data.transcription_model,
+                if data.include_in_notes { 1 } else { 0 },
+                now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+
+    get_session_input_by_id(&db.conn, &id)
+}
+
+#[tauri::command]
+async fn update_session_input(
+    db: State<'_, Mutex<Database>>,
+    data: UpdateSessionInput,
+) -> Result<SessionInput, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let existing = get_session_input_by_id(&db.conn, &data.id)?;
+    let title = data.title.unwrap_or(existing.title);
+    let text = data.text.unwrap_or(existing.text);
+    let include_in_notes = data.include_in_notes.unwrap_or(existing.include_in_notes);
+    let updated_at = Local::now().to_rfc3339();
+    let affected = db.conn
+        .execute(
+            "UPDATE session_inputs
+             SET title = ?1, text = ?2, include_in_notes = ?3, updated_at = ?4
+             WHERE id = ?5",
+            params![
+                title,
+                text,
+                if include_in_notes { 1 } else { 0 },
+                updated_at,
+                data.id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if affected == 0 {
+        return Err("Session input not found".into());
+    }
+    get_session_input_by_id(&db.conn, &data.id)
+}
+
+fn get_session_input_by_id(conn: &Connection, id: &str) -> Result<SessionInput, String> {
+    conn.query_row(
+        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, language, transcription_model, include_in_notes, created_at, updated_at
+         FROM session_inputs
+         WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(SessionInput {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                kind: row.get(2)?,
+                source: row.get(3)?,
+                title: row.get(4)?,
+                text: row.get(5)?,
+                audio_file: row.get(6)?,
+                duration_seconds: row.get(7)?,
+                language: row.get(8)?,
+                transcription_model: row.get(9)?,
+                include_in_notes: row.get::<_, i64>(10)? != 0,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1094,6 +1213,16 @@ async fn stop_recording(app: AppHandle) -> Result<audio::recorder::StopRecording
 }
 
 #[tauri::command]
+async fn pause_recording(app: AppHandle) -> Result<(), String> {
+    audio::recorder::pause_recording(app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn resume_recording(app: AppHandle) -> Result<(), String> {
+    audio::recorder::resume_recording(app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn is_recording() -> bool {
     audio::recorder::is_recording()
 }
@@ -1142,6 +1271,8 @@ pub fn run() {
             update_session,
             get_session,
             delete_session,
+            create_session_input,
+            update_session_input,
             create_session_note,
             get_patient_formats,
             set_patient_formats,
@@ -1157,6 +1288,8 @@ pub fn run() {
             list_audio_devices,
             start_recording,
             stop_recording,
+            pause_recording,
+            resume_recording,
             is_recording,
             get_recording_state,
         ])

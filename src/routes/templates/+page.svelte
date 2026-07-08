@@ -2,12 +2,12 @@
   import { onMount } from "svelte";
   import { confirm } from "@tauri-apps/plugin-dialog";
   import {
-    listNoteFormats,
     createNoteFormat,
-    updateNoteFormat,
     deleteNoteFormat,
+    listNoteFormats,
     resetNoteFormat,
     toggleNoteFormatHidden,
+    updateNoteFormat,
   } from "$lib/rpc";
   import type { NoteFormatTemplate } from "$lib/types";
 
@@ -16,13 +16,11 @@
   let error = $state("");
   let saved = $state(false);
 
-  // Editing state
   let editingId = $state<string | null>(null);
   let editName = $state("");
   let editPrompt = $state("");
   let saving = $state(false);
 
-  // New format state
   let showNew = $state(false);
   let newName = $state("");
   let newPrompt = $state("");
@@ -75,7 +73,7 @@
       editName = "";
       editPrompt = "";
       saved = true;
-      setTimeout(() => saved = false, 2000);
+      setTimeout(() => (saved = false), 2000);
     } catch (e) {
       error = String(e);
     } finally {
@@ -84,7 +82,12 @@
   }
 
   async function removeFormat(fmt: NoteFormatTemplate) {
-    if (!(await confirm(`Delete format "${fmt.name}"? This cannot be undone.`, { title: "Delete Format", kind: "warning" }))) return;
+    if (
+      !(await confirm(`Delete note format "${fmt.name}"? This cannot be undone.`, {
+        title: "Delete note format",
+        kind: "warning",
+      }))
+    ) return;
     try {
       await deleteNoteFormat(fmt.id);
       await loadFormats();
@@ -94,12 +97,17 @@
   }
 
   async function resetFormat(fmt: NoteFormatTemplate) {
-    if (!(await confirm(`Reset "${fmt.name}" to the shipped default? Your changes will be discarded.`, { title: "Reset Format", kind: "warning" }))) return;
+    if (
+      !(await confirm(`Reset "${fmt.name}" to the included default? Your changes will be discarded.`, {
+        title: "Reset note format",
+        kind: "warning",
+      }))
+    ) return;
     try {
       await resetNoteFormat(fmt.id);
       await loadFormats();
       saved = true;
-      setTimeout(() => saved = false, 2000);
+      setTimeout(() => (saved = false), 2000);
     } catch (e) {
       error = String(e);
     }
@@ -135,7 +143,7 @@
       newName = "";
       newPrompt = "";
       saved = true;
-      setTimeout(() => saved = false, 2000);
+      setTimeout(() => (saved = false), 2000);
     } catch (e) {
       error = String(e);
     } finally {
@@ -143,10 +151,12 @@
     }
   }
 
-  const PLACEHOLDER_PROMPT = `You are a clinical note-taking assistant for licensed therapists. Generate a {format name} note from a therapy session transcript.
+  const PLACEHOLDER_PROMPT = `You are a clinical note-taking assistant for licensed therapists. Generate a {format name} note from labeled clinical source materials.
 
 Rules:
-- Base all clinical statements ONLY on what the client says in the transcript.
+- Source materials may include a session transcript and/or clinician note.
+- Base client statements only on the session transcript.
+- Use the clinician note for therapist observations, interventions, corrections, clinical context, and plan details.
 - ...your rules here...
 
 Output format:
@@ -156,7 +166,8 @@ Output format:
 </script>
 
 <div class="workspace-header">
-  <h2>Templates</h2>
+  <h2>Note Formats</h2>
+  <div class="header-meta">Choose the documentation styles available when creating sessions.</div>
 </div>
 
 {#if error}
@@ -175,11 +186,7 @@ Output format:
       {#if editingId === fmt.id}
         <div class="template-card editing">
           <div class="template-edit-header">
-            <input
-              bind:value={editName}
-              placeholder="Format name"
-              class="template-name-input"
-            />
+            <input bind:value={editName} placeholder="Format name" class="template-name-input" />
             <div class="template-edit-actions">
               <button class="btn btn-sm btn-primary" onclick={saveEdit} disabled={saving}>
                 {saving ? "Saving..." : "Save"}
@@ -187,25 +194,29 @@ Output format:
               <button class="btn btn-sm" onclick={cancelEdit} disabled={saving}>Cancel</button>
             </div>
           </div>
+          <label class="template-editor-label" for="edit-format-prompt">Advanced prompt</label>
           <textarea
+            id="edit-format-prompt"
             bind:value={editPrompt}
             class="template-prompt-editor"
-            placeholder="Enter the system prompt for this format..."
+            placeholder="Enter the prompt and output structure for this note format..."
           ></textarea>
-
         </div>
       {:else}
         <div class="template-card">
           <div class="template-header">
-            <div class="template-name">
-              {fmt.name}
-              {#if fmt.is_builtin}
-                <span class="badge badge-blue">Built-in</span>
-              {/if}
+            <div>
+              <div class="template-name">
+                {fmt.name.toUpperCase()}
+                {#if fmt.is_builtin}
+                  <span class="badge badge-blue">Included</span>
+                {/if}
+              </div>
+              <div class="template-summary">Available when generating documentation.</div>
             </div>
             <div class="template-actions">
               <button class="btn-ghost btn-sm" onclick={() => startEdit(fmt)}>Edit</button>
-              <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Hide</button>
+              <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Turn Off</button>
               {#if fmt.is_builtin}
                 <button class="btn-ghost btn-sm" onclick={() => resetFormat(fmt)}>Reset</button>
               {:else}
@@ -221,20 +232,23 @@ Output format:
 
   {#if hiddenFormats.length > 0}
     <div class="hidden-section">
-      <div class="hidden-section-label">Hidden</div>
+      <div class="hidden-section-label">Turned off</div>
       <div class="templates-list">
         {#each hiddenFormats as fmt (fmt.id)}
           <div class="template-card hidden">
             <div class="template-header">
-              <div class="template-name">
-                {fmt.name}
-                {#if fmt.is_builtin}
-                  <span class="badge badge-blue">Built-in</span>
-                {/if}
+              <div>
+                <div class="template-name">
+                  {fmt.name.toUpperCase()}
+                  {#if fmt.is_builtin}
+                    <span class="badge badge-blue">Included</span>
+                  {/if}
+                </div>
+                <div class="template-summary">Hidden from new session choices.</div>
               </div>
               <div class="template-actions">
                 <button class="btn-ghost btn-sm" onclick={() => startEdit(fmt)}>Edit</button>
-                <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Show</button>
+                <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Turn On</button>
                 {#if fmt.is_builtin}
                   <button class="btn-ghost btn-sm" onclick={() => resetFormat(fmt)}>Reset</button>
                 {:else}
@@ -254,24 +268,29 @@ Output format:
       <div class="template-edit-header">
         <input
           bind:value={newName}
-          placeholder="Format name (e.g. progress, dap, birp)"
+          placeholder="Format name (for example DAP or BIRP)"
           class="template-name-input"
         />
         <div class="template-edit-actions">
           <button class="btn btn-sm btn-primary" onclick={createFormat} disabled={saving}>
             {saving ? "Creating..." : "Create"}
           </button>
-          <button class="btn btn-sm" onclick={() => { showNew = false; newName = ""; newPrompt = ""; }} disabled={saving}>
+          <button
+            class="btn btn-sm"
+            onclick={() => { showNew = false; newName = ""; newPrompt = ""; }}
+            disabled={saving}
+          >
             Cancel
           </button>
         </div>
       </div>
+      <label class="template-editor-label" for="new-format-prompt">Advanced prompt</label>
       <textarea
+        id="new-format-prompt"
         bind:value={newPrompt}
         class="template-prompt-editor"
         placeholder={PLACEHOLDER_PROMPT}
       ></textarea>
-
     </div>
   {:else}
     <button class="btn btn-primary add-format-btn" onclick={() => { showNew = true; newName = ""; newPrompt = ""; }}>

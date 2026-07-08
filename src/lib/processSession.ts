@@ -1,8 +1,28 @@
 import { invoke } from "@tauri-apps/api/core";
-import { transcribe, generateNote, createSessionNote, listNoteFormats } from "./rpc";
-import { progressPercent, progressStage, progressBase, progressScale, currentOperation, activeOperation, sessionUpdate } from "./stores";
+import {
+  transcribe,
+  generateNote,
+  createSessionNote,
+  createSessionInput,
+  getSession,
+  listNoteFormats,
+} from "./rpc";
+import {
+  formatInputsForNoteGeneration,
+  SESSION_INPUT_LABELS,
+  SESSION_INPUT_SOURCES,
+} from "./sessionInputs";
+import {
+  progressPercent,
+  progressStage,
+  progressBase,
+  progressScale,
+  currentOperation,
+  activeOperation,
+  sessionUpdate,
+} from "./stores";
 import { ensureSidecar } from "./ensureSidecar";
-import type { Session, NoteFormatTemplate } from "./types";
+import type { Session, NoteFormatTemplate, SessionInputKind } from "./types";
 
 export interface RecordingContext {
   patientId: string;
@@ -10,6 +30,78 @@ export interface RecordingContext {
   defaultLlm: string;
   defaultTranscription: string;
   thinking: boolean;
+  inputKind: SessionInputKind;
+  session?: Session;
+}
+
+function resetProgress() {
+  progressStage.set("");
+  activeOperation.set({ type: null, label: "" });
+  currentOperation.set(null);
+  progressBase.set(0);
+  progressScale.set(100);
+}
+
+async function loadTemplates(): Promise<NoteFormatTemplate[]> {
+  try {
+    return await listNoteFormats();
+  } catch {
+    return [];
+  }
+}
+
+async function generateDocumentationForSession(
+  session: Session,
+  formats: string[],
+  ctx: RecordingContext,
+): Promise<Session> {
+  const sortedFormats = [...formats].sort((a, b) => a.localeCompare(b));
+  if (sortedFormats.length === 0) return session;
+
+  const noteSourceMaterial = formatInputsForNoteGeneration(session);
+  const templates = await loadTemplates();
+  const totalNotes = sortedFormats.length;
+  const basePct = 30;
+  const noteRange = 70;
+  let nextSession = session;
+
+  for (let i = 0; i < sortedFormats.length; i++) {
+    const fmtName = sortedFormats[i];
+    const label = `${ctx.session ? "Updating" : "Generating"} ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
+    progressStage.set(label);
+    activeOperation.set({ type: "generate_note", label });
+    progressBase.set(basePct + Math.round((i / totalNotes) * noteRange));
+    progressScale.set(Math.round(noteRange / totalNotes));
+
+    try {
+      const tmpl = templates.find((t) => t.name === fmtName);
+      const result = await generateNote(
+        noteSourceMaterial,
+        fmtName,
+        ctx.defaultLlm || undefined,
+        ctx.thinking,
+        tmpl?.prompt,
+      );
+      const note = await createSessionNote(
+        session.id,
+        fmtName,
+        result.note,
+        ctx.defaultLlm || null,
+      );
+      nextSession = {
+        ...nextSession,
+        notes: [
+          ...nextSession.notes.filter((existing) => existing.format !== note.format),
+          note,
+        ].sort((a, b) => a.format.localeCompare(b.format)),
+      };
+      sessionUpdate.set(nextSession);
+    } catch {
+      break;
+    }
+  }
+
+  return nextSession;
 }
 
 export async function processSessionFromAudio(
@@ -18,18 +110,25 @@ export async function processSessionFromAudio(
 ): Promise<Session> {
   const ok = await ensureSidecar();
   if (!ok) {
-    throw new Error("Failed to start the processing engine.");
+    throw new Error("Failed to start processing engine.");
   }
 
-  const opId = "new-session";
-  const sortedFormats = [...ctx.formats].sort((a, b) => a.localeCompare(b));
+  const appendingToExistingSession = !!ctx.session;
+  const opId = appendingToExistingSession
+    ? `add-input-${ctx.session?.id ?? "session"}`
+    : "new-session";
 
   currentOperation.set(opId);
   progressBase.set(0);
   progressScale.set(100);
   progressPercent.set(0);
-  progressStage.set("Transcribing...");
-  activeOperation.set({ type: "transcribe", label: "Transcribing audio..." });
+
+  const isClinicianDictation = ctx.inputKind === "clinician_note";
+  const transcribingLabel = isClinicianDictation
+    ? "Transcribing clinician note..."
+    : "Transcribing session recording...";
+  progressStage.set(transcribingLabel);
+  activeOperation.set({ type: "transcribe", label: transcribingLabel });
 
   let transcript = "";
   let duration: number | null = null;
@@ -42,92 +141,83 @@ export async function processSessionFromAudio(
     language = result.language;
   } catch (e) {
     const msg = String(e);
-    const userMsg = msg === "sidecar_busy"
-      ? "Another operation is in progress. Please wait or cancel it first."
-      : `Transcription failed: ${msg}`;
-    activeOperation.set({ type: null, label: "" });
-    currentOperation.set(null);
-    progressBase.set(0);
-    progressScale.set(100);
-    throw new Error(userMsg);
+    resetProgress();
+    throw new Error(
+      msg === "sidecar_busy"
+        ? "Another operation is in progress. Please wait or cancel it first."
+        : `Transcription failed: ${msg}`,
+    );
   }
 
-  let session: Session;
+  const source = isClinicianDictation
+    ? SESSION_INPUT_SOURCES.dictation
+    : SESSION_INPUT_SOURCES.recording;
+
   try {
-    session = await invoke<Session>("create_session", {
+    progressStage.set("Saving session material...");
+    activeOperation.set({ type: "create_session", label: "Saving session material..." });
+
+    if (ctx.session) {
+      await createSessionInput({
+        session_id: ctx.session.id,
+        kind: ctx.inputKind,
+        source,
+        title: SESSION_INPUT_LABELS[ctx.inputKind],
+        text: transcript,
+        audio_file: audioPath,
+        duration_seconds: duration,
+        language,
+        transcription_model: ctx.defaultTranscription || null,
+        include_in_notes: true,
+      });
+
+      const updatedSession = (await getSession(ctx.session.id)) ?? ctx.session;
+      sessionUpdate.set(updatedSession);
+      const formatsToRefresh =
+        ctx.formats.length > 0
+          ? ctx.formats
+          : updatedSession.notes.map((note) => note.format);
+      const regeneratedSession = await generateDocumentationForSession(
+        updatedSession,
+        formatsToRefresh,
+        ctx,
+      );
+      progressPercent.set(100);
+      resetProgress();
+      return regeneratedSession;
+    }
+
+    let session = await invoke<Session>("create_session", {
       data: {
         patient_id: ctx.patientId,
         date: new Date().toISOString().slice(0, 10),
-        audio_file: audioPath,
       },
     });
-    await invoke("update_session", {
-      data: {
-        id: session.id,
-        transcript,
-        language: language || null,
-        duration_seconds: duration,
-        transcription_model: ctx.defaultTranscription || null,
-      },
-    });
-    session = {
-      ...session,
-      transcript,
-      language: language || null,
+    const input = await createSessionInput({
+      session_id: session.id,
+      kind: ctx.inputKind,
+      source,
+      title: SESSION_INPUT_LABELS[ctx.inputKind],
+      text: transcript,
+      audio_file: audioPath,
       duration_seconds: duration,
+      language,
       transcription_model: ctx.defaultTranscription || null,
-    };
-    // Live-update: session now has transcript
+      include_in_notes: true,
+    });
+    session = { ...session, inputs: [input] };
     sessionUpdate.set(session);
+
+    const generatedSession = await generateDocumentationForSession(
+      session,
+      ctx.formats,
+      ctx,
+    );
+    progressPercent.set(100);
+    resetProgress();
+    return generatedSession;
   } catch (e) {
-    activeOperation.set({ type: null, label: "" });
-    currentOperation.set(null);
-    throw new Error(`Failed to save session: ${e}`);
+    resetProgress();
+    throw new Error(`Failed to save session: ${String(e)}`);
   }
-
-  let templates: NoteFormatTemplate[] = [];
-  try {
-    templates = await listNoteFormats();
-  } catch {}
-
-  const totalNotes = sortedFormats.length;
-  const basePct = 30;
-  const noteRange = 70;
-
-  for (let i = 0; i < sortedFormats.length; i++) {
-    const fmtName = sortedFormats[i];
-    const label = `Generating ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
-    progressStage.set(label);
-    activeOperation.set({ type: "generate_note", label });
-    const fmtBase = basePct + Math.round((i / totalNotes) * noteRange);
-    const fmtScale = Math.round(noteRange / totalNotes);
-    progressBase.set(fmtBase);
-    progressScale.set(fmtScale);
-
-    try {
-      const tmpl = templates.find((t) => t.name === fmtName);
-      const result = await generateNote(
-        transcript,
-        fmtName,
-        ctx.defaultLlm || undefined,
-        ctx.thinking,
-        tmpl?.prompt,
-      );
-      const sn = await createSessionNote(session.id, fmtName, result.note, ctx.defaultLlm || null);
-      session.notes = [...session.notes, sn];
-      // Live-update: session now has one more note
-      sessionUpdate.set(session);
-    } catch {
-      break;
-    }
-  }
-
-  progressPercent.set(100);
-  progressStage.set("");
-  activeOperation.set({ type: null, label: "" });
-  currentOperation.set(null);
-  progressBase.set(0);
-  progressScale.set(100);
-
-  return session;
 }

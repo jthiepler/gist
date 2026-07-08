@@ -10,7 +10,7 @@ rm -rf build dist/gist-sidecar
 
 echo "=== Building gist-sidecar with PyInstaller ==="
 
-uv run pyinstaller \
+uv run --group dev pyinstaller \
     --onedir \
     --name gist-sidecar \
     --noconfirm \

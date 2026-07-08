@@ -8,16 +8,27 @@ export interface Session {
   id: string;
   patient_id: string;
   date: string;
+  created_at: string;
+  inputs: SessionInput[];
+  notes: SessionNote[];
+}
+
+export type SessionInputKind = "session_transcript" | "clinician_note";
+
+export interface SessionInput {
+  id: string;
+  session_id: string;
+  kind: SessionInputKind | string;
+  source: string;
+  title: string;
+  text: string;
   audio_file: string | null;
   duration_seconds: number | null;
-  transcript: string | null;
   language: string | null;
-  note: string | null;
-  note_format: string | null;
-  llm_model: string | null;
   transcription_model: string | null;
+  include_in_notes: boolean;
   created_at: string;
-  notes: SessionNote[];
+  updated_at: string;
 }
 
 export interface SessionNote {

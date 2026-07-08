@@ -1,12 +1,23 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
-    listModels, downloadModel, deleteModel,
-    startSidecar, stopSidecar, setSetting,
+    deleteModel,
+    downloadModel,
+    listModels,
+    setSetting,
+    startSidecar,
+    stopSidecar,
   } from "$lib/rpc";
-  import { sidecarRunning, progressPercent, progressStage, darkMode, sidecarBusy, activeOperation } from "$lib/stores";
-  import { loadSettings, saveSettings } from "$lib/settings";
+  import {
+    activeOperation,
+    darkMode,
+    progressPercent,
+    progressStage,
+    sidecarBusy,
+    sidecarRunning,
+  } from "$lib/stores";
   import { ensureSidecar } from "$lib/ensureSidecar";
+  import { loadSettings, saveSettings } from "$lib/settings";
   import type { ModelsResult } from "$lib/types";
 
   let models = $state<ModelsResult | null>(null);
@@ -17,7 +28,7 @@
   let selectedTranscription = $state("");
   let error = $state("");
   let saved = $state(false);
-  let showDebug = $state(false);
+  let showAdvanced = $state(false);
 
   async function refreshModels() {
     models = await listModels();
@@ -57,21 +68,19 @@
     }
     downloading = model;
     progressPercent.set(0);
-    progressStage.set("Starting download...");
-    activeOperation.set({ type: "download_model", label: `Downloading ${model}...` });
-
+    progressStage.set("Downloading model...");
+    activeOperation.set({ type: "download_model", label: "Downloading model..." });
     try {
       await downloadModel(model, kind);
       await refreshModels();
       saved = true;
-      setTimeout(() => saved = false, 3000);
+      setTimeout(() => (saved = false), 3000);
     } catch (e) {
       const msg = String(e);
-      if (msg === "sidecar_busy") {
-        error = "Another operation is in progress. Please wait or cancel it first.";
-      } else {
-        error = `Download failed: ${msg}`;
-      }
+      error =
+        msg === "sidecar_busy"
+          ? "Another operation is in progress. Please wait or cancel it first."
+          : `Download failed: ${msg}`;
     } finally {
       downloading = "";
       progressPercent.set(0);
@@ -89,13 +98,18 @@
     try {
       await deleteModel(model, kind);
       await refreshModels();
+      if (selectedLlm === model && models && Object.keys(models.llm).length > 0) {
+        selectedLlm = Object.keys(models.llm)[0];
+      }
+      if (selectedTranscription === model && models && Object.keys(models.transcription).length > 0) {
+        selectedTranscription = Object.keys(models.transcription)[0];
+      }
     } catch (e) {
       const msg = String(e);
-      if (msg === "sidecar_busy") {
-        error = "Another operation is in progress. Please wait or cancel it first.";
-      } else {
-        error = `Delete failed: ${msg}`;
-      }
+      error =
+        msg === "sidecar_busy"
+          ? "Another operation is in progress. Please wait or cancel it first."
+          : `Delete failed: ${msg}`;
     } finally {
       deleting = "";
     }
@@ -115,7 +129,7 @@
         darkMode: $darkMode,
       });
       saved = true;
-      setTimeout(() => saved = false, 3000);
+      setTimeout(() => (saved = false), 3000);
     } catch (e) {
       error = String(e);
     }
@@ -135,6 +149,7 @@
 
 <div class="workspace-header">
   <h2>Settings</h2>
+  <div class="header-meta">Manage local AI, appearance, and advanced engine controls.</div>
 </div>
 
 {#if error}
@@ -145,25 +160,20 @@
   <div class="success-banner">Saved.</div>
 {/if}
 
-<!-- Models -->
 <div class="settings-section">
-  <h3>Models</h3>
-  <p class="text-muted" style="font-size: 13px; margin-bottom: 20px;">
-    Click a downloaded model to select it as the default.
-  </p>
+  <h3>Local AI</h3>
+  <p class="text-muted settings-help">Downloaded models can be selected as defaults for new notes and transcripts.</p>
 
   {#if models}
-    <div style="margin-bottom: 28px;">
-      <div class="settings-row" style="border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px; margin-bottom: 8px;">
-        <strong style="font-size: 13px; color: var(--text-muted);">LLM</strong>
-      </div>
+    <div class="model-group">
+      <div class="model-group-title">Note generation model</div>
       <table class="model-table">
         <thead>
           <tr>
             <th style="width: 30%;">Name</th>
             <th>Description</th>
-            <th style="width: 60px;">Size</th>
-            <th style="width: 100px;"></th>
+            <th style="width: 70px;">Size</th>
+            <th style="width: 110px;"></th>
           </tr>
         </thead>
         <tbody>
@@ -179,7 +189,7 @@
               <td>
                 {#if info.downloaded}
                   {#if selectedLlm === name}
-                    <span class="model-selected-marker">✓ Selected</span>
+                    <span class="model-selected-marker">Selected</span>
                   {:else}
                     <button
                       class="btn btn-sm btn-danger"
@@ -205,17 +215,15 @@
       </table>
     </div>
 
-    <div>
-      <div class="settings-row" style="border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px; margin-bottom: 8px;">
-        <strong style="font-size: 13px; color: var(--text-muted);">Transcription</strong>
-      </div>
+    <div class="model-group">
+      <div class="model-group-title">Transcription model</div>
       <table class="model-table">
         <thead>
           <tr>
             <th style="width: 30%;">Name</th>
             <th>Description</th>
-            <th style="width: 60px;">Size</th>
-            <th style="width: 100px;"></th>
+            <th style="width: 70px;">Size</th>
+            <th style="width: 110px;"></th>
           </tr>
         </thead>
         <tbody>
@@ -231,7 +239,7 @@
               <td>
                 {#if info.downloaded}
                   {#if selectedTranscription === name}
-                    <span class="model-selected-marker">✓ Selected</span>
+                    <span class="model-selected-marker">Selected</span>
                   {:else}
                     <button
                       class="btn btn-sm btn-danger"
@@ -261,31 +269,49 @@
   {/if}
 </div>
 
-<!-- Preferences -->
 <div class="settings-section">
   <h3>Preferences</h3>
-
   <div class="settings-row">
     <div>
-      <div class="setting-label">Reasoning (Thinking)</div>
-      <div class="setting-desc">Enables extended reasoning before generating the note</div>
+      <div class="setting-label">More thorough note generation</div>
+      <div class="setting-desc">Allows the local model to spend more time reasoning before writing documentation.</div>
     </div>
-    <div class="toggle" class:active={thinking} onclick={() => thinking = !thinking}>
+    <button
+      type="button"
+      class="toggle"
+      class:active={thinking}
+      role="switch"
+      aria-checked={thinking}
+      aria-label="More thorough note generation"
+      onclick={() => (thinking = !thinking)}
+    >
       <div class="toggle-knob"></div>
-    </div>
+    </button>
   </div>
 
   <div class="settings-row">
     <div>
-      <div class="setting-label">Dark Mode</div>
-      <div class="setting-desc">Toggle between light and dark appearance</div>
+      <div class="setting-label">Dark appearance</div>
+      <div class="setting-desc">Use the darker clinical workspace theme.</div>
     </div>
-    <div class="toggle" class:active={$darkMode} onclick={async () => {
-      darkMode.set(!$darkMode);
-      try { await setSetting("dark_mode", String(!$darkMode)); } catch (e) { console.error("Failed to persist dark mode:", e); }
-    }}>
+    <button
+      type="button"
+      class="toggle"
+      class:active={$darkMode}
+      role="switch"
+      aria-checked={$darkMode}
+      aria-label="Dark appearance"
+      onclick={async () => {
+        darkMode.set(!$darkMode);
+        try {
+          await setSetting("dark_mode", String(!$darkMode));
+        } catch (e) {
+          console.error("Failed to persist dark mode:", e);
+        }
+      }}
+    >
       <div class="toggle-knob"></div>
-    </div>
+    </button>
   </div>
 
   <div style="margin-top: 16px;">
@@ -293,19 +319,18 @@
   </div>
 </div>
 
-<!-- Debug -->
 <div class="settings-section">
   <div class="debug-section">
-    <button class="debug-toggle" onclick={() => showDebug = !showDebug}>
+    <button class="debug-toggle" onclick={() => (showAdvanced = !showAdvanced)}>
       <span>Advanced</span>
-      <span>{showDebug ? "▾" : "▸"}</span>
+      <span>{showAdvanced ? "v" : ">"}</span>
     </button>
 
-    {#if showDebug}
+    {#if showAdvanced}
       <div class="debug-content">
         <div class="debug-row">
           <span class="status-dot" class:running={$sidecarRunning} class:stopped={!$sidecarRunning}></span>
-          <span>Engine: {$sidecarRunning ? "Running" : "Stopped"}</span>
+          <span>Processing engine: {$sidecarRunning ? "Running" : "Stopped"}</span>
           <button class="btn btn-sm" onclick={handleRestart} style="margin-left: auto;">Restart</button>
         </div>
       </div>
