@@ -1,9 +1,13 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { ask, confirm } from "@tauri-apps/plugin-dialog";
   import { marked } from "marked";
+  import MarkdownToolbar from "$lib/components/MarkdownToolbar.svelte";
   import {
     createSessionInput,
     createSessionNote,
+    deleteSessionInput,
     getSession,
     getPatientFormats,
     listAudioDevices,
@@ -18,15 +22,13 @@
   import { ensureSidecar } from "$lib/ensureSidecar";
   import type { RecordingContext } from "$lib/processSession";
   import {
-    getInputLabel,
     getSessionDurationSeconds,
-    getSessionInput,
     getSessionLanguage,
-    hasNoteSourceMaterial,
-    SESSION_INPUT_KINDS,
+    getInputLabel,
     SESSION_INPUT_LABELS,
     SESSION_INPUT_SOURCES,
   } from "$lib/sessionInputs";
+  import { confirmRegenerateAttachedNotes } from "$lib/confirmations";
   import {
     activeOperation,
     currentOperation,
@@ -63,11 +65,14 @@
 
   type EditTarget = "note" | "input";
   type ExistingInputMethod = "audio_file" | "recording" | "text" | "dictation";
+  type WorkspaceMode = "focus" | "compare";
+  type FocusPane = "note" | "source";
 
   let expanded = $state(true);
-  let showInputs = $state(false);
+  let workspaceMode = $state<WorkspaceMode>("focus");
+  let focusPane = $state<FocusPane>("note");
   let noteEditing = $state(false);
-  let editingInputKind = $state<SessionInputKind | null>(null);
+  let editingInputId = $state<string | null>(null);
   let addingInputKind = $state<SessionInputKind | null>(null);
   let inputMethod = $state<ExistingInputMethod>("text");
   let noteDraft = $state("");
@@ -83,7 +88,13 @@
   let defaultLlm = $state("");
   let defaultTranscription = $state("");
   let thinking = $state(false);
-  let audioDevices = $state<AudioDevice[]>([]);
+  let openSessionMenu = $state(false);
+  let openNoteMenu = $state(false);
+  let openInputMenu = $state<string | null>(null);
+  let openAddSourceMenu = $state(false);
+  let expandedInputId = $state<string | null>(null);
+  let initializedSessionId = $state<string | null>(null);
+  let inlineRecordingStarted = $state(false);
   let inputDevices = $state<AudioDevice[]>([]);
   let outputDevices = $state<AudioDevice[]>([]);
   let selectedInputDevice = $state("");
@@ -99,15 +110,20 @@
     sortedNotes.map((n) => ({ key: n.format, label: n.format.toUpperCase(), note: n }))
   );
 
-  let activeTab = $derived.by(() => {
-    if (sortedNotes.length > 0) return sortedNotes[0].format;
-    return "";
-  });
+  let activeTab = $derived(sortedNotes[0]?.format ?? "");
 
   let currentTab = $state<string | null>(null);
   let activeKey = $derived(currentTab ?? activeTab);
   let activeNote = $derived(sortedNotes.find((n) => n.format === activeKey));
-  let hasSources = $derived(hasNoteSourceMaterial(session));
+  let sourceInputs = $derived(
+    session.inputs.filter((input) => input.include_in_notes && input.text.trim().length > 0)
+  );
+  let hasSources = $derived(sourceInputs.length > 0);
+  let sourceSummary = $derived(
+    sourceInputs.length === 0
+      ? "No source material"
+      : `${sourceInputs.length} source ${sourceInputs.length === 1 ? "item" : "items"}`
+  );
 
   let formattedDate = $derived(
     new Date(session.date).toLocaleDateString("en-US", {
@@ -117,36 +133,67 @@
     })
   );
 
+  let durationSeconds = $derived(getSessionDurationSeconds(session));
   let durationMin = $derived(
-    getSessionDurationSeconds(session)
-      ? Math.round((getSessionDurationSeconds(session) ?? 0) / 60)
-      : null
+    durationSeconds ? Math.round(durationSeconds / 60) : null
   );
 
   let language = $derived(getSessionLanguage(session));
   let noteDirty = $derived(activeNote ? noteDraft !== (activeNote.note ?? "") : false);
   let inputDirty = $derived(
-    editingInputKind
-      ? inputDraft !== (getSessionInput(session, editingInputKind)?.text ?? "")
-      : false
+    editingInputId
+      ? inputDraft !== (session.inputs.find((input) => input.id === editingInputId)?.text ?? "")
+      : addingInputKind !== null && inputMethod === "text" && inputDraft.trim().length > 0
   );
   let renderedNote = $derived(activeNote ? renderMarkdown(noteDraft) : "");
-  let renderedInput = $derived(renderMarkdown(inputDraft));
   let recordingForThisSession = $derived($recordingContext?.session?.id === session.id);
   let recordingInputKind = $derived(
     recordingForThisSession ? $recordingContext?.inputKind ?? null : null
   );
+  let processingThisSession = $derived(
+    isGenerating ||
+      $currentOperation === addInputOperationId ||
+      $currentOperation === `gen-note-${session.id}` ||
+    $currentOperation === `new-session-${session.id}`
+  );
+  let processingLabel = $derived(
+    $activeOperation.label || (isGenerating ? "Working..." : "Processing...")
+  );
 
   $effect(() => {
-    const _ = session.id;
+    if (
+      !inlineRecordingStarted ||
+      $isRecording ||
+      recordingForThisSession
+    ) {
+      return;
+    }
+
+    inlineRecordingStarted = false;
+    addingInputKind = null;
+    inputDraft = "";
+    inputAudioPath = "";
+  });
+
+  $effect(() => {
+    const sessionId = session.id;
+    if (initializedSessionId === sessionId) return;
+
+    initializedSessionId = sessionId;
     currentTab = null;
     noteEditing = false;
-    editingInputKind = null;
+    editingInputId = null;
     addingInputKind = null;
     noteStatus = "";
     inputStatus = "";
     inputAudioPath = "";
-    showInputs = sortedNotes.length === 0;
+    openSessionMenu = false;
+    openNoteMenu = false;
+    openInputMenu = null;
+    openAddSourceMenu = false;
+    expandedInputId = null;
+    workspaceMode = "focus";
+    focusPane = untrack(() => (sortedNotes.length === 0 ? "source" : "note"));
   });
 
   $effect(() => {
@@ -159,8 +206,18 @@
     return marked.parse(content, { breaks: true }) as string;
   }
 
-  function inputFor(kind: SessionInputKind) {
-    return getSessionInput(session, kind);
+  function inputFor(id: string) {
+    return session.inputs.find((input) => input.id === id) ?? null;
+  }
+
+  function sourceMeta(input: SessionInput) {
+    return input.source.replace("_", " ");
+  }
+
+  function sourcePreview(input: SessionInput) {
+    const text = input.text.replace(/\s+/g, " ").trim();
+    if (!text) return "No text yet";
+    return text.length > 160 ? `${text.slice(0, 157)}...` : text;
   }
 
   function plainTextFromHtml(html: string) {
@@ -173,11 +230,17 @@
     return (
       status.startsWith("Save failed") ||
       status.startsWith("Copy failed") ||
+      status.startsWith("Delete failed") ||
       status.startsWith("Transcription failed") ||
       status.startsWith("Failed") ||
       status.startsWith("Audio devices unavailable") ||
       status.startsWith("Another operation")
     );
+  }
+
+  async function confirmDocumentationRefresh() {
+    if (session.notes.length === 0) return false;
+    return confirmRegenerateAttachedNotes(session.notes.length);
   }
 
   function clearCopiedStatus(target: "note" | "input") {
@@ -206,8 +269,10 @@
       }
       if (target === "note") {
         noteStatus = "Copied";
+        openNoteMenu = false;
       } else {
         inputStatus = "Copied";
+        openInputMenu = null;
       }
       clearCopiedStatus(target);
     } catch (e) {
@@ -221,12 +286,29 @@
 
   function toggle() {
     expanded = !expanded;
+    openSessionMenu = false;
+    openNoteMenu = false;
+    openInputMenu = null;
+    openAddSourceMenu = false;
+  }
+
+  function setWorkspaceMode(mode: WorkspaceMode) {
+    workspaceMode = mode;
+    if (mode === "compare" && !activeNote) {
+      focusPane = "source";
+    }
+  }
+
+  function setFocusPane(pane: FocusPane) {
+    focusPane = pane;
   }
 
   function selectTab(key: string) {
     currentTab = key;
+    focusPane = "note";
     noteEditing = false;
     noteStatus = "";
+    openNoteMenu = false;
   }
 
   function startNoteEditing() {
@@ -234,6 +316,7 @@
     noteDraft = activeNote.note ?? "";
     noteEditing = true;
     noteStatus = "";
+    openNoteMenu = false;
   }
 
   function cancelNoteEditing() {
@@ -242,19 +325,21 @@
     noteStatus = "";
   }
 
-  function startInputEditing(kind: SessionInputKind) {
-    inputDraft = inputFor(kind)?.text ?? "";
-    editingInputKind = kind;
+  function startInputEditing(input: SessionInput) {
+    inputDraft = input.text;
+    editingInputId = input.id;
     addingInputKind = null;
     inputMethod = "text";
     inputStatus = "";
-    showInputs = true;
+    openInputMenu = null;
+    expandedInputId = input.id;
+    focusPane = "source";
     queueMicrotask(() => inputEditorEl?.focus());
   }
 
   function cancelInputEditing() {
     inputDraft = "";
-    editingInputKind = null;
+    editingInputId = null;
     addingInputKind = null;
     inputAudioPath = "";
     inputStatus = "";
@@ -264,11 +349,14 @@
     if (processingInput || $isRecording) return;
     inputDraft = "";
     inputAudioPath = "";
-    editingInputKind = method === "text" ? kind : null;
+    editingInputId = null;
     addingInputKind = kind;
     inputMethod = method;
     inputStatus = "";
-    showInputs = true;
+    openInputMenu = null;
+    openAddSourceMenu = false;
+    expandedInputId = null;
+    focusPane = "source";
     if (method === "text") {
       queueMicrotask(() => inputEditorEl?.focus());
     }
@@ -288,7 +376,6 @@
     await loadExistingInputSettings();
     try {
       const devices = await listAudioDevices();
-      audioDevices = devices;
       inputDevices = devices.filter((d) => d.device_type === "input");
       outputDevices = devices.filter((d) => d.device_type === "output");
       if (inputDevices.length > 0 && !selectedInputDevice) {
@@ -427,18 +514,18 @@
   }
 
   async function saveInput() {
-    if (!editingInputKind || savingInput || !inputDraft.trim()) return;
+    if ((!editingInputId && !addingInputKind) || savingInput || !inputDraft.trim()) return;
     savingInput = true;
     inputStatus = "";
     try {
-      const existing = inputFor(editingInputKind);
+      const existing = editingInputId ? inputFor(editingInputId) : null;
       const saved = existing
         ? await updateSessionInput({ id: existing.id, text: inputDraft })
         : await createSessionInput({
             session_id: session.id,
-            kind: editingInputKind,
+            kind: addingInputKind!,
             source: SESSION_INPUT_SOURCES.typed,
-            title: SESSION_INPUT_LABELS[editingInputKind],
+            title: SESSION_INPUT_LABELS[addingInputKind!],
             text: inputDraft,
             include_in_notes: true,
           });
@@ -447,16 +534,49 @@
         : [...session.inputs, saved];
       const updatedSession = { ...session, inputs };
       onChange(updatedSession);
-      editingInputKind = null;
+      editingInputId = null;
       addingInputKind = null;
       inputDraft = "";
-      inputStatus = "Updating documentation...";
-      await onGenerateNote(updatedSession, { regenerateExisting: true });
+      if (await confirmDocumentationRefresh()) {
+        inputStatus = "Updating documentation...";
+        await onGenerateNote(updatedSession, { regenerateExisting: true });
+      }
       inputStatus = "Saved";
     } catch (e) {
       inputStatus = `Save failed: ${String(e)}`;
     } finally {
       savingInput = false;
+    }
+  }
+
+  async function deleteInput(input: SessionInput) {
+    const label = getInputLabel(input);
+    if (
+      !(await confirm(`Delete this ${label.toLowerCase()}? This source will be removed from future documentation.`, {
+        title: "Delete source material",
+        kind: "warning",
+      }))
+    ) {
+      return;
+    }
+
+    inputStatus = "";
+    try {
+      await deleteSessionInput(input.id);
+      const updatedSession = {
+        ...session,
+        inputs: session.inputs.filter((existing) => existing.id !== input.id),
+      };
+      onChange(updatedSession);
+      openInputMenu = null;
+      expandedInputId = null;
+      if (await confirmDocumentationRefresh()) {
+        inputStatus = "Updating documentation...";
+        await onGenerateNote(updatedSession, { regenerateExisting: true });
+      }
+      inputStatus = "Source deleted";
+    } catch (e) {
+      inputStatus = `Delete failed: ${String(e)}`;
     }
   }
 
@@ -502,7 +622,9 @@
       const updated = await getSession(session.id);
       if (updated) {
         onChange(updated);
-        await onGenerateNote(updated, { regenerateExisting: true });
+        if (await confirmDocumentationRefresh()) {
+          await onGenerateNote(updated, { regenerateExisting: true });
+        }
       }
       addingInputKind = null;
       inputAudioPath = "";
@@ -552,6 +674,7 @@
       isRecording.set(true);
       recordingPaused.set(false);
       recordingElapsed.set(0);
+      inlineRecordingStarted = true;
       addingInputKind = kind;
       inputMethod = method;
       inputStatus = "";
@@ -603,6 +726,12 @@
         <polyline points="9 18 15 12 9 6"/>
       </svg>
       <div class="session-date">{formattedDate}</div>
+      {#if processingThisSession}
+        <div class="session-processing-status" title={processingLabel}>
+          <span class="session-processing-spinner" aria-hidden="true"></span>
+          <span>{processingLabel}</span>
+        </div>
+      {/if}
     </div>
     <div class="session-meta">
       {#if durationMin}
@@ -611,18 +740,39 @@
       {#if language}
         <span>{language}</span>
       {/if}
-      <button
-        class="btn btn-sm btn-danger delete-session-btn"
-        onclick={(e) => { e.stopPropagation(); onDelete(session); }}
-        disabled={isGenerating}
-        title="Delete session"
-        aria-label="Delete session"
-      >
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="3 6 5 6 21 6"/>
-          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-        </svg>
-      </button>
+      <div class="action-menu">
+        <button
+          class="icon-btn action-menu-trigger"
+          onclick={(e) => {
+            e.stopPropagation();
+            openSessionMenu = !openSessionMenu;
+          }}
+          disabled={isGenerating}
+          title="Session actions"
+          aria-label="Session actions"
+          aria-expanded={openSessionMenu}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <circle cx="5" cy="12" r="1.8"/>
+            <circle cx="12" cy="12" r="1.8"/>
+            <circle cx="19" cy="12" r="1.8"/>
+          </svg>
+        </button>
+        {#if openSessionMenu}
+          <div class="action-menu-popover">
+            <button
+              class="action-menu-item danger"
+              onclick={(e) => {
+                e.stopPropagation();
+                openSessionMenu = false;
+                onDelete(session);
+              }}
+            >
+              Delete session
+            </button>
+          </div>
+        {/if}
+      </div>
     </div>
   </div>
 
@@ -632,23 +782,45 @@
         {#each tabs as tab (tab.key)}
           <button
             class="session-tab"
-            class:active={activeKey === tab.key}
+            class:active={activeKey === tab.key && (workspaceMode === "compare" || focusPane === "note")}
             onclick={() => selectTab(tab.key)}
             disabled={isGenerating}
           >
             {tab.label}
           </button>
         {/each}
+        <button
+          class="session-tab source-material-tab"
+          class:active={workspaceMode === "focus" && focusPane === "source"}
+          onclick={() => setFocusPane("source")}
+          disabled={isGenerating || workspaceMode === "compare"}
+          aria-pressed={workspaceMode === "focus" && focusPane === "source"}
+        >
+          Source Material
+        </button>
       </div>
-      <button
-        class="btn btn-sm inputs-toggle"
-        class:active={showInputs}
-        onclick={() => showInputs = !showInputs}
-        disabled={isGenerating}
-        title={showInputs ? "Hide transcript and notes" : "Show transcript and notes"}
-      >
-        Transcript & Notes
-      </button>
+      {#if activeNote}
+        <div class="workspace-controls" aria-label="Workspace view">
+          <div class="workspace-segmented" role="group" aria-label="Workspace mode">
+            <button
+              class:active={workspaceMode === "focus"}
+              onclick={() => setWorkspaceMode("focus")}
+              disabled={isGenerating}
+              aria-pressed={workspaceMode === "focus"}
+            >
+              Focus
+            </button>
+            <button
+              class:active={workspaceMode === "compare"}
+              onclick={() => setWorkspaceMode("compare")}
+              disabled={isGenerating}
+              aria-pressed={workspaceMode === "compare"}
+            >
+              Compare
+            </button>
+          </div>
+        </div>
+      {/if}
     </div>
 
     <div class="session-card-body">
@@ -658,35 +830,55 @@
           <p class="text-muted spinner-message">Generating note...</p>
         </div>
       {:else}
-        <div class="session-editor-layout" class:with-inputs={showInputs && !!activeNote} class:inputs-only={!activeNote}>
-          {#if activeNote}
+        <div
+          class="session-editor-layout"
+          class:focus-mode={workspaceMode === "focus"}
+          class:compare-mode={workspaceMode === "compare" && !!activeNote}
+          class:inputs-only={!activeNote}
+        >
+          {#if activeNote && (workspaceMode === "compare" || focusPane === "note")}
             <section class="editor-pane">
-              <div class="editor-pane-header">
-                <div class="editor-pane-title">{activeNote.format.toUpperCase()} note</div>
+              <div class="editor-pane-header note-pane-header">
                 <div class="editor-actions">
                   {#if noteStatus}
                     <span class:error={statusIsError(noteStatus)} class="save-status">{noteStatus}</span>
                   {/if}
-                  {#if noteEditing}
-                    <button class="btn btn-sm" onclick={cancelNoteEditing} disabled={savingNote}>Cancel</button>
-                    <button class="btn btn-sm btn-primary" onclick={saveNote} disabled={savingNote || !noteDirty}>
-                      {savingNote ? "Saving..." : "Save"}
-                    </button>
-                  {:else}
-                    <button class="btn btn-sm" onclick={() => copyRenderedContent("note")}>Copy</button>
-                    <button class="btn btn-sm" onclick={startNoteEditing}>Edit</button>
+                  {#if !noteEditing}
+                    <div class="action-menu">
+                      <button
+                        class="icon-btn action-menu-trigger"
+                        onclick={() => openNoteMenu = !openNoteMenu}
+                        title="Note actions"
+                        aria-label="Note actions"
+                        aria-expanded={openNoteMenu}
+                      >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                          <circle cx="5" cy="12" r="1.8"/>
+                          <circle cx="12" cy="12" r="1.8"/>
+                          <circle cx="19" cy="12" r="1.8"/>
+                        </svg>
+                      </button>
+                      {#if openNoteMenu}
+                        <div class="action-menu-popover">
+                          <button class="action-menu-item" onclick={() => copyRenderedContent("note")}>
+                            Copy note
+                          </button>
+                          <button class="action-menu-item" onclick={startNoteEditing}>
+                            Edit note
+                          </button>
+                        </div>
+                      {/if}
+                    </div>
                   {/if}
                 </div>
               </div>
 
               {#if noteEditing}
-                <div class="markdown-toolbar" role="toolbar" aria-label="Note formatting">
-                  <button class="toolbar-btn" type="button" title="Heading 1" aria-label="Heading 1" onmousedown={(e) => e.preventDefault()} onclick={() => applyHeadingMarkdown("note", 1)}>H1</button>
-                  <button class="toolbar-btn" type="button" title="Heading 2" aria-label="Heading 2" onmousedown={(e) => e.preventDefault()} onclick={() => applyHeadingMarkdown("note", 2)}>H2</button>
-                  <button class="toolbar-btn" type="button" title="Heading 3" aria-label="Heading 3" onmousedown={(e) => e.preventDefault()} onclick={() => applyHeadingMarkdown("note", 3)}>H3</button>
-                  <button class="toolbar-btn toolbar-btn-strong" type="button" title="Bold" aria-label="Bold" onmousedown={(e) => e.preventDefault()} onclick={() => applyInlineMarkdown("note", "**", "**", "bold text")}>B</button>
-                  <button class="toolbar-btn toolbar-btn-emphasis" type="button" title="Italic" aria-label="Italic" onmousedown={(e) => e.preventDefault()} onclick={() => applyInlineMarkdown("note", "*", "*", "italic text")}>I</button>
-                </div>
+                <MarkdownToolbar
+                  target="note"
+                  onHeading={(level) => applyHeadingMarkdown("note", level)}
+                  onInline={(prefix, suffix, placeholder) => applyInlineMarkdown("note", prefix, suffix, placeholder)}
+                />
                 <textarea
                   class="clinical-editor note-editor"
                   bind:this={noteEditorEl}
@@ -694,16 +886,25 @@
                   disabled={savingNote}
                   onkeydown={(e) => handleEditorShortcut(e, saveNote)}
                 ></textarea>
+                <div class="editor-footer">
+                  <button class="btn btn-sm" onclick={cancelNoteEditing} disabled={savingNote}>Cancel</button>
+                  <button class="btn btn-sm btn-primary" onclick={saveNote} disabled={savingNote || !noteDirty}>
+                    {savingNote ? "Saving..." : "Save"}
+                  </button>
+                </div>
               {:else}
                 <div class="rendered-content markdown-content">{@html renderedNote}</div>
               {/if}
             </section>
           {/if}
 
-          {#if showInputs || !activeNote}
-            <section class="editor-pane inputs-pane">
+          {#if !activeNote || workspaceMode === "compare" || focusPane === "source"}
+            <section class="editor-pane inputs-pane" class:supporting={workspaceMode === "compare" && !!activeNote}>
               <div class="editor-pane-header">
-                <div class="editor-pane-title">Transcript & Notes</div>
+                <div>
+                  <div class="editor-pane-title">Source Material</div>
+                  <div class="editor-pane-subtitle">{sourceSummary}</div>
+                </div>
                 <div class="editor-actions">
                   {#if inputStatus}
                     <span class:error={statusIsError(inputStatus)} class="save-status">{inputStatus}</span>
@@ -713,50 +914,106 @@
                       Generate Documentation
                     </button>
                   {/if}
+
+                  <div class="action-menu">
+                    <button
+                      class="btn btn-sm"
+                      onclick={() => openAddSourceMenu = !openAddSourceMenu}
+                      disabled={$isRecording || processingInput || !!editingInputId || !!addingInputKind}
+                      aria-expanded={openAddSourceMenu}
+                    >
+                      Add Source
+                    </button>
+
+                    {#if openAddSourceMenu}
+                      <div class="action-menu-popover source-add-menu">
+                        <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "recording")}>
+                          Record session
+                        </button>
+                        <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "audio_file")}>
+                          Upload recording
+                        </button>
+                        <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "text")}>
+                          Paste transcript
+                        </button>
+                        <button class="action-menu-item" onclick={() => startInputAdding("clinician_note", "text")}>
+                          Type clinician note
+                        </button>
+                        <button class="action-menu-item" onclick={() => startInputAdding("clinician_note", "dictation")}>
+                          Dictate clinician note
+                        </button>
+                      </div>
+                    {/if}
+                  </div>
                 </div>
               </div>
 
               <div class="source-input-list">
-                {#each SESSION_INPUT_KINDS as kind}
-                  {@const input = inputFor(kind)}
-                  <div class="source-input-card" class:empty={!input}>
+                {#each session.inputs as input (input.id)}
+                  <div class="source-input-card">
                     <div class="source-input-header">
                       <div>
-                        <div class="source-input-title">{SESSION_INPUT_LABELS[kind]}</div>
-                        {#if input}
-                          <div class="source-input-meta">{input.source.replace("_", " ")}</div>
-                        {/if}
+                        <div class="source-input-title">
+                          {getInputLabel(input)}
+                        </div>
+                        <div class="source-input-meta">{sourceMeta(input)}</div>
+                        <button
+                          class="source-input-preview"
+                          onclick={() => expandedInputId = expandedInputId === input.id ? null : input.id}
+                          aria-expanded={expandedInputId === input.id}
+                        >
+                          {sourcePreview(input)}
+                        </button>
                       </div>
                       <div class="editor-actions">
-                        {#if editingInputKind === kind}
-                          <button class="btn btn-sm" onclick={cancelInputEditing} disabled={savingInput}>Cancel</button>
-                          <button class="btn btn-sm btn-primary" onclick={saveInput} disabled={savingInput || !inputDirty || !inputDraft.trim()}>
-                            {savingInput ? "Saving..." : "Save"}
-                          </button>
-                        {:else if addingInputKind === kind && inputMethod === "audio_file"}
-                          <button class="btn btn-sm" onclick={cancelInputEditing} disabled={processingInput}>Cancel</button>
-                          <button class="btn btn-sm btn-primary" onclick={() => saveAudioInput(kind)} disabled={processingInput || !inputAudioPath}>
-                            {processingInput ? "Transcribing..." : "Transcribe & Save"}
-                          </button>
-                        {:else if addingInputKind === kind && (inputMethod === "recording" || inputMethod === "dictation") && !$isRecording}
-                          <button class="btn btn-sm" onclick={cancelInputEditing}>Cancel</button>
-                        {:else if input}
-                          <button class="btn btn-sm" onclick={() => copyRenderedContent("input", input)}>
-                            Copy
-                          </button>
-                          <button class="btn btn-sm" onclick={() => startInputEditing(kind)}>Edit</button>
+                        {#if editingInputId !== input.id}
+                          <div class="action-menu">
+                            <button
+                              class="icon-btn action-menu-trigger"
+                              onclick={() => openInputMenu = openInputMenu === input.id ? null : input.id}
+                              title="Source actions"
+                              aria-label="Source actions"
+                              aria-expanded={openInputMenu === input.id}
+                            >
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                                <circle cx="5" cy="12" r="1.8"/>
+                                <circle cx="12" cy="12" r="1.8"/>
+                                <circle cx="19" cy="12" r="1.8"/>
+                              </svg>
+                            </button>
+                            {#if openInputMenu === input.id}
+                              <div class="action-menu-popover">
+                                <button
+                                  class="action-menu-item"
+                                  onclick={() => copyRenderedContent("input", input)}
+                                >
+                                  Copy source
+                                </button>
+                                <button
+                                  class="action-menu-item"
+                                  onclick={() => startInputEditing(input)}
+                                >
+                                  Edit source
+                                </button>
+                                <button
+                                  class="action-menu-item danger"
+                                  onclick={() => deleteInput(input)}
+                                >
+                                  Delete source
+                                </button>
+                              </div>
+                            {/if}
+                          </div>
                         {/if}
                       </div>
                     </div>
 
-                    {#if editingInputKind === kind}
-                      <div class="markdown-toolbar" role="toolbar" aria-label={`${SESSION_INPUT_LABELS[kind]} formatting`}>
-                        <button class="toolbar-btn" type="button" title="Heading 1" aria-label="Heading 1" onmousedown={(e) => e.preventDefault()} onclick={() => applyHeadingMarkdown("input", 1)}>H1</button>
-                        <button class="toolbar-btn" type="button" title="Heading 2" aria-label="Heading 2" onmousedown={(e) => e.preventDefault()} onclick={() => applyHeadingMarkdown("input", 2)}>H2</button>
-                        <button class="toolbar-btn" type="button" title="Heading 3" aria-label="Heading 3" onmousedown={(e) => e.preventDefault()} onclick={() => applyHeadingMarkdown("input", 3)}>H3</button>
-                        <button class="toolbar-btn toolbar-btn-strong" type="button" title="Bold" aria-label="Bold" onmousedown={(e) => e.preventDefault()} onclick={() => applyInlineMarkdown("input", "**", "**", "bold text")}>B</button>
-                        <button class="toolbar-btn toolbar-btn-emphasis" type="button" title="Italic" aria-label="Italic" onmousedown={(e) => e.preventDefault()} onclick={() => applyInlineMarkdown("input", "*", "*", "italic text")}>I</button>
-                      </div>
+                    {#if editingInputId === input.id}
+                      <MarkdownToolbar
+                        target="input"
+                        onHeading={(level) => applyHeadingMarkdown("input", level)}
+                        onInline={(prefix, suffix, placeholder) => applyInlineMarkdown("input", prefix, suffix, placeholder)}
+                      />
                       <textarea
                         class="clinical-editor source-input-editor"
                         bind:this={inputEditorEl}
@@ -764,7 +1021,49 @@
                         disabled={savingInput}
                         onkeydown={(e) => handleEditorShortcut(e, saveInput)}
                       ></textarea>
-                    {:else if addingInputKind === kind && inputMethod === "audio_file"}
+                      <div class="editor-footer">
+                        <button class="btn btn-sm" onclick={cancelInputEditing} disabled={savingInput}>Cancel</button>
+                        <button class="btn btn-sm btn-primary" onclick={saveInput} disabled={savingInput || !inputDirty || !inputDraft.trim()}>
+                          {savingInput ? "Saving..." : "Save"}
+                        </button>
+                      </div>
+                    {:else if expandedInputId === input.id}
+                      <div class="rendered-content markdown-content source-input-rendered">
+                        {@html renderMarkdown(input.text)}
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+
+                {#if addingInputKind}
+                  <div class="source-input-card empty">
+                    <div class="source-input-header">
+                      <div class="source-input-title">{SESSION_INPUT_LABELS[addingInputKind]}</div>
+                      {#if inputMethod === "audio_file" || (inputMethod === "recording" || inputMethod === "dictation") && !$isRecording}
+                        <button class="btn btn-sm" onclick={cancelInputEditing} disabled={processingInput}>Cancel</button>
+                      {/if}
+                    </div>
+
+                    {#if inputMethod === "text"}
+                      <MarkdownToolbar
+                        target="input"
+                        onHeading={(level) => applyHeadingMarkdown("input", level)}
+                        onInline={(prefix, suffix, placeholder) => applyInlineMarkdown("input", prefix, suffix, placeholder)}
+                      />
+                      <textarea
+                        class="clinical-editor source-input-editor"
+                        bind:this={inputEditorEl}
+                        bind:value={inputDraft}
+                        disabled={savingInput}
+                        onkeydown={(e) => handleEditorShortcut(e, saveInput)}
+                      ></textarea>
+                      <div class="editor-footer">
+                        <button class="btn btn-sm" onclick={cancelInputEditing} disabled={savingInput}>Cancel</button>
+                        <button class="btn btn-sm btn-primary" onclick={saveInput} disabled={savingInput || !inputDirty}>
+                          {savingInput ? "Saving..." : "Save"}
+                        </button>
+                      </div>
+                    {:else if inputMethod === "audio_file"}
                       <div class="source-input-add-panel">
                         <div class="file-picker-row">
                           <input
@@ -775,10 +1074,15 @@
                           />
                           <button class="btn" onclick={pickInputAudioFile} disabled={processingInput}>Browse</button>
                         </div>
+                        <div class="editor-footer">
+                          <button class="btn btn-sm btn-primary" onclick={() => saveAudioInput(addingInputKind!)} disabled={processingInput || !inputAudioPath}>
+                            {processingInput ? "Transcribing..." : "Transcribe & Save"}
+                          </button>
+                        </div>
                       </div>
-                    {:else if addingInputKind === kind && (inputMethod === "recording" || inputMethod === "dictation")}
+                    {:else}
                       <div class="source-input-add-panel">
-                        {#if $isRecording && recordingForThisSession && recordingInputKind === kind}
+                        {#if $isRecording && recordingForThisSession && recordingInputKind === addingInputKind}
                           <div class="record-active compact-record-active">
                             <div class="record-indicator">
                               <span class="recording-dot-inline" class:paused={$recordingPaused}></span>
@@ -802,8 +1106,8 @@
                         {:else}
                           <div class="record-controls compact-record-controls">
                             <div class="form-group">
-                              <label for={`input-device-${session.id}-${kind}`}>Microphone</label>
-                              <select id={`input-device-${session.id}-${kind}`} bind:value={selectedInputDevice}>
+                              <label for={`input-device-${session.id}-${addingInputKind}`}>Microphone</label>
+                              <select id={`input-device-${session.id}-${addingInputKind}`} bind:value={selectedInputDevice}>
                                 {#each inputDevices as d (d.name)}
                                   <option value={d.name}>{d.name}</option>
                                 {/each}
@@ -811,60 +1115,23 @@
                             </div>
                             {#if inputMethod === "recording"}
                               <div class="form-group">
-                                <label for={`output-device-${session.id}-${kind}`}>System audio</label>
-                                <select id={`output-device-${session.id}-${kind}`} bind:value={selectedOutputDevice}>
+                                <label for={`output-device-${session.id}-${addingInputKind}`}>System audio</label>
+                                <select id={`output-device-${session.id}-${addingInputKind}`} bind:value={selectedOutputDevice}>
                                   {#each outputDevices as d (d.name)}
                                     <option value={d.name}>{d.name}</option>
                                   {/each}
                                 </select>
                               </div>
                             {/if}
-                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(kind, inputMethod === "dictation" ? "dictation" : "recording")}>
+                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")}>
                               {inputMethod === "dictation" ? "Start Dictation" : "Start Recording"}
                             </button>
                           </div>
                         {/if}
                       </div>
-                    {:else if input}
-                      <div class="rendered-content markdown-content source-input-rendered">
-                        {@html renderMarkdown(input.text)}
-                      </div>
-                    {:else}
-                      <div class="source-input-empty">
-                        <p>
-                          {kind === "session_transcript"
-                            ? "Add session material when it becomes available."
-                            : "Add your observations, corrections, formulation, or plan details."}
-                        </p>
-                        <div class="source-add-methods">
-                          {#if kind === "session_transcript"}
-                            <button class="session-start-card source-add-method" onclick={() => startInputAdding(kind, "recording")} disabled={$isRecording || processingInput}>
-                              <span class="session-start-title">Record session</span>
-                              <span class="session-start-desc">Capture session audio and create a transcript.</span>
-                            </button>
-                            <button class="session-start-card source-add-method" onclick={() => startInputAdding(kind, "audio_file")} disabled={$isRecording || processingInput}>
-                              <span class="session-start-title">Upload session recording</span>
-                              <span class="session-start-desc">Transcribe an existing audio file.</span>
-                            </button>
-                            <button class="session-start-card source-add-method" onclick={() => startInputAdding(kind, "text")} disabled={$isRecording || processingInput}>
-                              <span class="session-start-title">Paste session transcript</span>
-                              <span class="session-start-desc">Use text from a completed session.</span>
-                            </button>
-                          {:else}
-                            <button class="session-start-card source-add-method" onclick={() => startInputAdding(kind, "text")} disabled={$isRecording || processingInput}>
-                              <span class="session-start-title">Type clinician note</span>
-                              <span class="session-start-desc">Add observations, corrections, and plan details.</span>
-                            </button>
-                            <button class="session-start-card source-add-method" onclick={() => startInputAdding(kind, "dictation")} disabled={$isRecording || processingInput}>
-                              <span class="session-start-title">Dictate clinician note</span>
-                              <span class="session-start-desc">Record your own post-session note.</span>
-                            </button>
-                          {/if}
-                        </div>
-                      </div>
                     {/if}
                   </div>
-                {/each}
+                {/if}
               </div>
 
               {#if !hasSources}

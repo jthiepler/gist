@@ -910,6 +910,19 @@ async fn update_session_input(
     get_session_input_by_id(&db.conn, &data.id)
 }
 
+#[tauri::command]
+async fn delete_session_input(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let affected = db
+        .conn
+        .execute("DELETE FROM session_inputs WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    if affected == 0 {
+        return Err("Session input not found".into());
+    }
+    Ok(())
+}
+
 fn get_session_input_by_id(conn: &Connection, id: &str) -> Result<SessionInput, String> {
     conn.query_row(
         "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, language, transcription_model, include_in_notes, created_at, updated_at
@@ -1273,6 +1286,7 @@ pub fn run() {
             delete_session,
             create_session_input,
             update_session_input,
+            delete_session_input,
             create_session_note,
             get_patient_formats,
             set_patient_formats,

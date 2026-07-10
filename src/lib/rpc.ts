@@ -122,6 +122,10 @@ export async function updateSessionInput(data: {
   return invoke<SessionInput>("update_session_input", { data });
 }
 
+export async function deleteSessionInput(id: string): Promise<void> {
+  return invoke<void>("delete_session_input", { id });
+}
+
 export async function updateSession(data: {
   id: string;
   date: string;

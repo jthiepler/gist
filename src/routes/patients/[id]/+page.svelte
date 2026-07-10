@@ -4,10 +4,19 @@
   import { tick, untrack } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
-  import { patients, sidecarBusy, activeOperation, isRecording, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
+  import {
+    activeOperation,
+    currentOperation,
+    isRecording,
+    patients,
+    pendingSession,
+    recordingContext,
+    sessionUpdate,
+    sidecarBusy,
+  } from "$lib/stores";
   import { generateNote, listNoteFormats, getPatientFormats, createSessionNote } from "$lib/rpc";
   import { formatInputsForNoteGeneration, hasNoteSourceMaterial } from "$lib/sessionInputs";
-  import { progressPercent, progressStage, progressBase, progressScale, currentOperation } from "$lib/stores";
+  import { progressBase, progressPercent, progressScale, progressStage } from "$lib/stores";
   import { loadSettings } from "$lib/settings";
   import type { Patient, Session } from "$lib/types";
   import SessionCard from "$lib/components/SessionCard.svelte";
@@ -23,6 +32,7 @@
   let editNameInput = $state<HTMLInputElement | null>(null);
   let savingName = $state(false);
   let showPatientMenu = $state(false);
+  let recordingNewSession = $state(false);
 
   const patientId = $derived($page.params.id ?? "");
 
@@ -53,10 +63,19 @@
     return () => { stale = true; };
   });
 
-  // Keep New Session panel open while a recording is in progress for this patient
+  // Keep the New Session panel open only for recordings that create a new session.
+  // Existing-session recordings are controlled from their source-material pane.
   $effect(() => {
-    if ($isRecording && $recordingContext?.patientId === patientId) {
-      showNewSession = true;
+    const ctx = $recordingContext;
+    if ($isRecording && ctx?.patientId === patientId) {
+      recordingNewSession = !ctx.session;
+      showNewSession = recordingNewSession;
+      return;
+    }
+
+    if (!$isRecording && recordingNewSession) {
+      recordingNewSession = false;
+      showNewSession = false;
     }
   });
 

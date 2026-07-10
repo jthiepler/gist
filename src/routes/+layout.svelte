@@ -2,6 +2,7 @@
   import "../app.css";
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { confirm } from "@tauri-apps/plugin-dialog";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { isRunning, startSidecar, onProgress, cancelSidecar, checkIsRecording, getRecordingState, stopRecording, pauseRecording, resumeRecording, onRecordingTick, onRecordingStopped } from "$lib/rpc";
   import { processSessionFromAudio } from "$lib/processSession";
@@ -9,7 +10,8 @@
   import { get } from "svelte/store";
   import { loadDarkMode } from "$lib/settings";
   import { page } from "$app/stores";
-  import type { Patient } from "$lib/types";
+  import type { Patient, Session } from "$lib/types";
+  import { confirmRegenerateAttachedNotes } from "$lib/confirmations";
 
   let { children } = $props();
 
@@ -114,8 +116,27 @@
       recordingContext.set(null);
 
       try {
-        const session = await processSessionFromAudio(data.file_path, ctx);
-        pendingSession.set(session);
+        const isNewSession = !ctx.session;
+        const session = ctx.session ?? await invoke<Session>("create_session", {
+          data: {
+            patient_id: ctx.patientId,
+            date: new Date().toISOString().slice(0, 10),
+          },
+        });
+        if (isNewSession) {
+          pendingSession.set(session);
+        }
+
+        const regenerateExisting = await confirmRegenerateAttachedNotes(
+          ctx.session?.notes.length ?? 0
+        );
+        const processedSession = await processSessionFromAudio(data.file_path, {
+          ...ctx,
+          session,
+          isNewSession,
+          regenerateExisting,
+        });
+        pendingSession.set(processedSession);
         sessionUpdate.set(null);
       } catch (e) {
         console.error("Session processing failed:", e);

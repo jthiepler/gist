@@ -5,8 +5,6 @@ export const SESSION_INPUT_LABELS: Record<SessionInputKind, string> = {
   clinician_note: "Clinician note",
 };
 
-export const SESSION_INPUT_KINDS: SessionInputKind[] = ["session_transcript", "clinician_note"];
-
 export const SESSION_INPUT_SOURCES = {
   typed: "typed",
   uploadAudio: "upload_audio",
@@ -18,10 +16,6 @@ const INPUT_ORDER: Record<string, number> = {
   session_transcript: 0,
   clinician_note: 1,
 };
-
-export function getSessionInput(session: Session, kind: SessionInputKind): SessionInput | null {
-  return session.inputs.find((input) => input.kind === kind) ?? null;
-}
 
 export function getInputLabel(input: Pick<SessionInput, "kind" | "title">): string {
   if (input.title) return input.title;

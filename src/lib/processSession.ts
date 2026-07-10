@@ -1,4 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
 import {
   transcribe,
   generateNote,
@@ -32,6 +31,8 @@ export interface RecordingContext {
   thinking: boolean;
   inputKind: SessionInputKind;
   session?: Session;
+  isNewSession?: boolean;
+  regenerateExisting?: boolean;
 }
 
 function resetProgress() {
@@ -67,7 +68,7 @@ async function generateDocumentationForSession(
 
   for (let i = 0; i < sortedFormats.length; i++) {
     const fmtName = sortedFormats[i];
-    const label = `${ctx.session ? "Updating" : "Generating"} ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
+    const label = `${ctx.isNewSession ? "Generating" : "Updating"} ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
     progressStage.set(label);
     activeOperation.set({ type: "generate_note", label });
     progressBase.set(basePct + Math.round((i / totalNotes) * noteRange));
@@ -108,15 +109,19 @@ export async function processSessionFromAudio(
   audioPath: string,
   ctx: RecordingContext,
 ): Promise<Session> {
+  if (!ctx.session) {
+    throw new Error("Recording session was not initialized.");
+  }
+
+  const session = ctx.session;
   const ok = await ensureSidecar();
   if (!ok) {
     throw new Error("Failed to start processing engine.");
   }
 
-  const appendingToExistingSession = !!ctx.session;
-  const opId = appendingToExistingSession
-    ? `add-input-${ctx.session?.id ?? "session"}`
-    : "new-session";
+  const opId = ctx.isNewSession
+    ? `new-session-${session.id}`
+    : `add-input-${session.id}`;
 
   currentOperation.set(opId);
   progressBase.set(0);
@@ -157,43 +162,7 @@ export async function processSessionFromAudio(
     progressStage.set("Saving session material...");
     activeOperation.set({ type: "create_session", label: "Saving session material..." });
 
-    if (ctx.session) {
-      await createSessionInput({
-        session_id: ctx.session.id,
-        kind: ctx.inputKind,
-        source,
-        title: SESSION_INPUT_LABELS[ctx.inputKind],
-        text: transcript,
-        audio_file: audioPath,
-        duration_seconds: duration,
-        language,
-        transcription_model: ctx.defaultTranscription || null,
-        include_in_notes: true,
-      });
-
-      const updatedSession = (await getSession(ctx.session.id)) ?? ctx.session;
-      sessionUpdate.set(updatedSession);
-      const formatsToRefresh =
-        ctx.formats.length > 0
-          ? ctx.formats
-          : updatedSession.notes.map((note) => note.format);
-      const regeneratedSession = await generateDocumentationForSession(
-        updatedSession,
-        formatsToRefresh,
-        ctx,
-      );
-      progressPercent.set(100);
-      resetProgress();
-      return regeneratedSession;
-    }
-
-    let session = await invoke<Session>("create_session", {
-      data: {
-        patient_id: ctx.patientId,
-        date: new Date().toISOString().slice(0, 10),
-      },
-    });
-    const input = await createSessionInput({
+    await createSessionInput({
       session_id: session.id,
       kind: ctx.inputKind,
       source,
@@ -205,17 +174,26 @@ export async function processSessionFromAudio(
       transcription_model: ctx.defaultTranscription || null,
       include_in_notes: true,
     });
-    session = { ...session, inputs: [input] };
-    sessionUpdate.set(session);
-
-    const generatedSession = await generateDocumentationForSession(
-      session,
-      ctx.formats,
+    const updatedSession = (await getSession(session.id)) ?? session;
+    sessionUpdate.set(updatedSession);
+    if (!ctx.isNewSession && !ctx.regenerateExisting) {
+      progressPercent.set(100);
+      resetProgress();
+      return updatedSession;
+    }
+    const formatsToRefresh = ctx.isNewSession
+      ? ctx.formats
+      : ctx.formats.length > 0
+        ? ctx.formats
+        : updatedSession.notes.map((note) => note.format);
+    const processedSession = await generateDocumentationForSession(
+      updatedSession,
+      formatsToRefresh,
       ctx,
     );
     progressPercent.set(100);
     resetProgress();
-    return generatedSession;
+    return processedSession;
   } catch (e) {
     resetProgress();
     throw new Error(`Failed to save session: ${String(e)}`);
