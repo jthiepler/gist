@@ -48,12 +48,14 @@
 
   let {
     session,
+    initiallyExpanded = true,
     isGenerating = false,
     onGenerateNote,
     onDelete,
     onChange,
   }: {
     session: Session;
+    initiallyExpanded?: boolean;
     isGenerating?: boolean;
     onGenerateNote: (
       session: Session,
@@ -68,7 +70,7 @@
   type WorkspaceMode = "focus" | "compare";
   type FocusPane = "note" | "source";
 
-  let expanded = $state(true);
+  let expanded = $state(false);
   let workspaceMode = $state<WorkspaceMode>("focus");
   let focusPane = $state<FocusPane>("note");
   let noteEditing = $state(false);
@@ -78,6 +80,7 @@
   let noteDraft = $state("");
   let inputDraft = $state("");
   let inputAudioPath = $state("");
+  let diarizeInput = $state(false);
   let noteEditorEl = $state<HTMLTextAreaElement | null>(null);
   let inputEditorEl = $state<HTMLTextAreaElement | null>(null);
   let savingNote = $state(false);
@@ -86,7 +89,6 @@
   let noteStatus = $state("");
   let inputStatus = $state("");
   let defaultLlm = $state("");
-  let defaultTranscription = $state("");
   let thinking = $state(false);
   let openSessionMenu = $state(false);
   let openNoteMenu = $state(false);
@@ -121,9 +123,20 @@
   let hasSources = $derived(sourceInputs.length > 0);
   let sourceSummary = $derived(
     sourceInputs.length === 0
-      ? "No source material"
-      : `${sourceInputs.length} source ${sourceInputs.length === 1 ? "item" : "items"}`
+      ? "No source material added"
+      : `${sourceInputs.length} ${sourceInputs.length === 1 ? "source" : "sources"}`
   );
+
+  let sessionSummary = $derived.by(() => {
+    const parts: string[] = [];
+    if (session.inputs.length > 0) {
+      parts.push(`${session.inputs.length} ${session.inputs.length === 1 ? "source" : "sources"}`);
+    }
+    if (sortedNotes.length > 0) {
+      parts.push(`${sortedNotes.length} ${sortedNotes.length === 1 ? "note" : "notes"}`);
+    }
+    return parts.join(" · ");
+  });
 
   let formattedDate = $derived(
     new Date(session.date).toLocaleDateString("en-US", {
@@ -157,7 +170,7 @@
     $currentOperation === `new-session-${session.id}`
   );
   let processingLabel = $derived(
-    $activeOperation.label || (isGenerating ? "Working..." : "Processing...")
+    $activeOperation.label || (isGenerating ? "Generating notes..." : "Processing...")
   );
 
   $effect(() => {
@@ -173,6 +186,7 @@
     addingInputKind = null;
     inputDraft = "";
     inputAudioPath = "";
+    diarizeInput = false;
   });
 
   $effect(() => {
@@ -180,6 +194,7 @@
     if (initializedSessionId === sessionId) return;
 
     initializedSessionId = sessionId;
+    expanded = initiallyExpanded;
     currentTab = null;
     noteEditing = false;
     editingInputId = null;
@@ -208,10 +223,6 @@
 
   function inputFor(id: string) {
     return session.inputs.find((input) => input.id === id) ?? null;
-  }
-
-  function sourceMeta(input: SessionInput) {
-    return input.source.replace("_", " ");
   }
 
   function sourcePreview(input: SessionInput) {
@@ -368,7 +379,6 @@
   async function loadExistingInputSettings() {
     const settings = await loadSettings();
     defaultLlm = settings.defaultLlm;
-    defaultTranscription = settings.defaultTranscription;
     thinking = settings.thinking;
   }
 
@@ -538,7 +548,7 @@
       addingInputKind = null;
       inputDraft = "";
       if (await confirmDocumentationRefresh()) {
-        inputStatus = "Updating documentation...";
+        inputStatus = "Updating notes...";
         await onGenerateNote(updatedSession, { regenerateExisting: true });
       }
       inputStatus = "Saved";
@@ -552,7 +562,7 @@
   async function deleteInput(input: SessionInput) {
     const label = getInputLabel(input);
     if (
-      !(await confirm(`Delete this ${label.toLowerCase()}? This source will be removed from future documentation.`, {
+      !(await confirm(`Delete this ${label.toLowerCase()}? This source will be removed from future notes.`, {
         title: "Delete source material",
         kind: "warning",
       }))
@@ -571,7 +581,7 @@
       openInputMenu = null;
       expandedInputId = null;
       if (await confirmDocumentationRefresh()) {
-        inputStatus = "Updating documentation...";
+        inputStatus = "Updating notes...";
         await onGenerateNote(updatedSession, { regenerateExisting: true });
       }
       inputStatus = "Source deleted";
@@ -604,9 +614,12 @@
 
     try {
       await loadExistingInputSettings();
-      const result = await transcribe(inputAudioPath, defaultTranscription || undefined);
-      progressStage.set("Saving session material...");
-      activeOperation.set({ type: "create_session", label: "Saving session material..." });
+      const result = await transcribe(
+        inputAudioPath,
+        kind === "session_transcript" && diarizeInput,
+      );
+      progressStage.set("Saving source material...");
+      activeOperation.set({ type: "create_session", label: "Saving source material..." });
       await createSessionInput({
         session_id: session.id,
         kind,
@@ -616,7 +629,6 @@
         audio_file: inputAudioPath,
         duration_seconds: result.duration,
         language: result.language || null,
-        transcription_model: defaultTranscription || null,
         include_in_notes: true,
       });
       const updated = await getSession(session.id);
@@ -661,9 +673,9 @@
         patientId: session.patient_id,
         formats: await getPatientFormats(session.patient_id),
         defaultLlm,
-        defaultTranscription,
         thinking,
         inputKind: kind,
+        diarize: kind === "session_transcript" && diarizeInput,
         session,
       };
       recordingContext.set(ctx);
@@ -739,6 +751,9 @@
       {/if}
       {#if language}
         <span>{language}</span>
+      {/if}
+      {#if sessionSummary}
+        <span>{sessionSummary}</span>
       {/if}
       <div class="action-menu">
         <button
@@ -827,7 +842,7 @@
       {#if isGenerating}
         <div class="spinner-container">
           <div class="spinner"></div>
-          <p class="text-muted spinner-message">Generating note...</p>
+          <p class="text-muted spinner-message">Generating notes...</p>
         </div>
       {:else}
         <div
@@ -911,7 +926,7 @@
                   {/if}
                   {#if hasSources && !activeNote}
                     <button class="btn btn-sm btn-primary" onclick={() => onGenerateNote(session)}>
-                      Generate Documentation
+                      Generate notes
                     </button>
                   {/if}
 
@@ -922,7 +937,7 @@
                       disabled={$isRecording || processingInput || !!editingInputId || !!addingInputKind}
                       aria-expanded={openAddSourceMenu}
                     >
-                      Add Source
+                      Add source material
                     </button>
 
                     {#if openAddSourceMenu}
@@ -931,16 +946,16 @@
                           Record session
                         </button>
                         <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "audio_file")}>
-                          Upload recording
+                          Upload session recording
                         </button>
                         <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "text")}>
-                          Paste transcript
+                          Paste session transcript
                         </button>
                         <button class="action-menu-item" onclick={() => startInputAdding("clinician_note", "text")}>
-                          Type clinician note
+                          Write clinician note
                         </button>
                         <button class="action-menu-item" onclick={() => startInputAdding("clinician_note", "dictation")}>
-                          Dictate clinician note
+                          Record clinician note
                         </button>
                       </div>
                     {/if}
@@ -956,7 +971,6 @@
                         <div class="source-input-title">
                           {getInputLabel(input)}
                         </div>
-                        <div class="source-input-meta">{sourceMeta(input)}</div>
                         <button
                           class="source-input-preview"
                           onclick={() => expandedInputId = expandedInputId === input.id ? null : input.id}
@@ -1074,9 +1088,15 @@
                           />
                           <button class="btn" onclick={pickInputAudioFile} disabled={processingInput}>Browse</button>
                         </div>
+                        {#if addingInputKind === "session_transcript"}
+                          <label class="option-checkbox">
+                            <input type="checkbox" bind:checked={diarizeInput} disabled={processingInput} />
+                            <span>Identify speakers</span>
+                          </label>
+                        {/if}
                         <div class="editor-footer">
                           <button class="btn btn-sm btn-primary" onclick={() => saveAudioInput(addingInputKind!)} disabled={processingInput || !inputAudioPath}>
-                            {processingInput ? "Transcribing..." : "Transcribe & Save"}
+                            {processingInput ? "Transcribing..." : "Transcribe and add"}
                           </button>
                         </div>
                       </div>
@@ -1099,7 +1119,7 @@
                                 {$recordingPaused ? "Resume" : "Pause"}
                               </button>
                               <button class="btn btn-primary record-stop-btn" onclick={handleStopRecording}>
-                                Stop {inputMethod === "dictation" ? "Dictation" : "Recording"}
+                                Stop recording
                               </button>
                             </div>
                           </div>
@@ -1115,7 +1135,7 @@
                             </div>
                             {#if inputMethod === "recording"}
                               <div class="form-group">
-                                <label for={`output-device-${session.id}-${addingInputKind}`}>System audio</label>
+                              <label for={`output-device-${session.id}-${addingInputKind}`}>Computer audio</label>
                                 <select id={`output-device-${session.id}-${addingInputKind}`} bind:value={selectedOutputDevice}>
                                   {#each outputDevices as d (d.name)}
                                     <option value={d.name}>{d.name}</option>
@@ -1123,8 +1143,14 @@
                                 </select>
                               </div>
                             {/if}
+                            {#if addingInputKind === "session_transcript"}
+                              <label class="option-checkbox">
+                                <input type="checkbox" bind:checked={diarizeInput} />
+                                <span>Identify speakers</span>
+                              </label>
+                            {/if}
                             <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")}>
-                              {inputMethod === "dictation" ? "Start Dictation" : "Start Recording"}
+                              Start recording
                             </button>
                           </div>
                         {/if}
@@ -1136,7 +1162,7 @@
 
               {#if !hasSources}
                 <div class="spinner-container note-empty-panel">
-                  <p class="text-muted empty-message">Add a session transcript or clinician note to generate documentation.</p>
+                  <p class="text-muted empty-message">Add a session transcript or clinician note to generate notes.</p>
                 </div>
               {/if}
             </section>

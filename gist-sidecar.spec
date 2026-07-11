@@ -2,19 +2,16 @@
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('gist/formats/defaults.json', 'gist/formats')]
 binaries = []
-hiddenimports = []
+hiddenimports = ['torch', 'torchaudio', 'torchcodec']
 hiddenimports += collect_submodules('mlx_lm.models')
+hiddenimports += collect_submodules('torchcodec')
 tmp_ret = collect_all('mlx_lm')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('transformers')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('huggingface_hub')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('faster_whisper')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('ctranslate2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('tokenizers')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -24,6 +21,13 @@ tmp_ret = collect_all('mlx')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('mlx_audio')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('pyannote.audio')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+import pathlib, torchcodec
+torchcodec_dir = pathlib.Path(torchcodec.__file__).parent
+for name in ('libtorchcodec_core8.dylib', 'libtorchcodec_custom_ops8.dylib', 'libtorchcodec_pybind_ops8.so'):
+    binaries.append((str(torchcodec_dir / name), 'torchcodec'))
+binaries.append((str(torchcodec_dir / '.dylibs' / 'libc++.1.0.dylib'), 'torchcodec/.dylibs'))
 tmp_ret = collect_all('scipy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('miniaudio')
@@ -41,7 +45,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=['gist/_runtime_hook.py'],
-    excludes=['torch', 'torchvision', 'torchaudio', 'onnx', 'onnxruntime', 'tensorflow', 'keras', 'tf2onnx', 'flax', 'jax', 'librosa'],
+    excludes=['torchvision', 'onnx', 'onnxruntime', 'tensorflow', 'keras', 'tf2onnx', 'flax', 'jax', 'librosa'],
     noarchive=False,
     optimize=0,
 )

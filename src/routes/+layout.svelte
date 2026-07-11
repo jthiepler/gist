@@ -4,13 +4,13 @@
   import { invoke } from "@tauri-apps/api/core";
   import { confirm } from "@tauri-apps/plugin-dialog";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { isRunning, startSidecar, onProgress, cancelSidecar, checkIsRecording, getRecordingState, stopRecording, pauseRecording, resumeRecording, onRecordingTick, onRecordingStopped } from "$lib/rpc";
+import { isRunning, startSidecar, onProgress, cancelSidecar, checkIsRecording, getRecordingState, stopRecording, pauseRecording, resumeRecording, onRecordingTick, onRecordingStopped } from "$lib/rpc";
   import { processSessionFromAudio } from "$lib/processSession";
   import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressBase, progressScale, darkMode, sidecarBusy, activeOperation, isRecording, recordingPaused, recordingElapsed, recordingLevel, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
   import { get } from "svelte/store";
   import { loadDarkMode } from "$lib/settings";
   import { page } from "$app/stores";
-  import type { Patient, Session } from "$lib/types";
+import type { Patient, Session } from "$lib/types";
   import { confirmRegenerateAttachedNotes } from "$lib/confirmations";
 
   let { children } = $props();
@@ -34,6 +34,33 @@
     const h = Math.floor(seconds / 3600);
     const m = Math.round((seconds % 3600) / 60);
     return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+
+  function sanitizeProgressStage(stage: string, operationType: string | null): string {
+    const normalized = stage.trim().toLowerCase();
+
+    if (normalized.startsWith("loading speaker")) return "Preparing speaker identification...";
+    if (normalized.includes("speaker diarization complete") || normalized.includes("finalizing speaker turns")) {
+      return "Finalizing transcript...";
+    }
+    if (normalized.startsWith("loading ")) {
+      if (operationType === "generate_note") return "Preparing note generation...";
+      if (operationType === "download_model") return "Preparing model download...";
+      return "Preparing transcription...";
+    }
+    if (normalized === "transcribing") return "Transcribing...";
+    if (normalized === "generating") return "Generating note...";
+    if (normalized === "done") return "Finalizing note...";
+    if (normalized.startsWith("starting download")) return "Preparing model download...";
+    if (normalized.startsWith("downloading ")) return "Downloading model files...";
+    if (normalized === "download complete") return "Model download complete";
+    if (normalized.includes("speaker diarization") || normalized.includes("speaker analysis")) {
+      return "Preparing speaker identification...";
+    }
+    if (normalized.includes("analyzing speech segments")) return "Analyzing speech...";
+    if (normalized.includes("estimating speakers")) return "Estimating number of speakers...";
+    if (normalized.includes("identifying speakers")) return "Identifying speakers...";
+    return stage;
   }
 
   onMount(async () => {
@@ -62,9 +89,18 @@
     unlistenProgress = await onProgress((data) => {
       const base = get(progressBase);
       const scale = get(progressScale);
+      const operation = get(activeOperation);
+      const safeStage = sanitizeProgressStage(data.stage, operation.type);
       progressPercent.set(base + Math.round((data.percent / 100) * scale));
-      progressStage.set(data.stage);
+      progressStage.set(safeStage);
       progressEta.set(data.eta_seconds ?? null);
+      if (
+        operation.type === "transcribe" &&
+        safeStage !== "Preparing transcription..." &&
+        safeStage !== "Transcribing..."
+      ) {
+        activeOperation.set({ ...operation, label: safeStage });
+      }
     });
 
     // Sidecar busy state listener
@@ -243,6 +279,8 @@
 </script>
 
 <div class="app-shell">
+  <div class="window-drag-region" data-tauri-drag-region aria-hidden="true"></div>
+
   <aside class="sidebar">
     <div class="sidebar-header">
       <h1>Gist</h1>
@@ -288,7 +326,7 @@
         </button>
       {/if}
 
-      <a href="/templates" class="footer-link" class:active={isTemplates}>Note Formats</a>
+      <a href="/templates" class="footer-link" class:active={isTemplates}>Note templates</a>
       <a href="/settings" class="footer-link" class:active={isSettings}>Settings</a>
     </div>
   </aside>
@@ -302,7 +340,7 @@
   <div class="progress-card">
     <div class="progress-card-header">
       <span class="progress-card-title">
-        {$activeOperation.label || $progressStage || "Working..."}
+        {$activeOperation.label || $progressStage || "Processing..."}
       </span>
       <button class="progress-card-cancel" onclick={handleCancel}>Cancel</button>
     </div>

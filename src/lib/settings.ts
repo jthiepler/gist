@@ -3,14 +3,12 @@ import { darkMode } from "./stores";
 
 export interface Settings {
   defaultLlm: string;
-  defaultTranscription: string;
   thinking: boolean;
   darkMode: boolean;
 }
 
 const DEFAULTS: Settings = {
   defaultLlm: "",
-  defaultTranscription: "",
   thinking: false,
   darkMode: false,
 };
@@ -20,8 +18,6 @@ export async function loadSettings(): Promise<Settings> {
   try {
     const llm = await getSetting("default_llm");
     if (llm) s.defaultLlm = llm;
-    const tr = await getSetting("default_transcription");
-    if (tr) s.defaultTranscription = tr;
     const th = await getSetting("thinking");
     if (th !== null) s.thinking = th === "true";
     const dm = await getSetting("dark_mode");
@@ -34,7 +30,6 @@ export async function loadSettings(): Promise<Settings> {
 
 export async function saveSettings(s: Settings): Promise<void> {
   await setSetting("default_llm", s.defaultLlm);
-  await setSetting("default_transcription", s.defaultTranscription);
   await setSetting("thinking", s.thinking.toString());
   await setSetting("dark_mode", s.darkMode.toString());
 }

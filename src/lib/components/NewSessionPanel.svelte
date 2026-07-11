@@ -2,8 +2,6 @@
   import { invoke } from "@tauri-apps/api/core";
   import {
     createSessionInput,
-    createSessionNote,
-    generateNote,
     getPatientFormats,
     listAudioDevices,
     listNoteFormats,
@@ -18,10 +16,10 @@
   import { ensureSidecar } from "$lib/ensureSidecar";
   import type { RecordingContext } from "$lib/processSession";
   import {
-    formatInputsForNoteGeneration,
     SESSION_INPUT_LABELS,
     SESSION_INPUT_SOURCES,
   } from "$lib/sessionInputs";
+  import { generateSessionDocumentation } from "$lib/documentation";
   import {
     activeOperation,
     currentOperation,
@@ -42,10 +40,12 @@
   let {
     patientId,
     onComplete,
+    onProcessingStart,
     onCancel,
   }: {
     patientId: string;
     onComplete: (session: Session) => void;
+    onProcessingStart: (session: Session) => void;
     onCancel: () => void;
   } = $props();
 
@@ -59,6 +59,7 @@
 
   let sourceKind = $state<SessionInputKind>("session_transcript");
   let inputMethod = $state<InputMethod>("audio_file");
+  let diarizeSession = $state(false);
   let audioPath = $state("");
   let textDraft = $state("");
   let formats = $state<NoteFormatTemplate[]>([]);
@@ -66,10 +67,8 @@
   let formatsLoaded = $state(false);
   let error = $state("");
   let phase = $state<"idle" | "transcribing" | "generating">("idle");
-  let generatingLabel = $state("");
 
   let defaultLlm = $state("");
-  let defaultTranscription = $state("");
   let thinking = $state(false);
 
   let audioDevices = $state<AudioDevice[]>([]);
@@ -90,7 +89,7 @@
     if (sourceKind === "clinician_note" && inputMethod === "dictation") return "dictate_note";
     return "type_note";
   });
-  let recordingLabel = $derived(inputMethod === "dictation" ? "Dictation" : "Recording");
+  let recordingLabel = $derived("Recording");
   let canSubmitDirectly = $derived(inputMethod === "audio_file" || inputMethod === "text");
   let sourceLabel = $derived(SESSION_INPUT_LABELS[sourceKind]);
   let textLabel = $derived(sourceKind === "session_transcript" ? "Session transcript" : "Clinician note");
@@ -102,8 +101,8 @@
   let primaryActionLabel = $derived.by(() => {
     if (phase === "transcribing") return "Transcribing...";
     if (phase === "generating") return "Generating notes...";
-    if (inputMethod === "audio_file") return "Transcribe & Generate";
-    if (inputMethod === "text") return "Save & Generate";
+    if (inputMethod === "audio_file") return "Transcribe and generate notes";
+    if (inputMethod === "text") return "Save and generate notes";
     return "Start";
   });
 
@@ -121,6 +120,16 @@
     const m = Math.floor(seconds / 60);
     const s = Math.floor(seconds % 60);
     return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  function finishOperation() {
+    progressPercent.set(0);
+    progressStage.set("");
+    activeOperation.set({ type: null, label: "" });
+    currentOperation.set(null);
+    progressBase.set(0);
+    progressScale.set(100);
+    phase = "idle";
   }
 
   $effect(() => {
@@ -147,7 +156,6 @@
 
       const s = await loadSettings();
       if (s.defaultLlm) defaultLlm = s.defaultLlm;
-      if (s.defaultTranscription) defaultTranscription = s.defaultTranscription;
       thinking = s.thinking;
     })();
   });
@@ -178,6 +186,7 @@
       sourceKind = "clinician_note";
       inputMethod = "text";
     }
+    if (sourceKind !== "session_transcript") diarizeSession = false;
     error = "";
     if ((inputMethod === "recording" || inputMethod === "dictation") && audioDevices.length === 0) {
       loadAudioDevices();
@@ -195,6 +204,7 @@
     if (ctx && ctx.patientId === patientId && $isRecording) {
       sourceKind = ctx.inputKind;
       inputMethod = ctx.inputKind === "clinician_note" ? "dictation" : "recording";
+      diarizeSession = ctx.diarize ?? false;
     }
   });
 
@@ -223,9 +233,9 @@
         patientId,
         formats: sortedFormats,
         defaultLlm,
-        defaultTranscription,
         thinking,
         inputKind: sourceKind,
+        diarize: sourceKind === "session_transcript" && diarizeSession,
       };
       recordingContext.set(ctx);
       await startRecording(
@@ -290,7 +300,7 @@
       return;
     }
     if (selectedFormats.size === 0) {
-      error = "Please select at least one note format.";
+      error = "Please select at least one note type.";
       return;
     }
     if ($sidecarBusy) {
@@ -305,47 +315,24 @@
     }
 
     const sortedFormats = [...selectedFormats].sort((a, b) => a.localeCompare(b));
-    await setPatientFormats(patientId, sortedFormats);
+    try {
+      await setPatientFormats(patientId, sortedFormats);
+    } catch (e) {
+      error = `Failed to save note type preferences: ${String(e)}`;
+      return;
+    }
 
     error = "";
     currentOperation.set(opId);
     progressBase.set(0);
     progressScale.set(100);
     progressPercent.set(0);
-    progressStage.set(startsFromText ? "Saving session material..." : "Transcribing session recording...");
+    progressStage.set(startsFromText ? "Saving source material..." : "Transcribing session recording...");
     activeOperation.set({
       type: startsFromText ? "create_session" : "transcribe",
-      label: startsFromText ? "Saving session material..." : "Transcribing session recording...",
+      label: startsFromText ? "Saving source material..." : "Transcribing session recording...",
     });
     phase = startsFromText ? "generating" : "transcribing";
-
-    let sourceText = "";
-    let duration: number | null = null;
-    let language: string | null = null;
-
-    if (startsFromAudioFile) {
-      try {
-        const result = await transcribe(audioPath, defaultTranscription || undefined);
-        sourceText = result.transcript;
-        duration = result.duration;
-        language = result.language;
-      } catch (e) {
-        const msg = String(e);
-        error =
-          msg === "sidecar_busy"
-            ? "Another operation is in progress. Please wait or cancel it first."
-            : `Transcription failed: ${msg}`;
-        phase = "idle";
-        progressStage.set("");
-        activeOperation.set({ type: null, label: "" });
-        currentOperation.set(null);
-        progressBase.set(0);
-        progressScale.set(100);
-        return;
-      }
-    } else {
-      sourceText = cleanedText;
-    }
 
     let session: Session;
     try {
@@ -355,6 +342,41 @@
           date: new Date().toISOString().slice(0, 10),
         },
       });
+      currentOperation.set(`${opId}-${session.id}`);
+      onProcessingStart(session);
+    } catch (e) {
+      error = `Failed to create session: ${e}`;
+      finishOperation();
+      return;
+    }
+
+    let sourceText = "";
+    let duration: number | null = null;
+    let language: string | null = null;
+
+    if (startsFromAudioFile) {
+      try {
+        const result = await transcribe(
+          audioPath,
+          sourceKind === "session_transcript" && diarizeSession,
+        );
+        sourceText = result.transcript;
+        duration = result.duration;
+        language = result.language;
+      } catch (e) {
+        const msg = String(e);
+        error =
+          msg === "sidecar_busy"
+            ? "Another operation is in progress. Please wait or cancel it first."
+            : `Transcription failed: ${msg}`;
+        finishOperation();
+        return;
+      }
+    } else {
+      sourceText = cleanedText;
+    }
+
+    try {
       const input = await createSessionInput({
         session_id: session.id,
         kind: sourceKind,
@@ -364,7 +386,6 @@
         audio_file: startsFromAudioFile ? audioPath : null,
         language: startsFromAudioFile ? language || null : null,
         duration_seconds: startsFromAudioFile ? duration : null,
-        transcription_model: startsFromAudioFile ? defaultTranscription || null : null,
         include_in_notes: true,
       });
       session = {
@@ -373,79 +394,45 @@
       };
     } catch (e) {
       error = `Failed to save session: ${e}`;
-      phase = "idle";
-      progressStage.set("");
-      activeOperation.set({ type: null, label: "" });
-      currentOperation.set(null);
+      finishOperation();
       return;
     }
 
     phase = "generating";
-    const noteSourceMaterial = formatInputsForNoteGeneration(session);
-
-    let templates: NoteFormatTemplate[] = [];
     try {
-      templates = await listNoteFormats();
-    } catch {}
-
-    const totalNotes = sortedFormats.length;
-    const basePct = 30;
-    const noteRange = 70;
-
-    for (let i = 0; i < sortedFormats.length; i++) {
-      const fmtName = sortedFormats[i];
-      generatingLabel = `Creating ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
-      progressStage.set(generatingLabel);
-      activeOperation.set({ type: "generate_note", label: generatingLabel });
-      const fmtBase = basePct + Math.round((i / totalNotes) * noteRange);
-      const fmtScale = Math.round(noteRange / totalNotes);
-      progressBase.set(fmtBase);
-      progressScale.set(fmtScale);
-
-      try {
-        const tmpl = templates.find((t) => t.name === fmtName);
-        const result = await generateNote(
-          noteSourceMaterial,
-          fmtName,
-          defaultLlm || undefined,
-          thinking,
-          tmpl?.prompt
-        );
-        const sn = await createSessionNote(session.id, fmtName, result.note, defaultLlm || null);
-        session.notes = [...session.notes, sn];
-      } catch (e) {
-        const msg = String(e);
-        error =
-          msg === "sidecar_busy"
-            ? "Another operation is in progress. Please wait or cancel it first."
-            : `${fmtName.toUpperCase()} note generation failed: ${msg}`;
-        onComplete(session);
-        return;
-      }
+      session = await generateSessionDocumentation(session, sortedFormats, {
+        defaultLlm,
+        thinking,
+        verb: "Creating",
+        onSessionUpdate: onComplete,
+      });
+    } catch (e) {
+      const msg = String(e);
+      error =
+        msg === "sidecar_busy"
+          ? "Another operation is in progress. Please wait or cancel it first."
+          : msg;
+      finishOperation();
+      return;
     }
 
     progressPercent.set(100);
-    progressStage.set("");
-    activeOperation.set({ type: null, label: "" });
-    currentOperation.set(null);
-    progressBase.set(0);
-    progressScale.set(100);
-    phase = "idle";
+    finishOperation();
     onComplete(session);
   }
 </script>
 
 <div class="new-session-panel">
   <div class="new-session-heading">
-    <h3>New Session</h3>
-    <p>Start with the material you already have.</p>
+    <h3>Create a new session</h3>
+    <p>Choose how to add the first source material.</p>
   </div>
 
   {#if error}
     <div class="error-banner">{error}</div>
   {/if}
 
-  <div class="session-start-grid" role="radiogroup" aria-label="Choose what you are adding">
+  <div class="session-start-grid" role="radiogroup" aria-label="Choose how to add the first source material">
     <button
       type="button"
       class="session-start-card"
@@ -491,7 +478,7 @@
       aria-checked={selectedStartOption === "type_note"}
       role="radio"
     >
-      <span class="session-start-title">Type clinician note</span>
+      <span class="session-start-title">Write clinician note</span>
       <span class="session-start-desc">Add observations, corrections, and plan details.</span>
     </button>
     <button
@@ -503,7 +490,7 @@
       aria-checked={selectedStartOption === "dictate_note"}
       role="radio"
     >
-      <span class="session-start-title">Dictate clinician note</span>
+      <span class="session-start-title">Record clinician note</span>
       <span class="session-start-desc">Record your own post-session note.</span>
     </button>
   </div>
@@ -521,6 +508,10 @@
           />
           <button class="btn" onclick={pickFile} disabled={phase !== "idle"}>Browse</button>
         </div>
+        <label class="option-checkbox">
+          <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
+          <span>Identify speakers</span>
+        </label>
       </div>
     </div>
   {:else if inputMethod === "recording" || inputMethod === "dictation"}
@@ -559,17 +550,23 @@
           </div>
           {#if inputMethod === "recording"}
             <div class="form-group">
-              <label for="output-device">System audio</label>
+            <label for="output-device">Computer audio</label>
               <select id="output-device" bind:value={selectedOutputDevice} disabled={phase !== "idle"}>
                 {#each outputDevices as d (d.name)}
                   <option value={d.name}>{d.name}</option>
                 {/each}
               </select>
             </div>
-            <p class="record-hint">System audio capture requires macOS 14.4+. If it is unavailable, Gist will use the microphone.</p>
+            <p class="record-hint">Computer audio capture requires macOS 14.4+. If it is unavailable, Gist will use the microphone.</p>
+          {/if}
+          {#if sourceKind === "session_transcript"}
+            <label class="option-checkbox">
+              <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
+              <span>Identify speakers</span>
+            </label>
           {/if}
           <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={phase !== "idle"}>
-            {inputMethod === "dictation" ? "Start Dictation" : "Start Recording"}
+            Start recording
           </button>
         </div>
       {/if}
@@ -588,12 +585,12 @@
   {/if}
 
   <div class="format-checklist" role="group" aria-labelledby="note-formats-label">
-    <div id="note-formats-label" class="format-checklist-label">Documentation to generate</div>
+    <div id="note-formats-label" class="format-checklist-label">Notes to generate</div>
     <div class="format-checklist-items">
       {#if !formatsLoaded}
-        <span class="text-muted">Loading...</span>
+        <span class="text-muted">Loading note types...</span>
       {:else if visibleFormats.length === 0}
-        <span class="text-muted">No formats available</span>
+        <span class="text-muted">No note types available.</span>
       {:else}
         {#each visibleFormats as f (f.id)}
           <label class="format-checkbox" class:checked={selectedFormats.has(f.name)}>

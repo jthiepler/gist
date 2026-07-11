@@ -14,8 +14,9 @@
     sessionUpdate,
     sidecarBusy,
   } from "$lib/stores";
-  import { generateNote, listNoteFormats, getPatientFormats, createSessionNote } from "$lib/rpc";
-  import { formatInputsForNoteGeneration, hasNoteSourceMaterial } from "$lib/sessionInputs";
+  import { getPatientFormats } from "$lib/rpc";
+  import { hasNoteSourceMaterial } from "$lib/sessionInputs";
+  import { generateSessionDocumentation } from "$lib/documentation";
   import { progressBase, progressPercent, progressScale, progressStage } from "$lib/stores";
   import { loadSettings } from "$lib/settings";
   import type { Patient, Session } from "$lib/types";
@@ -120,7 +121,15 @@
   );
 
   async function deleteSession(session: Session) {
-    if (!(await confirm(`Delete session from ${session.date}?`))) return;
+    const formattedDate = new Date(session.date).toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+    if (!(await confirm(`Delete the session from ${formattedDate}?`, {
+      title: "Delete session",
+      kind: "warning",
+    }))) return;
     try {
       await invoke("delete_session", { id: session.id });
       sessions = sessions.filter((s) => s.id !== session.id);
@@ -168,50 +177,18 @@
     progressBase.set(0);
     progressScale.set(100);
     progressPercent.set(30);
-    progressStage.set(options.regenerateExisting ? "Updating documentation..." : "Creating documentation...");
+    progressStage.set(options.regenerateExisting ? "Updating notes..." : "Creating notes...");
     activeOperation.set({
       type: "generate_note",
-      label: options.regenerateExisting ? "Updating documentation..." : "Creating documentation...",
+      label: options.regenerateExisting ? "Updating notes..." : "Creating notes...",
     });
-    const noteSourceMaterial = formatInputsForNoteGeneration(session);
-
-    // Load templates for prompts
-    let templates = await listNoteFormats();
-
-    const totalNotes = formatsToRefresh.length;
-    const basePct = 30;
-    const noteRange = 70;
-    let updatedNotes = [...session.notes];
-
     try {
-      for (let i = 0; i < formatsToRefresh.length; i++) {
-        const fmtName = formatsToRefresh[i];
-        const label = `Generating ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
-        progressStage.set(label);
-        activeOperation.set({ type: "generate_note", label });
-        const fmtBase = basePct + Math.round((i / totalNotes) * noteRange);
-        const fmtScale = Math.round(noteRange / totalNotes);
-        progressBase.set(fmtBase);
-        progressScale.set(fmtScale);
-
-        const tmpl = templates.find((t) => t.name === fmtName);
-        const result = await generateNote(
-          noteSourceMaterial,
-          fmtName,
-          llm || undefined,
-          thinking,
-          tmpl?.prompt
-        );
-        const sn = await createSessionNote(session.id, fmtName, result.note, llm || null);
-        updatedNotes = [
-          ...updatedNotes.filter((note) => note.format !== sn.format),
-          sn,
-        ].sort((a, b) => a.format.localeCompare(b.format));
-        // Live-update sessions list so user sees progress
-        sessions = sessions.map((s) =>
-          s.id === session.id ? { ...s, notes: updatedNotes } : s
-        );
-      }
+      await generateSessionDocumentation(session, formatsToRefresh, {
+        defaultLlm: llm,
+        thinking,
+        verb: "Generating",
+        onSessionUpdate: upsertSession,
+      });
     } catch (e) {
       const msg = String(e);
       if (msg === "sidecar_busy") {
@@ -230,8 +207,13 @@
     }
   }
 
+  function onNewSessionProcessingStart(session: Session) {
+    upsertSession(session);
+    showNewSession = false;
+  }
+
   function onNewSessionComplete(session: Session) {
-    sessions = [session, ...sessions];
+    upsertSession(session);
     showNewSession = false;
   }
 
@@ -286,7 +268,7 @@
 </script>
 
 {#if loading}
-  <p class="text-muted">Loading...</p>
+  <p class="text-muted">Loading sessions...</p>
 {:else if !patient}
   <div class="error-banner">Patient not found.</div>
 {:else}
@@ -331,7 +313,7 @@
           </button>
           {#if showPatientMenu}
             <div class="patient-menu-popover">
-              <button class="patient-menu-item" onclick={startEditName}>Edit name</button>
+          <button class="patient-menu-item" onclick={startEditName}>Edit patient name</button>
               <button class="patient-menu-item danger" onclick={deletePatient}>Delete patient</button>
             </div>
           {/if}
@@ -340,7 +322,7 @@
     </div>
     <div class="header-meta">
       {#if lastSessionDate}
-        Last session: {lastSessionDate} · {sessions.length} {sessions.length === 1 ? 'session' : 'sessions'}
+        {sessions.length} {sessions.length === 1 ? 'session' : 'sessions'} · Last seen: {lastSessionDate}
       {:else}
         No sessions yet
       {/if}
@@ -353,8 +335,8 @@
 
   <div class="workspace-toolbar">
     {#if !showNewSession}
-      <button class="btn btn-primary" onclick={() => showNewSession = true}>
-        + New Session
+        <button class="btn btn-primary" onclick={() => showNewSession = true}>
+        New session
       </button>
     {/if}
   </div>
@@ -363,6 +345,7 @@
     <NewSessionPanel
       {patientId}
       onComplete={onNewSessionComplete}
+      onProcessingStart={onNewSessionProcessingStart}
       onCancel={() => showNewSession = false}
     />
   {/if}
@@ -374,9 +357,10 @@
     </div>
   {:else}
     <div class="session-list">
-      {#each sessions as session (session.id)}
+      {#each sessions as session, index (session.id)}
         <SessionCard
           {session}
+          initiallyExpanded={index === 0}
           isGenerating={generatingNoteFor === session.id}
           onGenerateNote={generateNoteForSession}
           onDelete={deleteSession}

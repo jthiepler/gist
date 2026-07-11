@@ -12,6 +12,7 @@ class Segment:
     start: float
     end: float
     text: str
+    speaker: Optional[str] = None
 
 
 @dataclass

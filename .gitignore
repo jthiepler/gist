@@ -34,3 +34,9 @@ test*.md
 
 # Reference codebase
 /meetily
+
+# Local PyAnnote model checkout (large, gated model artifacts)
+/speaker-diarization-community-1/
+
+# Local quantized Parakeet model checkout (bundled during macOS builds)
+/parakeet-tdt-0.6b-v3-mlx-4bit/

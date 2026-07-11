@@ -4,7 +4,7 @@ export function confirmRegenerateAttachedNotes(noteCount: number): Promise<boole
   if (noteCount === 0) return Promise.resolve(false);
 
   return ask(
-    "This will override the current content of all attached notes. Do you want to continue?",
+    `The current content of ${noteCount} attached ${noteCount === 1 ? "note" : "notes"} will be replaced with newly generated versions. Your source material will not be changed.`,
     {
       title: "Regenerate attached notes?",
       kind: "warning",

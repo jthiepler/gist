@@ -1,16 +1,13 @@
 import {
   transcribe,
-  generateNote,
-  createSessionNote,
   createSessionInput,
   getSession,
-  listNoteFormats,
 } from "./rpc";
 import {
-  formatInputsForNoteGeneration,
   SESSION_INPUT_LABELS,
   SESSION_INPUT_SOURCES,
 } from "./sessionInputs";
+import { generateSessionDocumentation } from "./documentation";
 import {
   progressPercent,
   progressStage,
@@ -21,15 +18,15 @@ import {
   sessionUpdate,
 } from "./stores";
 import { ensureSidecar } from "./ensureSidecar";
-import type { Session, NoteFormatTemplate, SessionInputKind } from "./types";
+import type { Session, SessionInputKind } from "./types";
 
 export interface RecordingContext {
   patientId: string;
   formats: string[];
   defaultLlm: string;
-  defaultTranscription: string;
   thinking: boolean;
   inputKind: SessionInputKind;
+  diarize: boolean;
   session?: Session;
   isNewSession?: boolean;
   regenerateExisting?: boolean;
@@ -41,68 +38,6 @@ function resetProgress() {
   currentOperation.set(null);
   progressBase.set(0);
   progressScale.set(100);
-}
-
-async function loadTemplates(): Promise<NoteFormatTemplate[]> {
-  try {
-    return await listNoteFormats();
-  } catch {
-    return [];
-  }
-}
-
-async function generateDocumentationForSession(
-  session: Session,
-  formats: string[],
-  ctx: RecordingContext,
-): Promise<Session> {
-  const sortedFormats = [...formats].sort((a, b) => a.localeCompare(b));
-  if (sortedFormats.length === 0) return session;
-
-  const noteSourceMaterial = formatInputsForNoteGeneration(session);
-  const templates = await loadTemplates();
-  const totalNotes = sortedFormats.length;
-  const basePct = 30;
-  const noteRange = 70;
-  let nextSession = session;
-
-  for (let i = 0; i < sortedFormats.length; i++) {
-    const fmtName = sortedFormats[i];
-    const label = `${ctx.isNewSession ? "Generating" : "Updating"} ${fmtName.toUpperCase()} note (${i + 1}/${totalNotes})...`;
-    progressStage.set(label);
-    activeOperation.set({ type: "generate_note", label });
-    progressBase.set(basePct + Math.round((i / totalNotes) * noteRange));
-    progressScale.set(Math.round(noteRange / totalNotes));
-
-    try {
-      const tmpl = templates.find((t) => t.name === fmtName);
-      const result = await generateNote(
-        noteSourceMaterial,
-        fmtName,
-        ctx.defaultLlm || undefined,
-        ctx.thinking,
-        tmpl?.prompt,
-      );
-      const note = await createSessionNote(
-        session.id,
-        fmtName,
-        result.note,
-        ctx.defaultLlm || null,
-      );
-      nextSession = {
-        ...nextSession,
-        notes: [
-          ...nextSession.notes.filter((existing) => existing.format !== note.format),
-          note,
-        ].sort((a, b) => a.format.localeCompare(b.format)),
-      };
-      sessionUpdate.set(nextSession);
-    } catch {
-      break;
-    }
-  }
-
-  return nextSession;
 }
 
 export async function processSessionFromAudio(
@@ -140,7 +75,10 @@ export async function processSessionFromAudio(
   let language: string | null = null;
 
   try {
-    const result = await transcribe(audioPath, ctx.defaultTranscription || undefined);
+    const result = await transcribe(
+      audioPath,
+      ctx.inputKind === "session_transcript" && ctx.diarize,
+    );
     transcript = result.transcript;
     duration = result.duration;
     language = result.language;
@@ -158,9 +96,10 @@ export async function processSessionFromAudio(
     ? SESSION_INPUT_SOURCES.dictation
     : SESSION_INPUT_SOURCES.recording;
 
+  let updatedSession: Session;
   try {
-    progressStage.set("Saving session material...");
-    activeOperation.set({ type: "create_session", label: "Saving session material..." });
+    progressStage.set("Saving source material...");
+    activeOperation.set({ type: "create_session", label: "Saving source material..." });
 
     await createSessionInput({
       session_id: session.id,
@@ -171,31 +110,39 @@ export async function processSessionFromAudio(
       audio_file: audioPath,
       duration_seconds: duration,
       language,
-      transcription_model: ctx.defaultTranscription || null,
       include_in_notes: true,
     });
-    const updatedSession = (await getSession(session.id)) ?? session;
+    updatedSession = (await getSession(session.id)) ?? session;
     sessionUpdate.set(updatedSession);
-    if (!ctx.isNewSession && !ctx.regenerateExisting) {
-      progressPercent.set(100);
-      resetProgress();
-      return updatedSession;
-    }
-    const formatsToRefresh = ctx.isNewSession
+  } catch (e) {
+    resetProgress();
+    throw new Error(`Failed to save session: ${String(e)}`);
+  }
+
+  if (!ctx.isNewSession && !ctx.regenerateExisting) {
+    progressPercent.set(100);
+    resetProgress();
+    return updatedSession;
+  }
+
+  const formatsToRefresh = ctx.isNewSession
+    ? ctx.formats
+    : ctx.formats.length > 0
       ? ctx.formats
-      : ctx.formats.length > 0
-        ? ctx.formats
-        : updatedSession.notes.map((note) => note.format);
-    const processedSession = await generateDocumentationForSession(
-      updatedSession,
-      formatsToRefresh,
-      ctx,
-    );
+      : updatedSession.notes.map((note) => note.format);
+
+  try {
+    const processedSession = await generateSessionDocumentation(updatedSession, formatsToRefresh, {
+      defaultLlm: ctx.defaultLlm,
+      thinking: ctx.thinking,
+      verb: ctx.isNewSession ? "Generating" : "Updating",
+      onSessionUpdate: (nextSession) => sessionUpdate.set(nextSession),
+    });
     progressPercent.set(100);
     resetProgress();
     return processedSession;
   } catch (e) {
     resetProgress();
-    throw new Error(`Failed to save session: ${String(e)}`);
+    throw e;
   }
 }

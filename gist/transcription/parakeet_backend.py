@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
@@ -12,6 +14,33 @@ log = logging.getLogger(__name__)
 
 _CHUNK_SECONDS = 120.0
 _OVERLAP_SECONDS = 2.0
+MODEL_DIR_NAME = "parakeet-tdt-0.6b-v3-mlx-4bit"
+
+
+def resolve_model_path() -> Optional[Path]:
+    """Find the bundled Parakeet checkpoint in development or the app bundle."""
+    configured = os.environ.get("GIST_PARAKEET_MODEL_PATH")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    candidates.extend(
+        [
+            project_root / MODEL_DIR_NAME,
+            project_root / "src-tauri" / "resources" / "parakeet" / MODEL_DIR_NAME,
+            Path.cwd() / MODEL_DIR_NAME,
+            Path.cwd() / "src-tauri" / "resources" / "parakeet" / MODEL_DIR_NAME,
+        ]
+    )
+
+    executable = Path(sys.executable).resolve()
+    candidates.append(executable.parent.parent / "parakeet" / MODEL_DIR_NAME)
+
+    for path in candidates:
+        if (path / "config.json").is_file() and (path / "model.safetensors").is_file():
+            return path
+    return None
 
 
 class ParakeetBackend(TranscriptionBackend):
@@ -41,38 +70,46 @@ class ParakeetBackend(TranscriptionBackend):
 
         log.info("Transcribing %s (language=%s ignored)", audio_path, language or "auto")
 
-        text_parts: list[str] = []
         segments: list[Segment] = []
-        audio_duration = 0.0
 
-        for chunk in self.model.generate(
+        def report_chunk_progress(current: int, total: int) -> None:
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Transcription cancelled")
+            if progress_callback:
+                pct = int((current / total) * 100) if total > 0 else 0
+                progress_callback(pct, "transcribing")
+
+        # Non-streaming generation retains Parakeet's sentence/token
+        # timestamps. The streaming API only exposes the accumulated text for
+        # each large chunk, which is too coarse for speaker alignment.
+        result = self.model.generate(
             str(path),
             chunk_duration=_CHUNK_SECONDS,
             overlap_duration=_OVERLAP_SECONDS,
-            stream=True,
-        ):
-            if cancel_event and cancel_event.is_set():
-                raise InterruptedError("Transcription cancelled")
-            new_text = getattr(chunk, "text", "") or ""
-            if new_text:
-                text_parts.append(new_text)
-                segments.append(
-                    Segment(
-                        start=float(getattr(chunk, "start_time", 0.0)),
-                        end=float(getattr(chunk, "end_time", 0.0)),
-                        text=new_text.strip(),
-                    )
-                )
-            audio_duration = float(getattr(chunk, "audio_duration", 0.0) or 0.0)
-            if progress_callback:
-                is_final = bool(getattr(chunk, "is_final", False))
-                pct = 100 if is_final else int(
-                    (getattr(chunk, "progress", 0.0) or 0.0) * 100
-                )
-                progress_callback(pct, "transcribing")
+            chunk_callback=report_chunk_progress,
+            stream=False,
+        )
 
-        full_text = " ".join(text_parts).strip()
-        duration = segments[-1].end if segments else audio_duration
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Transcription cancelled")
+
+        for sentence in getattr(result, "sentences", []):
+            text = getattr(sentence, "text", "").strip()
+            if not text:
+                continue
+            segments.append(
+                Segment(
+                    start=float(sentence.start),
+                    end=float(sentence.end),
+                    text=text,
+                )
+            )
+
+        if progress_callback:
+            progress_callback(100, "transcribing")
+
+        full_text = " ".join(segment.text for segment in segments).strip()
+        duration = segments[-1].end if segments else 0.0
 
         return TranscriptResult(
             text=full_text,

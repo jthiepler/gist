@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.0.0",
-    "faster-whisper>=1.0.0",
     "mlx-lm>=0.31.0",
     "transformers>=5.0.0,<5.13.0",
     "huggingface-hub>=0.20.0",
@@ -14,6 +13,7 @@ dependencies = [
     "mlx-audio[stt]>=0.4.4",
     "cffi<2",  # mlx-audio's transitive cffi 2.x breaks against bundled llvm
     "miniaudio>=1.59",
+    "pyannote-audio>=4.0.0,<5",
 ]
 
 [project.scripts]

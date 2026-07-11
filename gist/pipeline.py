@@ -8,9 +8,10 @@ from typing import Optional
 
 from .llm.factory import auto_detect_backend, create_backend
 from .config import DEFAULT_OPENAI_ENDPOINT
-from .models import DEFAULT_TRANSCRIPTION, resolve_model
+from .models import resolve_model
 from .transcription.base import ProgressCallback, TranscriptResult
 from .transcription.factory import create_transcription_backend
+from .transcription.parakeet_backend import resolve_model_path
 
 log = logging.getLogger(__name__)
 
@@ -28,71 +29,111 @@ def _probe_audio_duration(audio_path: str) -> float:
 
 def transcribe_audio(
     audio_path: str,
-    model_name: str = DEFAULT_TRANSCRIPTION,
     language: Optional[str] = None,
+    diarize: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> TranscriptResult:
-    spec = resolve_model(model_name, "transcription")
-    backend = create_transcription_backend(spec.backend)
+    model_path = resolve_model_path()
+    if model_path is None:
+        raise FileNotFoundError(
+            "Bundled transcription model not found. Rebuild the app with "
+            "the required model resources."
+        )
+    backend = create_transcription_backend()
 
     if progress_callback:
-        progress_callback(0, f"loading {spec.name}")
+        progress_callback(0, "Preparing transcription...")
 
-    backend.load(spec.hf_repo)  # faster-whisper resolves by repo id
+    try:
+        backend.load(str(model_path))
+        audio_duration = _probe_audio_duration(audio_path)
 
-    audio_duration = _probe_audio_duration(audio_path)
+        # ETA tracking — rate-based with EMA smoothing.
+        # The first chunk includes MLX kernel warmup (~10s) and is NOT representative
+        # of steady-state speed. We skip it for rate computation, then use an
+        # exponential moving average of the per-chunk rate for stable estimates.
+        prev_time: Optional[float] = None
+        prev_pct: Optional[int] = None
+        smoothed_rate: Optional[float] = None  # % per second
+        alpha = 0.4  # EMA weight on newest sample
 
-    # ETA tracking — rate-based with EMA smoothing.
-    # The first chunk includes MLX kernel warmup (~10s) and is NOT representative
-    # of steady-state speed. We skip it for rate computation, then use an
-    # exponential moving average of the per-chunk rate for stable estimates.
-    prev_time: Optional[float] = None
-    prev_pct: Optional[int] = None
-    smoothed_rate: Optional[float] = None  # % per second
-    alpha = 0.4  # EMA weight on newest sample
+        # The frontend reserves 30% of the overall workflow for transcription,
+        # including the optional diarization pass, and the final 70% for note
+        # generation. Keeping this mapping here prevents the bar from jumping
+        # backwards when it changes phase.
+        transcription_end = 18 if diarize else 30
 
-    def _wrapped(pct: int, stage: str):
-        if not progress_callback:
-            return
-        if cancel_event and cancel_event.is_set():
-            raise InterruptedError("Transcription cancelled")
-        nonlocal prev_time, prev_pct, smoothed_rate
-        now = time.monotonic()
+        def _wrapped(pct: int, stage: str):
+            if not progress_callback:
+                return
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Transcription cancelled")
+            nonlocal prev_time, prev_pct, smoothed_rate
+            now = time.monotonic()
 
-        eta_seconds: Optional[float] = None
-        if prev_time is not None and pct > prev_pct:
-            dt = now - prev_time
-            dpct = pct - prev_pct
-            if dt > 0.1 and dpct > 0:
-                instant_rate = dpct / dt
-                if smoothed_rate is None:
-                    smoothed_rate = instant_rate
-                else:
-                    smoothed_rate = alpha * instant_rate + (1 - alpha) * smoothed_rate
-                if smoothed_rate > 0 and pct < 100:
-                    eta_seconds = (100 - pct) / smoothed_rate
-        prev_time = now
-        prev_pct = pct
+            eta_seconds: Optional[float] = None
+            if prev_time is not None and pct > prev_pct:
+                dt = now - prev_time
+                dpct = pct - prev_pct
+                if dt > 0.1 and dpct > 0:
+                    instant_rate = dpct / dt
+                    if smoothed_rate is None:
+                        smoothed_rate = instant_rate
+                    else:
+                        smoothed_rate = alpha * instant_rate + (1 - alpha) * smoothed_rate
+                    if smoothed_rate > 0 and pct < 100:
+                        eta_seconds = (100 - pct) / smoothed_rate
+            prev_time = now
+            prev_pct = pct
 
-        progress_callback(
-            pct,
-            stage,
-            eta_seconds=eta_seconds,
-            audio_duration=audio_duration,
+            progress_callback(
+                max(1, round((pct / 100) * transcription_end)),
+                "Transcribing...",
+                eta_seconds=eta_seconds,
+                audio_duration=audio_duration,
+            )
+
+        # Signal that transcription has started (small fill so bar isn't frozen
+        # during the first chunk — ETA not yet available).
+        if progress_callback:
+            progress_callback(1, "Transcribing...", eta_seconds=None, audio_duration=audio_duration)
+
+        result = backend.transcribe(
+            audio_path, language=language, progress_callback=_wrapped, cancel_event=cancel_event
         )
 
-    # Signal that transcription has started (small fill so bar isn't frozen
-    # during the first chunk — ETA not yet available).
-    if progress_callback:
-        progress_callback(1, "transcribing", eta_seconds=None, audio_duration=audio_duration)
+        # Session recordings are diarized locally after transcription. Clinician
+        # dictation can opt out because it is a single-speaker source.
+        if diarize and result.segments:
+            from .diarization import attach_speakers, diarize_audio, is_available, render_speaker_transcript
 
-    result = backend.transcribe(
-        audio_path, language=language, progress_callback=_wrapped, cancel_event=cancel_event
-    )
-    backend.cleanup()
+            if not is_available():
+                raise FileNotFoundError(
+                    "Speaker diarization model is not bundled. Rebuild the app with "
+                    "speaker-diarization-community-1 in src-tauri/resources/pyannote/."
+                )
 
-    return result
+            def _diarization_progress(pct: int, stage: str) -> None:
+                if progress_callback:
+                    progress_callback(
+                        transcription_end + round((pct / 100) * (30 - transcription_end)),
+                        stage,
+                        eta_seconds=None,
+                        audio_duration=audio_duration,
+                    )
+
+            turns = diarize_audio(
+                audio_path,
+                progress_callback=_diarization_progress if progress_callback else None,
+                cancel_event=cancel_event,
+            )
+            attach_speakers(result.segments, turns)
+            result.text = render_speaker_transcript(result.segments)
+
+        return result
+    finally:
+        backend.cleanup()
 
 
 def generate_note(
@@ -118,37 +159,38 @@ def generate_note(
     spec = resolve_model(llm_model, "llm")
 
     if progress_callback:
-        progress_callback(0, f"loading {spec.name}")
+        progress_callback(0, "Preparing note generation...")
 
-    llm.load(spec.hf_repo)
+    try:
+        llm.load(spec.hf_repo)
 
-    if progress_callback:
-        progress_callback(30, "generating")
+        if progress_callback:
+            progress_callback(30, "Generating note...")
 
-    if cancel_event and cancel_event.is_set():
-        raise InterruptedError("Note generation cancelled")
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Note generation cancelled")
 
-    if prompt:
-        system_prompt = prompt
-        user_prompt = f"Generate a {format_name} note from this therapy session transcript:\n\n{transcript}"
-        messages = [
-            ChatMessage(role="system", content=system_prompt),
-            ChatMessage(role="user", content=user_prompt),
-        ]
-    else:
-        fmt = get_format(format_name)
-        messages = fmt.build_messages(transcript)
+        if prompt:
+            messages = [
+                ChatMessage(role="system", content=prompt),
+                ChatMessage(
+                    role="user",
+                    content=f"Generate a {format_name} note from this therapy session transcript:\n\n{transcript}",
+                ),
+            ]
+        else:
+            messages = get_format(format_name).build_messages(transcript)
 
-    note = llm.generate(
-        messages=messages,
-        max_tokens=max_tokens,
-        thinking=thinking,
-        cancel_event=cancel_event,
-    )
+        note = llm.generate(
+            messages=messages,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            cancel_event=cancel_event,
+        )
 
-    llm.cleanup()
+        if progress_callback:
+            progress_callback(100, "Finalizing note...")
 
-    if progress_callback:
-        progress_callback(100, "done")
-
-    return note
+        return note
+    finally:
+        llm.cleanup()

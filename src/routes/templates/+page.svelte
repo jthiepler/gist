@@ -83,8 +83,8 @@
 
   async function removeFormat(fmt: NoteFormatTemplate) {
     if (
-      !(await confirm(`Delete note format "${fmt.name}"? This cannot be undone.`, {
-        title: "Delete note format",
+      !(await confirm(`Delete note type "${fmt.name}"? This cannot be undone.`, {
+        title: "Delete note type",
         kind: "warning",
       }))
     ) return;
@@ -98,8 +98,8 @@
 
   async function resetFormat(fmt: NoteFormatTemplate) {
     if (
-      !(await confirm(`Reset "${fmt.name}" to the included default? Your changes will be discarded.`, {
-        title: "Reset note format",
+      !(await confirm(`Reset "${fmt.name}" to the built-in default? Your changes will be discarded.`, {
+        title: "Reset note type",
         kind: "warning",
       }))
     ) return;
@@ -166,8 +166,8 @@ Output format:
 </script>
 
 <div class="workspace-header">
-  <h2>Note Formats</h2>
-  <div class="header-meta">Choose the documentation styles available when creating sessions.</div>
+  <h2>Note templates</h2>
+  <div class="header-meta">Choose which note types are available when creating sessions.</div>
 </div>
 
 {#if error}
@@ -179,14 +179,14 @@ Output format:
 {/if}
 
 {#if loading}
-  <p class="text-muted">Loading...</p>
+  <p class="text-muted">Loading note templates...</p>
 {:else}
   <div class="templates-list">
     {#each visibleFormats as fmt (fmt.id)}
       {#if editingId === fmt.id}
         <div class="template-card editing">
           <div class="template-edit-header">
-            <input bind:value={editName} placeholder="Format name" class="template-name-input" />
+            <input bind:value={editName} placeholder="Note type name" class="template-name-input" />
             <div class="template-edit-actions">
               <button class="btn btn-sm btn-primary" onclick={saveEdit} disabled={saving}>
                 {saving ? "Saving..." : "Save"}
@@ -194,12 +194,12 @@ Output format:
               <button class="btn btn-sm" onclick={cancelEdit} disabled={saving}>Cancel</button>
             </div>
           </div>
-          <label class="template-editor-label" for="edit-format-prompt">Advanced prompt</label>
+          <label class="template-editor-label" for="edit-format-prompt">Generation instructions</label>
           <textarea
             id="edit-format-prompt"
             bind:value={editPrompt}
             class="template-prompt-editor"
-            placeholder="Enter the prompt and output structure for this note format..."
+            placeholder="Enter the instructions and output structure for this note type..."
           ></textarea>
         </div>
       {:else}
@@ -209,14 +209,13 @@ Output format:
               <div class="template-name">
                 {fmt.name.toUpperCase()}
                 {#if fmt.is_builtin}
-                  <span class="badge badge-blue">Included</span>
+                <span class="badge badge-blue">Built-in</span>
                 {/if}
               </div>
-              <div class="template-summary">Available when generating documentation.</div>
             </div>
             <div class="template-actions">
               <button class="btn-ghost btn-sm" onclick={() => startEdit(fmt)}>Edit</button>
-              <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Turn Off</button>
+              <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Hide</button>
               {#if fmt.is_builtin}
                 <button class="btn-ghost btn-sm" onclick={() => resetFormat(fmt)}>Reset</button>
               {:else}
@@ -232,7 +231,7 @@ Output format:
 
   {#if hiddenFormats.length > 0}
     <div class="hidden-section">
-      <div class="hidden-section-label">Turned off</div>
+      <div class="hidden-section-label">Hidden note types</div>
       <div class="templates-list">
         {#each hiddenFormats as fmt (fmt.id)}
           <div class="template-card hidden">
@@ -241,14 +240,13 @@ Output format:
                 <div class="template-name">
                   {fmt.name.toUpperCase()}
                   {#if fmt.is_builtin}
-                    <span class="badge badge-blue">Included</span>
+                    <span class="badge badge-blue">Built-in</span>
                   {/if}
                 </div>
-                <div class="template-summary">Hidden from new session choices.</div>
               </div>
               <div class="template-actions">
                 <button class="btn-ghost btn-sm" onclick={() => startEdit(fmt)}>Edit</button>
-                <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Turn On</button>
+                <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Show</button>
                 {#if fmt.is_builtin}
                   <button class="btn-ghost btn-sm" onclick={() => resetFormat(fmt)}>Reset</button>
                 {:else}
@@ -268,7 +266,7 @@ Output format:
       <div class="template-edit-header">
         <input
           bind:value={newName}
-          placeholder="Format name (for example DAP or BIRP)"
+          placeholder="Note type name (for example DAP or BIRP)"
           class="template-name-input"
         />
         <div class="template-edit-actions">
@@ -284,7 +282,7 @@ Output format:
           </button>
         </div>
       </div>
-      <label class="template-editor-label" for="new-format-prompt">Advanced prompt</label>
+      <label class="template-editor-label" for="new-format-prompt">Generation instructions</label>
       <textarea
         id="new-format-prompt"
         bind:value={newPrompt}
@@ -294,7 +292,7 @@ Output format:
     </div>
   {:else}
     <button class="btn btn-primary add-format-btn" onclick={() => { showNew = true; newName = ""; newPrompt = ""; }}>
-      + New Format
+      New note type
     </button>
   {/if}
 {/if}

@@ -1,7 +1,7 @@
 """Limit CPU thread usage to keep macOS responsive during inference.
 
 Sets BLAS / scipy / numpy thread env vars to ~50% of available cores.
-Must be imported before any numerical library (numpy, scipy, mlx, ctranslate2).
+Must be imported before any numerical library (numpy, scipy, or mlx).
 Respects existing env vars if the user has already set them.
 """
 import os

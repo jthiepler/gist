@@ -30,17 +30,31 @@ export async function onProgress(callback: (data: SidecarProgress) => void): Pro
 
 export async function listModels(): Promise<ModelsResult> {
   const result = await rpcCall<ModelsResult & { type: string }>({ type: "list_models" });
-  return { llm: result.llm, transcription: result.transcription };
+  return { llm: result.llm };
+}
+
+export interface TranscriptionSegment {
+  start: number;
+  end: number;
+  text: string;
+  speaker: string | null;
+}
+
+export interface TranscriptionResult {
+  transcript: string;
+  language: string;
+  duration: number;
+  segments: TranscriptionSegment[];
 }
 
 export async function transcribe(
   audioFile: string,
-  model?: string,
-): Promise<{ transcript: string; language: string; duration: number; segments: unknown[] }> {
+  diarize = false,
+): Promise<TranscriptionResult> {
   return rpcCall({
     type: "transcribe",
     audio_file: audioFile,
-    model: model || undefined,
+    diarize,
   });
 }
 
@@ -61,12 +75,12 @@ export async function generateNote(
   });
 }
 
-export async function downloadModel(model: string, kind: string): Promise<void> {
-  await rpcCall({ type: "download_model", model, kind });
+export async function downloadModel(model: string): Promise<void> {
+  await rpcCall({ type: "download_model", model, kind: "llm" });
 }
 
-export async function deleteModel(model: string, kind: string): Promise<void> {
-  await rpcCall({ type: "delete_model", model, kind });
+export async function deleteModel(model: string): Promise<void> {
+  await rpcCall({ type: "delete_model", model, kind: "llm" });
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────

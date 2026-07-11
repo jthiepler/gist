@@ -144,13 +144,18 @@ impl Database {
 
         let _ = conn.execute("ALTER TABLE note_formats ADD COLUMN hidden INTEGER DEFAULT 0", []);
 
-        // Seed default formats if table is empty
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM note_formats", [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        if count == 0 {
-            let now = Local::now().to_rfc3339();
-            for (name, prompt) in DEFAULT_FORMATS {
+        // Seed only missing defaults. Existing built-ins may have been edited by
+        // the user and are reset explicitly through the templates UI.
+        let now = Local::now().to_rfc3339();
+        for (name, prompt) in default_formats() {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM note_formats WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if exists == 0 {
                 let id = Uuid::new_v4().to_string();
                 conn.execute(
                     "INSERT INTO note_formats (id, name, prompt, is_builtin, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
@@ -158,12 +163,6 @@ impl Database {
                 )
                 .map_err(|e| e.to_string())?;
             }
-        }
-        for (name, prompt) in DEFAULT_FORMATS {
-            let _ = conn.execute(
-                "UPDATE note_formats SET prompt = ?1 WHERE name = ?2 AND is_builtin = 1",
-                params![prompt, name],
-            );
         }
 
         Ok(Database { conn })
@@ -300,126 +299,57 @@ struct UpdateNoteFormat {
 
 // ── Default Format Prompts ────────────────────────────────────────────────
 
-const SOAP_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a SOAP note from labeled clinical source materials.
+#[derive(Debug, Deserialize)]
+struct DefaultFormatSection {
+    heading: String,
+    guidance: Vec<String>,
+}
 
-Rules:
-- Source materials may include a Session Transcript and/or Clinician Note.
-- Base client statements ONLY on the Session Transcript.
-- Use the Clinician Note only for therapist observations, interventions, corrections, clinical context, and plan details.
-- When information for a section is absent from the source materials, write "Insufficient information in source materials."
-- Do NOT fabricate or hallucinate diagnoses, symptoms, or history.
-- Use person-first language (e.g., "client with anxiety" not "anxious client").
-- Remove any identifying information (names, locations, dates) and replace with [deidentified].
-- If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
-- Use professional clinical terminology appropriate to the discipline.
-- Maintain client dignity and avoid judgmental language.
+#[derive(Debug, Deserialize)]
+struct DefaultFormat {
+    name: String,
+    description: String,
+    sections: Vec<DefaultFormatSection>,
+}
 
-Output format:
+#[derive(Debug, Deserialize)]
+struct DefaultFormatCatalog {
+    common_rules: Vec<String>,
+    formats: Vec<DefaultFormat>,
+}
 
-**Subjective:**
-- Chief complaint / reason for session (client's own words)
-- Symptoms reported (affect, mood, concerns)
-- Relevant client statements (paraphrased, quoted)
-
-**Objective:**
-- Therapist observations (appearance, behavior, affect, engagement)
-- Interventions used (CBT, MI, ACT, etc.)
-- Client response to interventions
-
-**Assessment:**
-- Clinical impressions (supported by transcript evidence)
-- Progress toward treatment goals
-- Risk assessment (if applicable)
-
-**Plan:**
-- Next session focus
-- Homework or between-session tasks
-- Referrals or coordination (if indicated)"#;
-
-const CBT_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate a CBT session note from labeled clinical source materials.
-
-Rules:
-- Source materials may include a Session Transcript and/or Clinician Note.
-- Base client statements ONLY on the Session Transcript.
-- Use the Clinician Note only for therapist observations, interventions, corrections, clinical context, and plan details.
-- When information for a section is absent, write "Insufficient information in source materials."
-- Do NOT fabricate or hallucinate diagnoses, symptoms, or history.
-- Remove any identifying information and replace with [deidentified].
-- If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
-
-Output format:
-
-**Session Overview:**
-- Session number / phase of treatment (if discernible)
-- Presenting concerns and session focus
-
-**Cognitive Conceptualization:**
-- Automatic thoughts identified
-- Cognitive distortions noted
-- Core beliefs / schemas addressed
-
-**Behavioral Interventions:**
-- Behavioral activation tasks
-- Exposure work (if applicable)
-- Homework review
-
-**Cognitive Interventions:**
-- Socratic dialogue / guided discovery
-- Cognitive restructuring
-- Behavioral experiments discussed
-
-**Progress and Plan:**
-- Progress toward goals
-- Homework assigned
-- Next session focus"#;
-
-const INTAKE_PROMPT: &str = r#"You are a clinical note-taking assistant for licensed therapists. Generate an intake assessment from labeled clinical source materials.
-
-Rules:
-- Source materials may include a Session Transcript and/or Clinician Note.
-- Base client statements ONLY on the Session Transcript.
-- Use the Clinician Note only for therapist observations, interventions, corrections, clinical context, and plan details.
-- When information for a section is absent from the source materials, write "Insufficient information in source materials."
-- Do NOT fabricate or hallucinate diagnoses, symptoms, history, or demographics.
-- Remove any identifying information and replace with [deidentified].
-- If the transcript mentions suicidal ideation, self-harm, or harm to others, include explicit risk assessment language.
-- This is an initial assessment; do not assume prior treatment relationship.
-
-Output format:
-
-**Presenting Problem:**
-- Reason for seeking treatment (client's description)
-- Onset, duration, and context of symptoms
-- Previous treatment history (if discussed)
-
-**Mental Status:**
-- Appearance and behavior
-- Mood and affect
-- Thought process and content
-- Cognitive functioning
-
-**Risk Assessment:**
-- Suicidal ideation (presence, plan, intent, means)
-- Self-harm behaviors
-- Risk to others
-- Protective factors
-
-**Clinical Impressions:**
-- Preliminary observations (supported by transcript)
-- Areas for further assessment
-- Differential considerations
-
-**Initial Plan:**
-- Recommended treatment approach
-- Frequency and duration
-- Immediate safety plan (if indicated)
-- Coordination of care (if indicated)"#;
-
-const DEFAULT_FORMATS: &[(&str, &str)] = &[
-    ("soap", SOAP_PROMPT),
-    ("cbt", CBT_PROMPT),
-    ("intake", INTAKE_PROMPT),
-];
+fn default_formats() -> Vec<(String, String)> {
+    let catalog: DefaultFormatCatalog = serde_json::from_str(include_str!("../../gist/formats/defaults.json"))
+        .expect("bundled clinical note format defaults must be valid JSON");
+    let DefaultFormatCatalog { common_rules, formats } = catalog;
+    formats
+        .into_iter()
+        .map(|format| {
+            let mut prompt = format!(
+                "{}. Generate a clinical note from the labeled source materials.\n\nRules:\n",
+                format.description
+            );
+            for rule in &common_rules {
+                prompt.push_str("- ");
+                prompt.push_str(rule);
+                prompt.push('\n');
+            }
+            prompt.push_str("\nOutput format:\n\n");
+            for section in format.sections {
+                prompt.push_str("**");
+                prompt.push_str(&section.heading);
+                prompt.push_str(":**\n");
+                for item in section.guidance {
+                    prompt.push_str("- ");
+                    prompt.push_str(&item);
+                    prompt.push('\n');
+                }
+                prompt.push('\n');
+            }
+            (format.name, prompt.trim_end().to_string())
+        })
+        .collect()
+}
 
 // ── Sidecar ───────────────────────────────────────────────────────────────
 
@@ -1161,7 +1091,10 @@ async fn reset_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result
     let name: String = db.conn
         .query_row("SELECT name FROM note_formats WHERE id = ?1", params![id], |row| row.get(0))
         .map_err(|e| e.to_string())?;
-    let default_prompt = DEFAULT_FORMATS.iter().find(|(n, _)| *n == name).map(|(_, p)| *p);
+    let default_prompt = default_formats()
+        .into_iter()
+        .find(|(default_name, _)| default_name == &name)
+        .map(|(_, prompt)| prompt);
     match default_prompt {
         Some(prompt) => {
             db.conn

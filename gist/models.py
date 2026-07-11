@@ -1,4 +1,4 @@
-"""Model catalog: supported LLM and transcription models."""
+"""Model catalog for note-generation models."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,40 +36,14 @@ LLM_MODELS: Dict[str, ModelSpec] = {
     ),
 }
 
-TRANSCRIPTION_MODELS: Dict[str, ModelSpec] = {
-    "parakeet-tdt-0.6b-v3": ModelSpec(
-        name="parakeet-tdt-0.6b-v3",
-        display="Parakeet TDT 0.6B v3",
-        backend="parakeet",
-        hf_repo="mlx-community/parakeet-tdt-0.6b-v3",
-        size_gb=2.3,
-        default=True,
-        description="Fast, accurate — Apple Silicon native",
-    ),
-    "whisper-base": ModelSpec(
-        name="whisper-base",
-        display="Whisper Base",
-        backend="whisper",
-        hf_repo="Systran/faster-whisper-base",
-        size_gb=0.15,
-        description="Fastest, lower accuracy",
-    ),
-    "whisper-large-v3": ModelSpec(
-        name="whisper-large-v3",
-        display="Whisper Large v3",
-        backend="whisper",
-        hf_repo="Systran/faster-whisper-large-v3",
-        size_gb=3.0,
-        description="Highest accuracy, slower",
-    ),
-}
-
 DEFAULT_LLM = "qwen-3.5-4b"
-DEFAULT_TRANSCRIPTION = "parakeet-tdt-0.6b-v3"
 
 
 def resolve_model(name: str, kind: str) -> ModelSpec:
-    catalog = LLM_MODELS if kind == "llm" else TRANSCRIPTION_MODELS
+    if kind == "llm":
+        catalog = LLM_MODELS
+    else:
+        raise ValueError(f"Unknown model kind '{kind}'. Expected 'llm'.")
     spec = catalog.get(name)
     if not spec:
         available = ", ".join(catalog.keys())

@@ -34,7 +34,7 @@ def _make_progress_tqdm(
             if total_size > 0:
                 done = base + self.n
                 pct = min(int(done / total_size * 100), 100)
-                progress_callback(pct, f"downloading {filename} ({file_idx}/{total_files})")
+                progress_callback(pct, f"Downloading model files ({file_idx}/{total_files})...")
             return result
 
     return _ProgressTqdm
@@ -82,7 +82,7 @@ def download_model(
             )
             accumulated += file_size
 
-        progress_callback(100, "download complete")
+        progress_callback(100, "Model download complete")
     else:
         snapshot_download(
             repo_id=spec.hf_repo,

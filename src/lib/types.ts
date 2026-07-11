@@ -58,7 +58,6 @@ export interface ModelInfo {
 
 export interface ModelsResult {
   llm: Record<string, ModelInfo>;
-  transcription: Record<string, ModelInfo>;
 }
 
 export interface NoteFormatTemplate {

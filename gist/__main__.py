@@ -16,12 +16,8 @@ from .config import DEFAULT_OPENAI_ENDPOINT
 from .formats.registry import list_formats
 from .models import (
     DEFAULT_LLM,
-    DEFAULT_TRANSCRIPTION,
     LLM_MODELS,
-    TRANSCRIPTION_MODELS,
-    resolve_model,
 )
-from .transcription.factory import create_transcription_backend
 
 log = logging.getLogger(__name__)
 
@@ -43,19 +39,13 @@ def cli(ctx, verbose):
 @cli.command()
 @click.argument("audio_file", type=click.Path(exists=True))
 @click.option("-o", "--output", type=click.Path(), help="Write transcript to file (default: stdout).")
-@click.option("--model", default=DEFAULT_TRANSCRIPTION, help=f"Transcription model (default: {DEFAULT_TRANSCRIPTION}). Use 'gist models' to list.")
 @click.option("--language", help="Force language code (e.g. en, de, fr). Default: auto-detect.")
-def transcribe(audio_file, output, model, language):
+def transcribe(audio_file, output, language):
     """Transcribe an audio file to text."""
-    spec = resolve_model(model, "transcription")
-    backend = create_transcription_backend(spec.backend)
-
-    click.echo(f"Loading {spec.display}...", err=True)
-    backend.load(spec.hf_repo)
+    from .pipeline import transcribe_audio
 
     click.echo("Transcribing...", err=True)
-    result = backend.transcribe(audio_file, language=language)
-    backend.cleanup()
+    result = transcribe_audio(audio_file, language=language)
 
     output_text = result.text
     if output:
@@ -73,7 +63,7 @@ def transcribe(audio_file, output, model, language):
 
 @cli.command()
 @click.option("-t", "--transcript", "transcript_file", type=click.Path(exists=True), help="Read transcript from file (default: read from stdin).")
-@click.option("-f", "--format", "format_name", default="soap", help="Note format: soap, cbt, intake (default: soap)")
+@click.option("-f", "--format", "format_name", default="soap", help="Note format name (default: soap). Use 'gist formats' to list available formats.")
 @click.option("-o", "--output", type=click.Path(), help="Write note to file (default: stdout).")
 @click.option("--model", default=DEFAULT_LLM, help=f"LLM model (default: {DEFAULT_LLM}). Use 'gist models' to list.")
 @click.option("--backend", type=click.Choice(["mlx", "openai"]), help="Override backend (mlx, openai). Default: auto-detected from model.")
@@ -127,27 +117,20 @@ def models():
 
 @models.command(name="list")
 def list_models():
-    """Show all available LLM and transcription models."""
+    """Show all available note-generation models."""
     click.echo("\nLLM models:")
     for name, spec in LLM_MODELS.items():
         default = " (default)" if spec.default else ""
         click.echo(f"  {name:<20} {spec.display:<20} {spec.backend:<8} ~{spec.size_gb:.1f} GB{default}")
 
-    click.echo("\nTranscription models:")
-    for name, spec in TRANSCRIPTION_MODELS.items():
-        default = " (default)" if spec.default else ""
-        click.echo(f"  {name:<20} {spec.display:<20} {spec.backend:<8} ~{spec.size_gb:.1f} GB{default}")
-
-
 @cli.command()
 @click.argument("model", required=False)
-@click.option("--kind", type=click.Choice(["llm", "transcription"]), help="Filter by model kind (default: download all defaults).")
+@click.option("--kind", type=click.Choice(["llm"]), help="Filter by model kind (default: download all LLM defaults).")
 def download(model, kind):
     """Download models from HuggingFace Hub.
 
-    If MODEL is specified, download that specific model.
-    If --kind is specified, download all models of that kind.
-    If neither is specified, download default LLM + transcription models.
+    If MODEL is specified, download that note-generation model.
+    If neither is specified, download the default note-generation model.
     """
     from .downloader import download_model
 
@@ -155,17 +138,13 @@ def download(model, kind):
         # Determine kind from model
         if model in LLM_MODELS:
             models_to_download = [(model, "llm")]
-        elif model in TRANSCRIPTION_MODELS:
-            models_to_download = [(model, "transcription")]
         else:
             click.echo(f"Unknown model: {model}", err=True)
             sys.exit(1)
     elif kind == "llm":
         models_to_download = [(name, "llm") for name in LLM_MODELS]
-    elif kind == "transcription":
-        models_to_download = [(name, "transcription") for name in TRANSCRIPTION_MODELS]
     else:
-        models_to_download = [(DEFAULT_LLM, "llm"), (DEFAULT_TRANSCRIPTION, "transcription")]
+        models_to_download = [(DEFAULT_LLM, "llm")]
 
     for name, kind in models_to_download:
         click.echo(f"Downloading {kind} model: {name}...")

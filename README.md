@@ -9,11 +9,19 @@ private, no cloud dependency.
 - **Tauri 2 + SvelteKit** shell (Rust backend, Svelte SPA frontend)
 - **Python sidecar** (`gist/`) for transcription + LLM inference, bundled via PyInstaller
 - **MLX** for native Apple Silicon LLM inference
-- **faster-whisper** for transcription
+- **Parakeet** via MLX for local transcription
 - JSON-RPC over stdin/stdout between Rust and Python
 - SQLite (owned by Tauri) for patients, sessions, and settings
 
 ## Build
+
+Before building, place the local model checkouts at the project root:
+
+- `parakeet-tdt-0.6b-v3-mlx-4bit/`
+- `speaker-diarization-community-1/`
+
+The macOS build script copies both into the application resources; neither
+checkout is committed to Git.
 
 ```bash
 # 1. Build Python sidecar

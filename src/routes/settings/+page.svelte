@@ -25,7 +25,6 @@
   let deleting = $state("");
   let thinking = $state(false);
   let selectedLlm = $state("");
-  let selectedTranscription = $state("");
   let error = $state("");
   let saved = $state(false);
   let showAdvanced = $state(false);
@@ -46,9 +45,6 @@
       if (models && Object.keys(models.llm).length > 0) {
         selectedLlm = Object.keys(models.llm)[0];
       }
-      if (models && Object.keys(models.transcription).length > 0) {
-        selectedTranscription = Object.keys(models.transcription)[0];
-      }
     } catch (e) {
       console.error("Failed to load models:", e);
       error = "Failed to load models.";
@@ -56,12 +52,11 @@
 
     const s = await loadSettings();
     if (s.defaultLlm) selectedLlm = s.defaultLlm;
-    if (s.defaultTranscription) selectedTranscription = s.defaultTranscription;
     thinking = s.thinking;
     darkMode.set(s.darkMode);
   });
 
-  async function handleDownload(model: string, kind: string) {
+  async function handleDownload(model: string) {
     if ($sidecarBusy) {
       error = "Another operation is in progress. Please wait or cancel it first.";
       return;
@@ -71,7 +66,7 @@
     progressStage.set("Downloading model...");
     activeOperation.set({ type: "download_model", label: "Downloading model..." });
     try {
-      await downloadModel(model, kind);
+      await downloadModel(model);
       await refreshModels();
       saved = true;
       setTimeout(() => (saved = false), 3000);
@@ -89,20 +84,17 @@
     }
   }
 
-  async function handleDelete(model: string, kind: string) {
+  async function handleDelete(model: string) {
     if ($sidecarBusy) {
       error = "Another operation is in progress. Please wait or cancel it first.";
       return;
     }
     deleting = model;
     try {
-      await deleteModel(model, kind);
+      await deleteModel(model);
       await refreshModels();
       if (selectedLlm === model && models && Object.keys(models.llm).length > 0) {
         selectedLlm = Object.keys(models.llm)[0];
-      }
-      if (selectedTranscription === model && models && Object.keys(models.transcription).length > 0) {
-        selectedTranscription = Object.keys(models.transcription)[0];
       }
     } catch (e) {
       const msg = String(e);
@@ -115,16 +107,14 @@
     }
   }
 
-  function selectModel(name: string, kind: "llm" | "transcription") {
-    if (kind === "llm") selectedLlm = name;
-    else selectedTranscription = name;
+  function selectModel(name: string) {
+    selectedLlm = name;
   }
 
   async function savePreferences() {
     try {
       await saveSettings({
         defaultLlm: selectedLlm,
-        defaultTranscription: selectedTranscription,
         thinking,
         darkMode: $darkMode,
       });
@@ -149,7 +139,7 @@
 
 <div class="workspace-header">
   <h2>Settings</h2>
-  <div class="header-meta">Manage local AI, appearance, and advanced engine controls.</div>
+  <div class="header-meta">Manage AI models, appearance, and advanced settings.</div>
 </div>
 
 {#if error}
@@ -161,12 +151,12 @@
 {/if}
 
 <div class="settings-section">
-  <h3>Local AI</h3>
-  <p class="text-muted settings-help">Downloaded models can be selected as defaults for new notes and transcripts.</p>
+  <h3>AI models</h3>
+  <p class="text-muted settings-help">Manage the local model used to write notes.</p>
 
   {#if models}
     <div class="model-group">
-      <div class="model-group-title">Note generation model</div>
+      <div class="model-group-title">Note-writing model</div>
       <table class="model-table">
         <thead>
           <tr>
@@ -181,7 +171,7 @@
             <tr
               class="model-row {info.downloaded ? 'model-available' : 'model-not-downloaded'}"
               class:model-selected={selectedLlm === name}
-              onclick={() => info.downloaded && selectModel(name, "llm")}
+              onclick={() => info.downloaded && selectModel(name)}
             >
               <td>{info.display}</td>
               <td class="model-desc">{info.description}</td>
@@ -193,7 +183,7 @@
                   {:else}
                     <button
                       class="btn btn-sm btn-danger"
-                      onclick={(e) => { e.stopPropagation(); handleDelete(name, "llm"); }}
+                      onclick={(e) => { e.stopPropagation(); handleDelete(name); }}
                       disabled={deleting === name}
                     >
                       {deleting === name ? "..." : "Delete"}
@@ -202,7 +192,7 @@
                 {:else}
                   <button
                     class="btn btn-sm btn-primary"
-                    onclick={(e) => { e.stopPropagation(); handleDownload(name, "llm"); }}
+                    onclick={(e) => { e.stopPropagation(); handleDownload(name); }}
                     disabled={downloading === name}
                   >
                     {downloading === name ? "..." : "Download"}
@@ -215,55 +205,6 @@
       </table>
     </div>
 
-    <div class="model-group">
-      <div class="model-group-title">Transcription model</div>
-      <table class="model-table">
-        <thead>
-          <tr>
-            <th style="width: 30%;">Name</th>
-            <th>Description</th>
-            <th style="width: 70px;">Size</th>
-            <th style="width: 110px;"></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each Object.entries(models.transcription) as [name, info]}
-            <tr
-              class="model-row {info.downloaded ? 'model-available' : 'model-not-downloaded'}"
-              class:model-selected={selectedTranscription === name}
-              onclick={() => info.downloaded && selectModel(name, "transcription")}
-            >
-              <td>{info.display}</td>
-              <td class="model-desc">{info.description}</td>
-              <td>{info.size_gb} GB</td>
-              <td>
-                {#if info.downloaded}
-                  {#if selectedTranscription === name}
-                    <span class="model-selected-marker">Selected</span>
-                  {:else}
-                    <button
-                      class="btn btn-sm btn-danger"
-                      onclick={(e) => { e.stopPropagation(); handleDelete(name, "transcription"); }}
-                      disabled={deleting === name}
-                    >
-                      {deleting === name ? "..." : "Delete"}
-                    </button>
-                  {/if}
-                {:else}
-                  <button
-                    class="btn btn-sm btn-primary"
-                    onclick={(e) => { e.stopPropagation(); handleDownload(name, "transcription"); }}
-                    disabled={downloading === name}
-                  >
-                    {downloading === name ? "..." : "Download"}
-                  </button>
-                {/if}
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
   {:else}
     <p class="text-muted">Loading models...</p>
   {/if}
@@ -273,8 +214,8 @@
   <h3>Preferences</h3>
   <div class="settings-row">
     <div>
-      <div class="setting-label">More thorough note generation</div>
-      <div class="setting-desc">Allows the local model to spend more time reasoning before writing documentation.</div>
+      <div class="setting-label">More detailed reasoning</div>
+      <div class="setting-desc">Allows the local model to spend more time reasoning before writing notes.</div>
     </div>
     <button
       type="button"
@@ -282,7 +223,7 @@
       class:active={thinking}
       role="switch"
       aria-checked={thinking}
-      aria-label="More thorough note generation"
+      aria-label="More detailed reasoning"
       onclick={() => (thinking = !thinking)}
     >
       <div class="toggle-knob"></div>
@@ -330,7 +271,7 @@
       <div class="debug-content">
         <div class="debug-row">
           <span class="status-dot" class:running={$sidecarRunning} class:stopped={!$sidecarRunning}></span>
-          <span>Processing engine: {$sidecarRunning ? "Running" : "Stopped"}</span>
+          <span>Local processing: {$sidecarRunning ? "Running" : "Stopped"}</span>
           <button class="btn btn-sm" onclick={handleRestart} style="margin-left: auto;">Restart</button>
         </div>
       </div>

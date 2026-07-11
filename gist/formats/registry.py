@@ -1,33 +1,34 @@
-"""Format registry."""
+"""Format registry backed by the shared shipped-template resource."""
 from __future__ import annotations
 
-from typing import Dict, Type
+from typing import Dict
 
 from .base import ClinicalFormat
+from .defaults import load_templates
+from .template import TemplateFormat
 
-_registry: Dict[str, Type[ClinicalFormat]] = {}
+_registry: Dict[str, TemplateFormat] = {
+    name: TemplateFormat(name, template["description"], template["prompt"])
+    for name, template in load_templates().items()
+}
+_ALIASES = {"darp": "dart"}
 
 
-def register(cls: Type[ClinicalFormat]):
-    _registry[cls.name] = cls
+def register(template: TemplateFormat) -> None:
+    _registry[template.name] = template
 
 
 def get_format(name: str) -> ClinicalFormat:
-    cls = _registry.get(name)
-    if not cls:
+    canonical_name = _ALIASES.get(name.lower(), name.lower())
+    template = _registry.get(canonical_name)
+    if not template:
         available = ", ".join(_registry.keys())
         raise KeyError(f"Unknown format '{name}'. Available: {available}")
-    return cls()
+    return template
 
 
 def list_formats() -> list[dict[str, str]]:
-    return [{"name": name, "description": cls.description} for name, cls in _registry.items()]
-
-
-from .cbt import CBTFormat
-from .intake import IntakeFormat
-from .soap import SOAPFormat
-
-register(SOAPFormat)
-register(CBTFormat)
-register(IntakeFormat)
+    return [
+        {"name": name, "description": template.description}
+        for name, template in _registry.items()
+    ]

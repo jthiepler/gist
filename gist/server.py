@@ -9,12 +9,10 @@ import threading
 from typing import Any, Dict, Optional
 
 from .downloader import download_model, is_model_downloaded, delete_model
-from .formats.registry import get_format, list_formats
+from .formats.registry import list_formats
 from .models import (
     DEFAULT_LLM,
-    DEFAULT_TRANSCRIPTION,
     LLM_MODELS,
-    TRANSCRIPTION_MODELS,
 )
 from .pipeline import generate_note, transcribe_audio
 
@@ -72,8 +70,8 @@ def _stdin_reader():
 
 def _handle_transcribe(params: Dict[str, Any]):
     audio_file = params.get("audio_file", "")
-    model = params.get("model", DEFAULT_TRANSCRIPTION)
     language = params.get("language")
+    diarize = params.get("diarize", False)
 
     duration_sent = False
 
@@ -87,8 +85,8 @@ def _handle_transcribe(params: Dict[str, Any]):
     try:
         result = transcribe_audio(
             audio_file,
-            model_name=model,
             language=language,
+            diarize=diarize,
             progress_callback=progress,
             cancel_event=_cancel_event,
         )
@@ -96,7 +94,7 @@ def _handle_transcribe(params: Dict[str, Any]):
             "type": "result",
             "transcript": result.text,
             "segments": [
-                {"start": s.start, "end": s.end, "text": s.text}
+                {"start": s.start, "end": s.end, "text": s.text, "speaker": s.speaker}
                 for s in result.segments
             ],
             "duration": result.duration,
@@ -149,7 +147,7 @@ def _handle_download_model(params: Dict[str, Any]):
         _send_progress(pct, stage)
 
     try:
-        _send_progress(0, f"starting download of {model_name}")
+        _send_progress(0, "Preparing model download...")
         download_model(model_name, kind=kind, progress_callback=progress, cancel_event=_cancel_event)
         _send({"type": "result", "ok": True, "model": model_name})
     except InterruptedError:
@@ -205,17 +203,7 @@ def run_server():
                 }
                 for name, spec in LLM_MODELS.items()
             }
-            tr_info = {
-                name: {
-                    "display": spec.display,
-                    "backend": spec.backend,
-                    "size_gb": spec.size_gb,
-                    "description": spec.description,
-                    "downloaded": is_model_downloaded(name, "transcription"),
-                }
-                for name, spec in TRANSCRIPTION_MODELS.items()
-            }
-            _send({"type": "result", "llm": llm_info, "transcription": tr_info})
+            _send({"type": "result", "llm": llm_info})
         elif msg_type == "list_formats":
             _send({"type": "result", "formats": list_formats()})
         elif msg_type == "transcribe":
