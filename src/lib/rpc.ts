@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { SidecarProgress, ModelsResult, NoteFormatTemplate, Session, SessionInput, SessionNote } from "./types";
+import type { SidecarProgress, ModelsResult, NoteFormatTemplate, RecordingJob, Session, SessionInput, SessionNote } from "./types";
 
 export async function startSidecar(): Promise<string> {
   return invoke<string>("start_sidecar");
@@ -143,8 +143,14 @@ export async function deleteSessionInput(id: string): Promise<void> {
 export async function updateSession(data: {
   id: string;
   date: string;
-}): Promise<void> {
-  return invoke<void>("update_session", { data });
+  start_time?: string | null;
+  title?: string | null;
+  session_type?: string | null;
+}): Promise<Session> {
+  await invoke<void>("update_session", { data });
+  const session = await getSession(data.id);
+  if (!session) throw new Error("Session not found after update");
+  return session;
 }
 
 export async function getSession(id: string): Promise<Session | null> {
@@ -188,11 +194,14 @@ export interface RecordingStateInfo {
   elapsed_seconds: number;
   has_recording: boolean;
   file_path: string | null;
+  job_id: string | null;
 }
 
 export interface StopRecordingResult {
+  job_id: string;
   file_path: string;
   duration_seconds: number;
+  is_short_recording: boolean;
 }
 
 export interface RecordingTickPayload {
@@ -201,17 +210,38 @@ export interface RecordingTickPayload {
   is_paused: boolean;
 }
 
+export interface RecordingErrorPayload {
+  message: string;
+}
+
 export interface RecordingStoppedPayload {
+  job_id: string;
   file_path: string;
   duration_seconds: number;
+  is_short_recording: boolean;
 }
 
 export async function listAudioDevices(): Promise<AudioDevice[]> {
   return invoke<AudioDevice[]>("list_audio_devices");
 }
 
-export async function startRecording(micDevice?: string, systemDevice?: string): Promise<void> {
-  await invoke<void>("start_recording", {
+export interface StartRecordingData {
+  session_id: string;
+  input_kind: string;
+  formats: string[];
+  llm_model: string;
+  thinking: boolean;
+  diarize: boolean;
+  created_session: boolean;
+}
+
+export async function startRecording(
+  data: StartRecordingData,
+  micDevice?: string,
+  systemDevice?: string,
+): Promise<RecordingJob> {
+  return invoke<RecordingJob>("start_recording", {
+    data,
     micDevice: micDevice || null,
     systemDevice: systemDevice || null,
   });
@@ -237,10 +267,34 @@ export async function getRecordingState(): Promise<RecordingStateInfo> {
   return invoke<RecordingStateInfo>("get_recording_state");
 }
 
+export async function listRecoverableRecordingJobs(): Promise<RecordingJob[]> {
+  return invoke<RecordingJob[]>("list_recoverable_recording_jobs");
+}
+
+export async function getRecordingJob(id: string): Promise<RecordingJob> {
+  return invoke<RecordingJob>("get_recording_job", { id });
+}
+
+export async function completeRecordingJob(id: string): Promise<void> {
+  await invoke("complete_recording_job", { id });
+}
+
+export async function setRecordingJobError(id: string, error: string): Promise<void> {
+  await invoke("set_recording_job_error", { id, error });
+}
+
+export async function discardRecordingJob(id: string): Promise<void> {
+  await invoke("discard_recording_job", { id });
+}
+
 export async function onRecordingTick(callback: (data: RecordingTickPayload) => void): Promise<UnlistenFn> {
   return listen<RecordingTickPayload>("recording-tick", (event) => callback(event.payload));
 }
 
 export async function onRecordingStopped(callback: (data: RecordingStoppedPayload) => void): Promise<UnlistenFn> {
   return listen<RecordingStoppedPayload>("recording-stopped", (event) => callback(event.payload));
+}
+
+export async function onRecordingError(callback: (data: RecordingErrorPayload) => void): Promise<UnlistenFn> {
+  return listen<RecordingErrorPayload>("recording-error", (event) => callback(event.payload));
 }

@@ -47,29 +47,62 @@ impl CoreAudioTapHandle {
         }
         batch
     }
+
+    pub fn error(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            if self._ctx.should_terminate.load(Ordering::Acquire) {
+                return Some("Computer-audio capture fell behind and was stopped to avoid an incomplete recording.".into());
+            }
+        }
+        None
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        #[cfg(target_os = "macos")]
+        {
+            return self._ctx.current_sample_rate.load(Ordering::Acquire);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            48_000
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl CoreAudioTapHandle {
-    pub fn create() -> Result<Self> {
-        eprintln!("CoreAudio: Starting system audio capture initialization...");
+    pub fn create(selected_device_name: Option<&str>) -> Result<Self> {
+        let output_device = match selected_device_name {
+            Some(name) => ca::System::devices()?
+                .into_iter()
+                .find(|device| {
+                    device
+                        .name()
+                        .map(|device_name| device_name.to_string() == name)
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Selected computer-audio device is no longer available")
+                })?,
+            None => ca::System::default_output_device()
+                .map_err(|e| anyhow::anyhow!("Failed to get default output device: {:?}", e))?,
+        };
 
-        let output_device = ca::System::default_output_device()
-            .map_err(|e| anyhow::anyhow!("Failed to get default output device: {:?}", e))?;
-
-        let output_uid = output_device.uid()
+        let output_uid = output_device
+            .uid()
             .map_err(|e| anyhow::anyhow!("Failed to get device UID: {:?}", e))?;
 
-        let device_name = output_device.name().unwrap_or_else(|_| cf::String::from_str("Unknown"));
-        eprintln!("CoreAudio: Default output device: '{}'", device_name);
-
         let tap_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&ns::Array::new());
-        let tap = tap_desc.create_process_tap()
+        let tap = tap_desc
+            .create_process_tap()
             .map_err(|e| anyhow::anyhow!("Failed to create process tap: {:?}", e))?;
 
         let tap_asbd = tap.asbd();
-        let tap_sample_rate = tap_asbd.as_ref().map(|a| a.sample_rate as u32).unwrap_or(48000);
-        eprintln!("CoreAudio: Tap sample rate: {} Hz", tap_sample_rate);
+        let tap_sample_rate = tap_asbd
+            .as_ref()
+            .map(|a| a.sample_rate as u32)
+            .unwrap_or(48000);
 
         let sub_tap = cf::DictionaryOf::with_keys_values(
             &[ca::sub_device_keys::uid()],
@@ -97,7 +130,8 @@ impl CoreAudioTapHandle {
             ],
         );
 
-        let asbd = tap.asbd()
+        let asbd = tap
+            .asbd()
             .map_err(|e| anyhow::anyhow!("Failed to get tap ASBD: {:?}", e))?;
         let format = av::AudioFormat::with_asbd(&asbd)
             .ok_or_else(|| anyhow::anyhow!("Failed to create audio format"))?;
@@ -125,13 +159,12 @@ impl CoreAudioTapHandle {
         let agg_device = ca::AggregateDevice::with_desc(&agg_desc)
             .map_err(|e| anyhow::anyhow!("Failed to create aggregate device: {:?}", e))?;
 
-        let proc_id = agg_device.create_io_proc_id(audio_proc, Some(&mut ctx))
+        let proc_id = agg_device
+            .create_io_proc_id(audio_proc, Some(&mut ctx))
             .map_err(|e| anyhow::anyhow!("Failed to create IO proc: {:?}", e))?;
 
         let started_device = ca::device_start(agg_device, Some(proc_id))
             .map_err(|e| anyhow::anyhow!("Failed to start device: {:?}", e))?;
-
-        eprintln!("CoreAudio: System audio capture started successfully");
 
         Ok(CoreAudioTapHandle {
             consumer,
@@ -175,9 +208,8 @@ extern "C" fn audio_proc(
         let float_count = byte_count / std::mem::size_of::<f32>();
 
         if float_count > 0 && first_buffer.data != std::ptr::null_mut() {
-            let data = unsafe {
-                std::slice::from_raw_parts(first_buffer.data as *const f32, float_count)
-            };
+            let data =
+                unsafe { std::slice::from_raw_parts(first_buffer.data as *const f32, float_count) };
             push_samples(ctx, data);
         }
     }
@@ -218,7 +250,7 @@ fn push_samples(ctx: &mut AudioContext, data: &[f32]) {
 
 #[cfg(not(target_os = "macos"))]
 impl CoreAudioTapHandle {
-    pub fn create() -> Result<Self> {
+    pub fn create(_selected_device_name: Option<&str>) -> Result<Self> {
         anyhow::bail!("System audio capture is only supported on macOS");
     }
 }
@@ -227,6 +259,5 @@ impl CoreAudioTapHandle {
 impl Drop for CoreAudioTapHandle {
     fn drop(&mut self) {
         self._ctx.should_terminate.store(true, Ordering::Release);
-        eprintln!("CoreAudio: Tap handle dropped");
     }
 }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { confirm } from "@tauri-apps/plugin-dialog";
-  import { tick, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { page } from "$app/stores";
   import { goto } from "$app/navigation";
   import {
@@ -9,15 +9,17 @@
     currentOperation,
     isRecording,
     patients,
-    pendingSession,
     recordingContext,
     sessionUpdate,
     sidecarBusy,
+    progressBase,
+    progressPercent,
+    progressScale,
+    progressStage,
   } from "$lib/stores";
   import { getPatientFormats } from "$lib/rpc";
   import { hasNoteSourceMaterial } from "$lib/sessionInputs";
   import { generateSessionDocumentation } from "$lib/documentation";
-  import { progressBase, progressPercent, progressScale, progressStage } from "$lib/stores";
   import { loadSettings } from "$lib/settings";
   import type { Patient, Session } from "$lib/types";
   import SessionCard from "$lib/components/SessionCard.svelte";
@@ -34,6 +36,14 @@
   let savingName = $state(false);
   let showPatientMenu = $state(false);
   let recordingNewSession = $state(false);
+
+  onMount(() => {
+    const dismissMenu = (event: PointerEvent) => {
+      if (!(event.target as Element).closest(".patient-menu")) showPatientMenu = false;
+    };
+    document.addEventListener("pointerdown", dismissMenu);
+    return () => document.removeEventListener("pointerdown", dismissMenu);
+  });
 
   const patientId = $derived($page.params.id ?? "");
 
@@ -52,10 +62,16 @@
       try {
         const result = await invoke<Session[]>("list_sessions", { patientId: id });
         if (stale) return;
-        sessions = result;
+        const liveSessions = untrack(() => sessions);
+        const fetchedIds = new Set(result.map((session) => session.id));
+        const liveById = new Map(liveSessions.map((session) => [session.id, session]));
+        sessions = sortSessions([
+          ...result.map((session) => liveById.get(session.id) ?? session),
+          ...liveSessions.filter((session) => !fetchedIds.has(session.id)),
+        ]);
       } catch (e) {
         if (stale) return;
-        error = String(e);
+        error = "Gist could not safely load this patient's sessions. Nothing has been changed. Try again after reopening Gist; if this continues, restore the Gist data folder from a backup before editing or deleting anything.";
       } finally {
         if (!stale) loading = false;
       }
@@ -80,16 +96,20 @@
     }
   });
 
-  // Upsert a session into the list without triggering reactive loops
-  function upsertSession(s: Session) {
-    const exists = untrack(() => sessions.some((x) => x.id === s.id));
-    if (exists) {
-      sessions = untrack(() =>
-        sessions.map((x) => (x.id === s.id ? s : x)),
-      );
-    } else {
-      sessions = untrack(() => [s, ...sessions]);
-    }
+  function sortSessions(items: Session[]) {
+    return [...items].sort((a, b) => {
+      const aKey = `${a.date.slice(0, 10)}T${a.start_time ?? ""}`;
+      const bKey = `${b.date.slice(0, 10)}T${b.start_time ?? ""}`;
+      return bKey.localeCompare(aKey) || b.created_at.localeCompare(a.created_at);
+    });
+  }
+
+  // Upsert without subscribing the surrounding effect to the session array.
+  function upsertSession(nextSession: Session) {
+    sessions = untrack(() => sortSessions([
+      nextSession,
+      ...sessions.filter((session) => session.id !== nextSession.id),
+    ]));
   }
 
   // Live-update: fires at each step of processing (source material saved, each note)
@@ -97,16 +117,6 @@
     const s = $sessionUpdate;
     if (s && s.patient_id === patientId) {
       upsertSession(s);
-    }
-  });
-
-  // Watch for sessions processed by the layout (from recording-stopped)
-  $effect(() => {
-    const s = $pendingSession;
-    if (s && s.patient_id === patientId) {
-      upsertSession(s);
-      pendingSession.set(null);
-      showNewSession = false;
     }
   });
 
@@ -119,6 +129,24 @@
         })
       : null
   );
+
+  let sessionGroups = $derived.by(() => {
+    const groups = new Map<string, Session[]>();
+    for (const session of sessions) {
+      const key = session.date.slice(0, 10);
+      groups.set(key, [...(groups.get(key) ?? []), session]);
+    }
+    return [...groups.entries()].map(([date, items]) => ({
+      date,
+      label: new Date(`${date}T12:00:00`).toLocaleDateString([], {
+        weekday: "short",
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      }),
+      sessions: items,
+    }));
+  });
 
   async function deleteSession(session: Session) {
     const formattedDate = new Date(session.date).toLocaleDateString("en-US", {
@@ -297,26 +325,31 @@
         </div>
       {/if}
       {#if !editingName}
-        <div class="patient-menu">
-          <button
-            class="icon-btn patient-menu-trigger"
-            onclick={() => showPatientMenu = !showPatientMenu}
-            title="Patient actions"
-            aria-label="Patient actions"
-            aria-expanded={showPatientMenu}
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="1"/>
-              <circle cx="19" cy="12" r="1"/>
-              <circle cx="5" cy="12" r="1"/>
-            </svg>
-          </button>
-          {#if showPatientMenu}
-            <div class="patient-menu-popover">
-          <button class="patient-menu-item" onclick={startEditName}>Edit patient name</button>
-              <button class="patient-menu-item danger" onclick={deletePatient}>Delete patient</button>
-            </div>
+        <div class="patient-header-actions">
+          {#if !showNewSession}
+            <button class="btn btn-primary" onclick={() => showNewSession = true}>New session</button>
           {/if}
+          <div class="patient-menu">
+            <button
+              class="icon-btn patient-menu-trigger"
+              onclick={() => showPatientMenu = !showPatientMenu}
+              title="Patient actions"
+              aria-label="Patient actions"
+              aria-expanded={showPatientMenu}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="1"/>
+                <circle cx="19" cy="12" r="1"/>
+                <circle cx="5" cy="12" r="1"/>
+              </svg>
+            </button>
+            {#if showPatientMenu}
+              <div class="patient-menu-popover">
+                <button class="patient-menu-item" onclick={startEditName}>Edit patient name</button>
+                <button class="patient-menu-item danger" onclick={deletePatient}>Delete patient</button>
+              </div>
+            {/if}
+          </div>
         </div>
       {/if}
     </div>
@@ -330,22 +363,18 @@
   </div>
 
   {#if error}
-    <div class="error-banner">{error}</div>
+    <div class="error-banner" role="alert">
+      <span>{error}</span>
+      <button class="btn btn-sm" onclick={() => window.location.reload()}>Reload</button>
+    </div>
   {/if}
-
-  <div class="workspace-toolbar">
-    {#if !showNewSession}
-        <button class="btn btn-primary" onclick={() => showNewSession = true}>
-        New session
-      </button>
-    {/if}
-  </div>
 
   {#if showNewSession}
     <NewSessionPanel
       {patientId}
       onComplete={onNewSessionComplete}
       onProcessingStart={onNewSessionProcessingStart}
+      onSessionUpdate={upsertSession}
       onCancel={() => showNewSession = false}
     />
   {/if}
@@ -357,15 +386,22 @@
     </div>
   {:else}
     <div class="session-list">
-      {#each sessions as session, index (session.id)}
-        <SessionCard
-          {session}
-          initiallyExpanded={index === 0}
-          isGenerating={generatingNoteFor === session.id}
-          onGenerateNote={generateNoteForSession}
-          onDelete={deleteSession}
-          onChange={updateSessionInList}
-        />
+      {#each sessionGroups as group, groupIndex (group.date)}
+        <section class="session-group" aria-labelledby={`session-group-${group.date}`}>
+          <h3 id={`session-group-${group.date}`} class="session-group-heading">{group.label}</h3>
+          <div class="session-group-items">
+            {#each group.sessions as session, sessionIndex (session.id)}
+              <SessionCard
+                {session}
+                initiallyExpanded={groupIndex === 0 && sessionIndex === 0}
+                isGenerating={generatingNoteFor === session.id}
+                onGenerateNote={generateNoteForSession}
+                onDelete={deleteSession}
+                onChange={updateSessionInList}
+              />
+            {/each}
+          </div>
+        </section>
       {/each}
     </div>
   {/if}

@@ -22,9 +22,32 @@ log = logging.getLogger(__name__)
 _cancel_event = threading.Event()
 # Request queue — stdin reader thread puts messages here, main thread processes
 _request_queue: "queue.Queue[Optional[dict]]" = queue.Queue()
+_active_request_id: Optional[str] = None
+
+
+def _user_facing_error(operation: str, error: Exception) -> str:
+    """Return helpful, non-technical errors while preserving diagnostics in logs."""
+    detail = str(error).lower()
+    if isinstance(error, PermissionError) or "permission denied" in detail:
+        return "Gist cannot access this file or model. Check its permissions, then try again."
+    if any(term in detail for term in ("no space", "disk full", "not enough space", "errno 28")):
+        return "Your Mac is out of storage. Free some space, then try again."
+    if any(term in detail for term in ("network", "connection", "timeout", "timed out", "http", "download")):
+        return "Gist could not reach the model download service. Check your internet connection and try again."
+    if any(term in detail for term in ("model", "mlx", "huggingface", "weights", "tokenizer")):
+        return "The selected model could not be prepared. Check that it is fully downloaded, then try again."
+    if operation == "transcription":
+        return "Gist could not transcribe this audio. Confirm the recording can be played, then try again."
+    if operation == "note_generation":
+        return "Gist could not generate this note. Try again, or choose a different downloaded model."
+    if operation == "model_download":
+        return "Gist could not download this model. Check your internet connection and available storage, then try again."
+    return "Gist could not complete that request. Please try again."
 
 
 def _send(obj: Dict[str, Any]):
+    if _active_request_id and obj.get("type") in {"progress", "result", "error", "pong"}:
+        obj = {**obj, "request_id": _active_request_id}
     line = json.dumps(obj, ensure_ascii=False)
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
@@ -104,7 +127,7 @@ def _handle_transcribe(params: Dict[str, Any]):
         _send({"type": "error", "message": "Transcription cancelled"})
     except Exception as e:
         log.exception("Transcription failed")
-        _send({"type": "error", "message": str(e)})
+        _send({"type": "error", "message": _user_facing_error("transcription", e)})
 
 
 def _handle_generate_note(params: Dict[str, Any]):
@@ -136,7 +159,7 @@ def _handle_generate_note(params: Dict[str, Any]):
         _send({"type": "error", "message": "Note generation cancelled"})
     except Exception as e:
         log.exception("Note generation failed")
-        _send({"type": "error", "message": str(e)})
+        _send({"type": "error", "message": _user_facing_error("note_generation", e)})
 
 
 def _handle_download_model(params: Dict[str, Any]):
@@ -154,7 +177,7 @@ def _handle_download_model(params: Dict[str, Any]):
         _send({"type": "error", "message": "Download cancelled"})
     except Exception as e:
         log.exception("Download failed")
-        _send({"type": "error", "message": str(e)})
+        _send({"type": "error", "message": _user_facing_error("model_download", e)})
 
 
 def _handle_delete_model(params: Dict[str, Any]):
@@ -166,11 +189,17 @@ def _handle_delete_model(params: Dict[str, Any]):
         _send({"type": "result", "ok": True, "model": model_name})
     except Exception as e:
         log.exception("Delete failed")
-        _send({"type": "error", "message": str(e)})
+        _send({"type": "error", "message": _user_facing_error("model_download", e)})
 
 
 def run_server():
-    log.info("JSON-RPC server started (stdin/stdout)")
+    global _active_request_id
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log.info("JSON-RPC server started")
 
     reader = threading.Thread(target=_stdin_reader, daemon=True)
     reader.start()
@@ -183,6 +212,7 @@ def run_server():
 
         msg_type = msg.get("type", "")
         params = msg.get("params", msg)
+        _active_request_id = msg.get("request_id")
 
         # Clear cancel event before each operation
         _cancel_event.clear()
@@ -216,5 +246,7 @@ def run_server():
             _handle_delete_model(params)
         else:
             _send({"type": "error", "message": f"Unknown message type: {msg_type}"})
+
+        _active_request_id = None
 
     log.info("JSON-RPC server exiting (stdin closed)")

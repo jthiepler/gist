@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { ask, confirm } from "@tauri-apps/plugin-dialog";
-  import { marked } from "marked";
+  import { renderSafeMarkdown } from "$lib/markdown";
   import MarkdownToolbar from "$lib/components/MarkdownToolbar.svelte";
   import {
     createSessionInput,
@@ -16,6 +16,7 @@
     startRecording,
     stopRecording,
     transcribe,
+    updateSession,
     updateSessionInput,
     type AudioDevice,
   } from "$lib/rpc";
@@ -68,11 +69,12 @@
   type EditTarget = "note" | "input";
   type ExistingInputMethod = "audio_file" | "recording" | "text" | "dictation";
   type WorkspaceMode = "focus" | "compare";
-  type FocusPane = "note" | "source";
+  type FocusPane = "note" | "source" | "details";
 
   let expanded = $state(false);
   let workspaceMode = $state<WorkspaceMode>("focus");
   let focusPane = $state<FocusPane>("note");
+  let singleViewPane = $state<FocusPane>("note");
   let noteEditing = $state(false);
   let editingInputId = $state<string | null>(null);
   let addingInputKind = $state<SessionInputKind | null>(null);
@@ -88,6 +90,12 @@
   let processingInput = $state(false);
   let noteStatus = $state("");
   let inputStatus = $state("");
+  let metadataStatus = $state("");
+  let metadataEditing = $state(false);
+  let metadataDate = $state("");
+  let metadataTime = $state("");
+  let metadataTitle = $state("");
+  let transcriptSearch = $state("");
   let defaultLlm = $state("");
   let thinking = $state(false);
   let openSessionMenu = $state(false);
@@ -96,11 +104,16 @@
   let openAddSourceMenu = $state(false);
   let expandedInputId = $state<string | null>(null);
   let initializedSessionId = $state<string | null>(null);
+  let previousNoteCount = $state(0);
   let inlineRecordingStarted = $state(false);
+  let noteSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let inputSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
   let inputDevices = $state<AudioDevice[]>([]);
   let outputDevices = $state<AudioDevice[]>([]);
   let selectedInputDevice = $state("");
   let selectedOutputDevice = $state("");
+  let sessionMenuTrigger = $state<HTMLButtonElement | null>(null);
 
   const addInputOperationId = $derived(`add-input-${session.id}`);
 
@@ -109,7 +122,7 @@
   );
 
   let tabs = $derived(
-    sortedNotes.map((n) => ({ key: n.format, label: n.format.toUpperCase(), note: n }))
+    sortedNotes.map((note) => ({ key: note.format, label: note.format.toUpperCase() }))
   );
 
   let activeTab = $derived(sortedNotes[0]?.format ?? "");
@@ -120,13 +133,12 @@
   let sourceInputs = $derived(
     session.inputs.filter((input) => input.include_in_notes && input.text.trim().length > 0)
   );
+  let visibleSourceInputs = $derived.by(() => {
+    const query = transcriptSearch.trim().toLocaleLowerCase();
+    if (!query) return session.inputs;
+    return session.inputs.filter((input) => input.text.toLocaleLowerCase().includes(query));
+  });
   let hasSources = $derived(sourceInputs.length > 0);
-  let sourceSummary = $derived(
-    sourceInputs.length === 0
-      ? "No source material added"
-      : `${sourceInputs.length} ${sourceInputs.length === 1 ? "source" : "sources"}`
-  );
-
   let sessionSummary = $derived.by(() => {
     const parts: string[] = [];
     if (session.inputs.length > 0) {
@@ -145,6 +157,25 @@
       day: "numeric",
     })
   );
+
+  let formattedTime = $derived.by(() => {
+    const time = session.start_time || (session.date.includes("T") ? session.date.split("T")[1] : "");
+    if (!time) return "";
+    const [hours, minutes] = time.split(":").map(Number);
+    const value = new Date(2000, 0, 1, hours, minutes);
+    return value.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  });
+
+  let lastEdited = $derived.by(() => {
+    const timestamps = [
+      session.updated_at,
+      session.created_at,
+      ...session.inputs.map((input) => input.updated_at),
+      ...session.notes.map((note) => note.created_at),
+    ].filter(Boolean) as string[];
+    const latest = timestamps.sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+    return latest ? new Date(latest).toLocaleDateString([], { month: "short", day: "numeric" }) : "";
+  });
 
   let durationSeconds = $derived(getSessionDurationSeconds(session));
   let durationMin = $derived(
@@ -190,6 +221,37 @@
   });
 
   $effect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (openSessionMenu) {
+        event.preventDefault();
+        openSessionMenu = false;
+        queueMicrotask(() => sessionMenuTrigger?.focus());
+      } else if (openNoteMenu || openInputMenu || openAddSourceMenu) {
+        event.preventDefault();
+        openNoteMenu = false;
+        openInputMenu = null;
+        openAddSourceMenu = false;
+      }
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  });
+
+  $effect(() => {
+    const dismissMenus = (event: PointerEvent) => {
+      if ((event.target as Element).closest(".action-menu")) return;
+      openSessionMenu = false;
+      openNoteMenu = false;
+      openInputMenu = null;
+      openAddSourceMenu = false;
+    };
+
+    document.addEventListener("pointerdown", dismissMenus);
+    return () => document.removeEventListener("pointerdown", dismissMenus);
+  });
+
+  $effect(() => {
     const sessionId = session.id;
     if (initializedSessionId === sessionId) return;
 
@@ -209,16 +271,45 @@
     expandedInputId = null;
     workspaceMode = "focus";
     focusPane = untrack(() => (sortedNotes.length === 0 ? "source" : "note"));
+    singleViewPane = focusPane;
+    previousNoteCount = untrack(() => sortedNotes.length);
+    metadataEditing = false;
+    metadataDate = session.date.slice(0, 10);
+    metadataTime = session.start_time ?? (session.date.includes("T") ? session.date.split("T")[1]?.slice(0, 5) ?? "" : "");
+    metadataTitle = session.title ?? "";
+  });
+
+  // Reveal the first generated note as soon as it is saved. Subsequent notes
+  // add tabs without pulling the user away from the note they are reviewing.
+  $effect(() => {
+    const noteCount = sortedNotes.length;
+    if (
+      initializedSessionId === session.id &&
+      previousNoteCount === 0 &&
+      noteCount > 0 &&
+      focusPane === "source"
+    ) {
+      currentTab = sortedNotes[0].format;
+      focusPane = "note";
+      expanded = true;
+    }
+    previousNoteCount = noteCount;
   });
 
   $effect(() => {
     const _ = `${session.id}:${activeNote?.id ?? ""}:${activeNote?.note ?? ""}`;
-    noteEditing = false;
-    noteDraft = activeNote?.note ?? "";
+    if (!noteEditing) noteDraft = activeNote?.note ?? "";
+  });
+
+  onDestroy(() => {
+    if (noteSaveTimer) clearTimeout(noteSaveTimer);
+    if (inputSaveTimer) clearTimeout(inputSaveTimer);
+    if (noteDirty) void saveNote(true);
+    if (inputDirty) void saveInput(true);
   });
 
   function renderMarkdown(content: string) {
-    return marked.parse(content, { breaks: true }) as string;
+    return renderSafeMarkdown(content);
   }
 
   function inputFor(id: string) {
@@ -229,6 +320,14 @@
     const text = input.text.replace(/\s+/g, " ").trim();
     if (!text) return "No text yet";
     return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+  }
+
+  function sourceMetadata(input: SessionInput) {
+    const parts: string[] = [];
+    if (input.duration_seconds) parts.push(`${Math.round(input.duration_seconds / 60)} min`);
+    parts.push(input.source === "typed" ? "Clinician authored" : input.audio_file ? "Transcribed locally" : "Text source");
+    parts.push(`Added ${new Date(input.created_at).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}`);
+    return parts.join(" · ");
   }
 
   function plainTextFromHtml(html: string) {
@@ -296,6 +395,8 @@
   }
 
   function toggle() {
+    if (noteDirty) void saveNote(true);
+    if (inputDirty) void saveInput(true);
     expanded = !expanded;
     openSessionMenu = false;
     openNoteMenu = false;
@@ -304,19 +405,55 @@
   }
 
   function setWorkspaceMode(mode: WorkspaceMode) {
+    if (mode === workspaceMode) return;
+    if (mode === "compare") {
+      singleViewPane = focusPane;
+    }
     workspaceMode = mode;
-    if (mode === "compare" && !activeNote) {
+    if (mode === "compare" && (focusPane === "note" || focusPane === "details")) {
       focusPane = "source";
+    }
+    if (mode === "focus") {
+      focusPane = singleViewPane === "note" && activeNote ? "note" : singleViewPane;
     }
   }
 
   function setFocusPane(pane: FocusPane) {
     focusPane = pane;
+    if (workspaceMode === "focus") singleViewPane = pane;
+  }
+
+  function startMetadataEditing() {
+    metadataDate = session.date.slice(0, 10);
+    metadataTime = session.start_time ?? (session.date.includes("T") ? session.date.split("T")[1]?.slice(0, 5) ?? "" : "");
+    metadataTitle = session.title ?? "";
+    metadataEditing = true;
+    metadataStatus = "";
+  }
+
+  async function saveMetadata() {
+    if (!metadataDate) return;
+    metadataStatus = "Saving…";
+    try {
+      const updated = await updateSession({
+        id: session.id,
+        date: metadataDate,
+        start_time: metadataTime || null,
+        title: metadataTitle.trim() || null,
+        session_type: session.session_type,
+      });
+      onChange(updated);
+      metadataEditing = false;
+      metadataStatus = "Saved";
+    } catch (e) {
+      metadataStatus = `Could not save: ${String(e)}`;
+    }
   }
 
   function selectTab(key: string) {
+    if (noteDirty) void saveNote(true);
     currentTab = key;
-    focusPane = "note";
+    if (workspaceMode === "focus") focusPane = "note";
     noteEditing = false;
     noteStatus = "";
     openNoteMenu = false;
@@ -331,6 +468,7 @@
   }
 
   function cancelNoteEditing() {
+    if (noteSaveTimer) clearTimeout(noteSaveTimer);
     noteDraft = activeNote?.note ?? "";
     noteEditing = false;
     noteStatus = "";
@@ -349,6 +487,7 @@
   }
 
   function cancelInputEditing() {
+    if (inputSaveTimer) clearTimeout(inputSaveTimer);
     inputDraft = "";
     editingInputId = null;
     addingInputKind = null;
@@ -421,6 +560,22 @@
     } else {
       inputDraft = value;
     }
+  }
+
+  function queueAutosave(target: EditTarget) {
+    const existingTimer = target === "note" ? noteSaveTimer : inputSaveTimer;
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      if (target === "note") {
+        noteSaveTimer = null;
+        void saveNote(true);
+      } else {
+        inputSaveTimer = null;
+        void saveInput(true);
+      }
+    }, 800);
+    if (target === "note") noteSaveTimer = timer;
+    else inputSaveTimer = timer;
   }
 
   function getEditorState(target: EditTarget) {
@@ -499,7 +654,7 @@
     replaceSelection(target, nextValue, lineStart, lineStart + replacement.length);
   }
 
-  async function saveNote() {
+  async function saveNote(autosave = false) {
     if (!activeNote || savingNote || !noteDirty) return;
     savingNote = true;
     noteStatus = "";
@@ -514,8 +669,8 @@
         ...session,
         notes: session.notes.map((n) => (n.format === saved.format ? saved : n)),
       });
-      noteEditing = false;
-      noteStatus = "Saved";
+      if (!autosave) noteEditing = false;
+      noteStatus = autosave ? "Saved automatically" : "Saved";
     } catch (e) {
       noteStatus = `Save failed: ${String(e)}`;
     } finally {
@@ -523,7 +678,7 @@
     }
   }
 
-  async function saveInput() {
+  async function saveInput(autosave = false) {
     if ((!editingInputId && !addingInputKind) || savingInput || !inputDraft.trim()) return;
     savingInput = true;
     inputStatus = "";
@@ -544,14 +699,19 @@
         : [...session.inputs, saved];
       const updatedSession = { ...session, inputs };
       onChange(updatedSession);
-      editingInputId = null;
-      addingInputKind = null;
-      inputDraft = "";
-      if (await confirmDocumentationRefresh()) {
+      if (autosave && !existing) {
+        editingInputId = saved.id;
+        addingInputKind = null;
+      } else if (!autosave) {
+        editingInputId = null;
+        addingInputKind = null;
+        inputDraft = "";
+      }
+      if (!autosave && await confirmDocumentationRefresh()) {
         inputStatus = "Updating notes...";
         await onGenerateNote(updatedSession, { regenerateExisting: true });
       }
-      inputStatus = "Saved";
+      inputStatus = autosave ? "Saved automatically" : "Saved";
     } catch (e) {
       inputStatus = `Save failed: ${String(e)}`;
     } finally {
@@ -678,11 +838,19 @@
         diarize: kind === "session_transcript" && diarizeInput,
         session,
       };
-      recordingContext.set(ctx);
-      await startRecording(
+      const job = await startRecording({
+        session_id: session.id,
+        input_kind: kind,
+        formats: ctx.formats,
+        llm_model: defaultLlm,
+        thinking,
+        diarize: ctx.diarize,
+        created_session: false,
+      },
         selectedInputDevice || undefined,
         method === "recording" ? selectedOutputDevice || undefined : undefined
       );
+      recordingContext.set({ ...ctx, jobId: job.id });
       isRecording.set(true);
       recordingPaused.set(false);
       recordingElapsed.set(0);
@@ -721,30 +889,26 @@
 </script>
 
 <div class="session-card" class:generating={isGenerating} class:collapsed={!expanded}>
-  <div
-    class="session-card-header"
-    onclick={toggle}
-    role="button"
-    tabindex="0"
-    onkeydown={(e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        toggle();
-      }
-    }}
-  >
-    <div class="session-header-left">
+  <div class="session-card-header">
+    <button class="session-disclosure" onclick={toggle} aria-expanded={expanded} aria-controls={`session-content-${session.id}`}>
+      <div class="session-header-left">
       <svg class="session-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="9 18 15 12 9 6"/>
       </svg>
-      <div class="session-date">{formattedDate}</div>
+      <div class="session-date-block">
+        <div class="session-title">{session.title || formattedDate}</div>
+        {#if formattedTime || session.inputs.length === 0}
+          <div class="session-row-subtitle">{formattedTime || "No source material yet"}</div>
+        {/if}
+      </div>
       {#if processingThisSession}
         <div class="session-processing-status" title={processingLabel}>
           <span class="session-processing-spinner" aria-hidden="true"></span>
           <span>{processingLabel}</span>
         </div>
       {/if}
-    </div>
+      </div>
+    </button>
     <div class="session-meta">
       {#if durationMin}
         <span>{durationMin} min</span>
@@ -755,9 +919,13 @@
       {#if sessionSummary}
         <span>{sessionSummary}</span>
       {/if}
+      {#if lastEdited}
+        <span>Edited {lastEdited}</span>
+      {/if}
       <div class="action-menu">
         <button
           class="icon-btn action-menu-trigger"
+          bind:this={sessionMenuTrigger}
           onclick={(e) => {
             e.stopPropagation();
             openSessionMenu = !openSessionMenu;
@@ -774,9 +942,10 @@
           </svg>
         </button>
         {#if openSessionMenu}
-          <div class="action-menu-popover">
+          <div class="action-menu-popover" role="menu" aria-label="Session actions">
             <button
               class="action-menu-item danger"
+              role="menuitem"
               onclick={(e) => {
                 e.stopPropagation();
                 openSessionMenu = false;
@@ -792,7 +961,7 @@
   </div>
 
   {#if expanded}
-    <div class="session-card-tabs-row">
+    <div id={`session-content-${session.id}`} class="session-card-tabs-row">
       <div class="session-card-tabs">
         {#each tabs as tab (tab.key)}
           <button
@@ -801,17 +970,27 @@
             onclick={() => selectTab(tab.key)}
             disabled={isGenerating}
           >
-            {tab.label}
+            Note · {tab.label}
           </button>
         {/each}
         <button
-          class="session-tab source-material-tab"
-          class:active={workspaceMode === "focus" && focusPane === "source"}
+          class="session-tab"
+          class:active={focusPane === "source"}
           onclick={() => setFocusPane("source")}
-          disabled={isGenerating || workspaceMode === "compare"}
-          aria-pressed={workspaceMode === "focus" && focusPane === "source"}
+          disabled={isGenerating}
+          aria-pressed={focusPane === "source"}
         >
-          Source Material
+          Session material
+          <span class="session-tab-count" aria-hidden="true">{session.inputs.length}</span>
+        </button>
+        <button
+          class="session-tab"
+          class:active={workspaceMode === "focus" && focusPane === "details"}
+          onclick={() => setFocusPane("details")}
+          disabled={isGenerating || workspaceMode === "compare"}
+          aria-pressed={workspaceMode === "focus" && focusPane === "details"}
+        >
+          Details
         </button>
       </div>
       {#if activeNote}
@@ -823,7 +1002,7 @@
               disabled={isGenerating}
               aria-pressed={workspaceMode === "focus"}
             >
-              Focus
+              Single
             </button>
             <button
               class:active={workspaceMode === "compare"}
@@ -831,7 +1010,7 @@
               disabled={isGenerating}
               aria-pressed={workspaceMode === "compare"}
             >
-              Compare
+              Split
             </button>
           </div>
         </div>
@@ -853,7 +1032,23 @@
         >
           {#if activeNote && (workspaceMode === "compare" || focusPane === "note")}
             <section class="editor-pane">
-              <div class="editor-pane-header note-pane-header">
+              <div
+                class="editor-pane-header note-pane-header"
+                class:has-draft={!noteEditing && !!activeNote?.llm_model}
+              >
+                {#if !noteEditing && activeNote?.llm_model}
+                  <div class="note-draft-notice" role="note">
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="9"></circle>
+                      <path d="M12 10v6"></path>
+                      <path d="M12 7h.01"></path>
+                    </svg>
+                    <span>
+                      <strong>AI-generated draft</strong>
+                      Generated locally. Review before using in the clinical record.
+                    </span>
+                  </div>
+                {/if}
                 <div class="editor-actions">
                   {#if noteStatus}
                     <span class:error={statusIsError(noteStatus)} class="save-status">{noteStatus}</span>
@@ -874,11 +1069,11 @@
                         </svg>
                       </button>
                       {#if openNoteMenu}
-                        <div class="action-menu-popover">
-                          <button class="action-menu-item" onclick={() => copyRenderedContent("note")}>
+                        <div class="action-menu-popover" role="menu" aria-label="Note actions">
+                          <button class="action-menu-item" role="menuitem" onclick={() => copyRenderedContent("note")}>
                             Copy note
                           </button>
-                          <button class="action-menu-item" onclick={startNoteEditing}>
+                          <button class="action-menu-item" role="menuitem" onclick={startNoteEditing}>
                             Edit note
                           </button>
                         </div>
@@ -899,11 +1094,12 @@
                   bind:this={noteEditorEl}
                   bind:value={noteDraft}
                   disabled={savingNote}
+                  oninput={() => queueAutosave("note")}
                   onkeydown={(e) => handleEditorShortcut(e, saveNote)}
                 ></textarea>
                 <div class="editor-footer">
                   <button class="btn btn-sm" onclick={cancelNoteEditing} disabled={savingNote}>Cancel</button>
-                  <button class="btn btn-sm btn-primary" onclick={saveNote} disabled={savingNote || !noteDirty}>
+                  <button class="btn btn-sm btn-primary" onclick={() => saveNote()} disabled={savingNote || !noteDirty}>
                     {savingNote ? "Saving..." : "Save"}
                   </button>
                 </div>
@@ -913,13 +1109,49 @@
             </section>
           {/if}
 
-          {#if !activeNote || workspaceMode === "compare" || focusPane === "source"}
-            <section class="editor-pane inputs-pane" class:supporting={workspaceMode === "compare" && !!activeNote}>
+          {#if focusPane === "details" && workspaceMode === "focus"}
+            <section class="editor-pane details-pane">
               <div class="editor-pane-header">
                 <div>
-                  <div class="editor-pane-title">Source Material</div>
-                  <div class="editor-pane-subtitle">{sourceSummary}</div>
+                  <div class="editor-pane-title">Session details</div>
+                  <div class="editor-pane-subtitle">Appointment information associated with this session</div>
                 </div>
+                {#if metadataStatus}<span class:error={metadataStatus.startsWith("Could not")} class="save-status">{metadataStatus}</span>{/if}
+              </div>
+
+              <div class="session-details-form">
+                <div class="form-group">
+                  <label for={`metadata-date-${session.id}`}>Session date</label>
+                  <input id={`metadata-date-${session.id}`} type="date" bind:value={metadataDate} disabled={!metadataEditing} />
+                </div>
+                <div class="form-group">
+                  <label for={`metadata-time-${session.id}`}>Start time <span class="text-muted">(optional)</span></label>
+                  <input id={`metadata-time-${session.id}`} type="time" bind:value={metadataTime} disabled={!metadataEditing} />
+                </div>
+                <div class="form-group">
+                  <label for={`metadata-title-${session.id}`}>Session title <span class="text-muted">(optional)</span></label>
+                  <input id={`metadata-title-${session.id}`} bind:value={metadataTitle} placeholder="Initial assessment" disabled={!metadataEditing} />
+                </div>
+              </div>
+              <div class="details-summary">
+                <span><strong>Duration</strong>{durationMin ? `${durationMin} min` : "Not available"}</span>
+                <span><strong>Sources</strong>{session.inputs.length}</span>
+                <span><strong>Notes</strong>{session.notes.length}</span>
+              </div>
+              <div class="editor-footer">
+                {#if metadataEditing}
+                  <button class="btn" onclick={() => { metadataEditing = false; metadataStatus = ""; }}>Cancel</button>
+                  <button class="btn btn-primary" onclick={saveMetadata} disabled={!metadataDate}>Save details</button>
+                {:else}
+                  <button class="btn btn-primary" onclick={startMetadataEditing}>Edit details</button>
+                {/if}
+              </div>
+            </section>
+          {/if}
+
+          {#if focusPane === "source" || (!activeNote && focusPane === "note")}
+            <section class="editor-pane inputs-pane" class:supporting={workspaceMode === "compare" && !!activeNote}>
+              <div class="editor-pane-header">
                 <div class="editor-actions">
                   {#if inputStatus}
                     <span class:error={statusIsError(inputStatus)} class="save-status">{inputStatus}</span>
@@ -930,6 +1162,17 @@
                     </button>
                   {/if}
 
+                  {#if session.inputs.length > 0}
+                    <div class="source-search">
+                      <input
+                        bind:value={transcriptSearch}
+                        type="search"
+                        placeholder="Search session material"
+                        aria-label="Search session material"
+                      />
+                    </div>
+                  {/if}
+
                   <div class="action-menu">
                     <button
                       class="btn btn-sm"
@@ -937,24 +1180,24 @@
                       disabled={$isRecording || processingInput || !!editingInputId || !!addingInputKind}
                       aria-expanded={openAddSourceMenu}
                     >
-                      Add source material
+                      Add source
                     </button>
 
                     {#if openAddSourceMenu}
-                      <div class="action-menu-popover source-add-menu">
-                        <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "recording")}>
+                      <div class="action-menu-popover source-add-menu" role="menu" aria-label="Add source">
+                        <button class="action-menu-item" role="menuitem" onclick={() => startInputAdding("session_transcript", "recording")}>
                           Record session
                         </button>
-                        <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "audio_file")}>
+                        <button class="action-menu-item" role="menuitem" onclick={() => startInputAdding("session_transcript", "audio_file")}>
                           Upload session recording
                         </button>
-                        <button class="action-menu-item" onclick={() => startInputAdding("session_transcript", "text")}>
+                        <button class="action-menu-item" role="menuitem" onclick={() => startInputAdding("session_transcript", "text")}>
                           Paste session transcript
                         </button>
-                        <button class="action-menu-item" onclick={() => startInputAdding("clinician_note", "text")}>
+                        <button class="action-menu-item" role="menuitem" onclick={() => startInputAdding("clinician_note", "text")}>
                           Write clinician note
                         </button>
-                        <button class="action-menu-item" onclick={() => startInputAdding("clinician_note", "dictation")}>
+                        <button class="action-menu-item" role="menuitem" onclick={() => startInputAdding("clinician_note", "dictation")}>
                           Record clinician note
                         </button>
                       </div>
@@ -964,13 +1207,14 @@
               </div>
 
               <div class="source-input-list">
-                {#each session.inputs as input (input.id)}
+                {#each visibleSourceInputs as input (input.id)}
                   <div class="source-input-card">
                     <div class="source-input-header">
                       <div>
                         <div class="source-input-title">
                           {getInputLabel(input)}
                         </div>
+                        <div class="source-input-meta">{sourceMetadata(input)}</div>
                         <button
                           class="source-input-preview"
                           onclick={() => expandedInputId = expandedInputId === input.id ? null : input.id}
@@ -996,21 +1240,24 @@
                               </svg>
                             </button>
                             {#if openInputMenu === input.id}
-                              <div class="action-menu-popover">
+                              <div class="action-menu-popover" role="menu" aria-label="Source actions">
                                 <button
                                   class="action-menu-item"
+                                  role="menuitem"
                                   onclick={() => copyRenderedContent("input", input)}
                                 >
                                   Copy source
                                 </button>
                                 <button
                                   class="action-menu-item"
+                                  role="menuitem"
                                   onclick={() => startInputEditing(input)}
                                 >
                                   Edit source
                                 </button>
                                 <button
                                   class="action-menu-item danger"
+                                  role="menuitem"
                                   onclick={() => deleteInput(input)}
                                 >
                                   Delete source
@@ -1033,11 +1280,12 @@
                         bind:this={inputEditorEl}
                         bind:value={inputDraft}
                         disabled={savingInput}
+                        oninput={() => queueAutosave("input")}
                         onkeydown={(e) => handleEditorShortcut(e, saveInput)}
                       ></textarea>
                       <div class="editor-footer">
                         <button class="btn btn-sm" onclick={cancelInputEditing} disabled={savingInput}>Cancel</button>
-                        <button class="btn btn-sm btn-primary" onclick={saveInput} disabled={savingInput || !inputDirty || !inputDraft.trim()}>
+                        <button class="btn btn-sm btn-primary" onclick={() => saveInput()} disabled={savingInput || !inputDirty || !inputDraft.trim()}>
                           {savingInput ? "Saving..." : "Save"}
                         </button>
                       </div>
@@ -1048,6 +1296,10 @@
                     {/if}
                   </div>
                 {/each}
+
+                {#if session.inputs.length > 0 && visibleSourceInputs.length === 0}
+                  <p class="text-muted source-search-empty">No session material matches “{transcriptSearch}”.</p>
+                {/if}
 
                 {#if addingInputKind}
                   <div class="source-input-card empty">
@@ -1069,11 +1321,12 @@
                         bind:this={inputEditorEl}
                         bind:value={inputDraft}
                         disabled={savingInput}
+                        oninput={() => queueAutosave("input")}
                         onkeydown={(e) => handleEditorShortcut(e, saveInput)}
                       ></textarea>
                       <div class="editor-footer">
                         <button class="btn btn-sm" onclick={cancelInputEditing} disabled={savingInput}>Cancel</button>
-                        <button class="btn btn-sm btn-primary" onclick={saveInput} disabled={savingInput || !inputDirty}>
+                        <button class="btn btn-sm btn-primary" onclick={() => saveInput()} disabled={savingInput || !inputDirty}>
                           {savingInput ? "Saving..." : "Save"}
                         </button>
                       </div>
@@ -1149,6 +1402,7 @@
                                 <span>Identify speakers</span>
                               </label>
                             {/if}
+                            <p class="record-hint">About 345 MB per hour (roughly 690 MB for two hours). Gist prevents idle sleep while recording and processing.</p>
                             <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")}>
                               Start recording
                             </button>

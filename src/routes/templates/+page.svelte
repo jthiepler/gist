@@ -24,9 +24,16 @@
   let showNew = $state(false);
   let newName = $state("");
   let newPrompt = $state("");
+  let previewId = $state<string | null>(null);
+  let openTemplateMenu = $state<string | null>(null);
 
-  onMount(async () => {
-    await loadFormats();
+  onMount(() => {
+    const dismissMenu = (event: PointerEvent) => {
+      if (!(event.target as Element).closest(".action-menu")) openTemplateMenu = null;
+    };
+    document.addEventListener("pointerdown", dismissMenu);
+    void loadFormats();
+    return () => document.removeEventListener("pointerdown", dismissMenu);
   });
 
   async function loadFormats() {
@@ -41,6 +48,7 @@
   }
 
   function startEdit(fmt: NoteFormatTemplate) {
+    openTemplateMenu = null;
     editingId = fmt.id;
     editName = fmt.name;
     editPrompt = fmt.prompt;
@@ -52,6 +60,15 @@
     editingId = null;
     editName = "";
     editPrompt = "";
+  }
+
+  function uniqueFormatName(base: string) {
+    let name = base;
+    let suffix = 2;
+    while (formats.some((candidate) => candidate.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      name = `${base} ${suffix++}`;
+    }
+    return name;
   }
 
   async function saveEdit() {
@@ -67,7 +84,12 @@
     saving = true;
     error = "";
     try {
-      await updateNoteFormat(editingId, editName.trim(), editPrompt);
+      const original = formats.find((format) => format.id === editingId);
+      if (original?.is_builtin) {
+        await createNoteFormat(uniqueFormatName(`${editName.trim()} customized`), editPrompt);
+      } else {
+        await updateNoteFormat(editingId, editName.trim(), editPrompt);
+      }
       await loadFormats();
       editingId = null;
       editName = "";
@@ -82,6 +104,7 @@
   }
 
   async function removeFormat(fmt: NoteFormatTemplate) {
+    openTemplateMenu = null;
     if (
       !(await confirm(`Delete note type "${fmt.name}"? This cannot be undone.`, {
         title: "Delete note type",
@@ -97,6 +120,7 @@
   }
 
   async function resetFormat(fmt: NoteFormatTemplate) {
+    openTemplateMenu = null;
     if (
       !(await confirm(`Reset "${fmt.name}" to the built-in default? Your changes will be discarded.`, {
         title: "Reset note type",
@@ -114,6 +138,7 @@
   }
 
   async function toggleHidden(fmt: NoteFormatTemplate) {
+    openTemplateMenu = null;
     try {
       await toggleNoteFormatHidden(fmt.id);
       await loadFormats();
@@ -122,8 +147,29 @@
     }
   }
 
+  async function duplicateFormat(fmt: NoteFormatTemplate) {
+    openTemplateMenu = null;
+    error = "";
+    try {
+      await createNoteFormat(uniqueFormatName(`${fmt.name} copy`), fmt.prompt);
+      await loadFormats();
+      saved = true;
+      setTimeout(() => (saved = false), 2000);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   const visibleFormats = $derived(formats.filter((f) => !f.hidden));
   const hiddenFormats = $derived(formats.filter((f) => f.hidden));
+
+  function templateDescription(fmt: NoteFormatTemplate) {
+    const name = fmt.name.toLowerCase();
+    if (name.includes("soap")) return "A concise clinical structure for subjective report, objective observations, assessment, and plan.";
+    if (name.includes("dap")) return "A focused format for data, assessment, and the next clinical plan.";
+    if (name.includes("birp")) return "A structured record of behavior, intervention, response, and plan.";
+    return "A structured clinical note generated from the session’s local source material.";
+  }
 
   async function createFormat() {
     if (!newName.trim()) {
@@ -166,8 +212,15 @@ Output format:
 </script>
 
 <div class="workspace-header">
-  <h2>Note templates</h2>
-  <div class="header-meta">Choose which note types are available when creating sessions.</div>
+  <div class="header-top-row">
+    <div>
+      <h2>Note templates</h2>
+      <div class="header-meta">Choose which note formats are available when creating session notes.</div>
+    </div>
+    {#if !showNew}
+      <button class="btn btn-primary" onclick={() => { showNew = true; newName = ""; newPrompt = ""; }}>Create template</button>
+    {/if}
+  </div>
 </div>
 
 {#if error}
@@ -194,36 +247,75 @@ Output format:
               <button class="btn btn-sm" onclick={cancelEdit} disabled={saving}>Cancel</button>
             </div>
           </div>
-          <label class="template-editor-label" for="edit-format-prompt">Generation instructions</label>
-          <textarea
-            id="edit-format-prompt"
-            bind:value={editPrompt}
-            class="template-prompt-editor"
-            placeholder="Enter the instructions and output structure for this note type..."
-          ></textarea>
+          <details class="advanced-prompt" open>
+            <summary>Advanced prompt</summary>
+            <p>Changes here can substantially alter the structure and content of generated notes.</p>
+            <label class="template-editor-label" for="edit-format-prompt">Generation instructions</label>
+            <textarea
+              id="edit-format-prompt"
+              bind:value={editPrompt}
+              class="template-prompt-editor"
+              placeholder="Enter the instructions and output structure for this note type..."
+            ></textarea>
+          </details>
         </div>
       {:else}
         <div class="template-card">
           <div class="template-header">
             <div>
               <div class="template-name">
-                {fmt.name.toUpperCase()}
+                {fmt.name}
                 {#if fmt.is_builtin}
                 <span class="badge badge-blue">Built-in</span>
+                {:else}
+                <span class="badge">Custom</span>
                 {/if}
+                <span class="badge badge-active">Active</span>
               </div>
             </div>
             <div class="template-actions">
-              <button class="btn-ghost btn-sm" onclick={() => startEdit(fmt)}>Edit</button>
-              <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Hide</button>
-              {#if fmt.is_builtin}
-                <button class="btn-ghost btn-sm" onclick={() => resetFormat(fmt)}>Reset</button>
-              {:else}
-                <button class="btn btn-sm btn-danger" onclick={() => removeFormat(fmt)}>Delete</button>
-              {/if}
+              <button
+                class="btn btn-sm"
+                class:preview-active={previewId === fmt.id}
+                onclick={() => previewId = previewId === fmt.id ? null : fmt.id}
+                aria-pressed={previewId === fmt.id}
+              >Preview</button>
+              <button class="btn btn-sm" onclick={() => startEdit(fmt)}>{fmt.is_builtin ? "Customize" : "Edit"}</button>
+              <div class="action-menu">
+                <button
+                  class="icon-btn action-menu-trigger"
+                  onclick={() => openTemplateMenu = openTemplateMenu === fmt.id ? null : fmt.id}
+                  title="Template actions"
+                  aria-label="Template actions"
+                  aria-expanded={openTemplateMenu === fmt.id}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <circle cx="5" cy="12" r="1.8"/>
+                    <circle cx="12" cy="12" r="1.8"/>
+                    <circle cx="19" cy="12" r="1.8"/>
+                  </svg>
+                </button>
+                {#if openTemplateMenu === fmt.id}
+                  <div class="action-menu-popover">
+                    <button class="action-menu-item" onclick={() => duplicateFormat(fmt)}>Duplicate</button>
+                    <button class="action-menu-item" onclick={() => toggleHidden(fmt)}>Hide</button>
+                    {#if fmt.is_builtin}
+                      <button class="action-menu-item" onclick={() => resetFormat(fmt)}>Reset</button>
+                    {:else}
+                      <button class="action-menu-item danger" onclick={() => removeFormat(fmt)}>Delete</button>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
             </div>
           </div>
-          <div class="template-preview">{fmt.prompt.slice(0, 200)}{#if fmt.prompt.length > 200}...{/if}</div>
+          <p class="template-description">{templateDescription(fmt)}</p>
+          {#if previewId === fmt.id}
+            <div class="template-prompt-preview">
+              <strong>Prompt preview</strong>
+              <pre>{fmt.prompt}</pre>
+            </div>
+          {/if}
         </div>
       {/if}
     {/each}
@@ -238,23 +330,45 @@ Output format:
             <div class="template-header">
               <div>
                 <div class="template-name">
-                  {fmt.name.toUpperCase()}
+                  {fmt.name}
                   {#if fmt.is_builtin}
                     <span class="badge badge-blue">Built-in</span>
+                  {:else}
+                    <span class="badge">Custom</span>
                   {/if}
                 </div>
               </div>
               <div class="template-actions">
-                <button class="btn-ghost btn-sm" onclick={() => startEdit(fmt)}>Edit</button>
-                <button class="btn-ghost btn-sm" onclick={() => toggleHidden(fmt)}>Show</button>
-                {#if fmt.is_builtin}
-                  <button class="btn-ghost btn-sm" onclick={() => resetFormat(fmt)}>Reset</button>
-                {:else}
-                  <button class="btn btn-sm btn-danger" onclick={() => removeFormat(fmt)}>Delete</button>
-                {/if}
+                <button class="btn btn-sm" onclick={() => startEdit(fmt)}>{fmt.is_builtin ? "Customize" : "Edit"}</button>
+                <div class="action-menu">
+                  <button
+                    class="icon-btn action-menu-trigger"
+                    onclick={() => openTemplateMenu = openTemplateMenu === fmt.id ? null : fmt.id}
+                    title="Template actions"
+                    aria-label="Template actions"
+                    aria-expanded={openTemplateMenu === fmt.id}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <circle cx="5" cy="12" r="1.8"/>
+                      <circle cx="12" cy="12" r="1.8"/>
+                      <circle cx="19" cy="12" r="1.8"/>
+                    </svg>
+                  </button>
+                  {#if openTemplateMenu === fmt.id}
+                    <div class="action-menu-popover">
+                      <button class="action-menu-item" onclick={() => duplicateFormat(fmt)}>Duplicate</button>
+                      <button class="action-menu-item" onclick={() => toggleHidden(fmt)}>Show</button>
+                      {#if fmt.is_builtin}
+                        <button class="action-menu-item" onclick={() => resetFormat(fmt)}>Reset</button>
+                      {:else}
+                        <button class="action-menu-item danger" onclick={() => removeFormat(fmt)}>Delete</button>
+                      {/if}
+                    </div>
+                  {/if}
+                </div>
               </div>
             </div>
-            <div class="template-preview">{fmt.prompt.slice(0, 200)}{#if fmt.prompt.length > 200}...{/if}</div>
+            <p class="template-description">{templateDescription(fmt)}</p>
           </div>
         {/each}
       </div>
@@ -282,17 +396,17 @@ Output format:
           </button>
         </div>
       </div>
-      <label class="template-editor-label" for="new-format-prompt">Generation instructions</label>
-      <textarea
-        id="new-format-prompt"
-        bind:value={newPrompt}
-        class="template-prompt-editor"
-        placeholder={PLACEHOLDER_PROMPT}
-      ></textarea>
+      <details class="advanced-prompt" open>
+        <summary>Advanced prompt</summary>
+        <p>Define the note structure and generation rules. All processing remains local.</p>
+        <label class="template-editor-label" for="new-format-prompt">Generation instructions</label>
+        <textarea
+          id="new-format-prompt"
+          bind:value={newPrompt}
+          class="template-prompt-editor"
+          placeholder={PLACEHOLDER_PROMPT}
+        ></textarea>
+      </details>
     </div>
-  {:else}
-    <button class="btn btn-primary add-format-btn" onclick={() => { showNew = true; newName = ""; newPrompt = ""; }}>
-      New note type
-    </button>
   {/if}
 {/if}

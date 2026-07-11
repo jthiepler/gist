@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import {
     createSessionInput,
     getPatientFormats,
@@ -41,11 +42,13 @@
     patientId,
     onComplete,
     onProcessingStart,
+    onSessionUpdate,
     onCancel,
   }: {
     patientId: string;
     onComplete: (session: Session) => void;
     onProcessingStart: (session: Session) => void;
+    onSessionUpdate: (session: Session) => void;
     onCancel: () => void;
   } = $props();
 
@@ -62,6 +65,12 @@
   let diarizeSession = $state(false);
   let audioPath = $state("");
   let textDraft = $state("");
+  const now = new Date();
+  let sessionDate = $state(now.toLocaleDateString("en-CA"));
+  let sessionTime = $state(
+    `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`
+  );
+  let sessionTitle = $state("");
   let formats = $state<NoteFormatTemplate[]>([]);
   let selectedFormats = $state<Set<string>>(new Set());
   let formatsLoaded = $state(false);
@@ -70,12 +79,15 @@
 
   let defaultLlm = $state("");
   let thinking = $state(false);
+  let confirmRecordingConsent = $state(true);
+  let recordingConsentConfirmed = $state(false);
 
   let audioDevices = $state<AudioDevice[]>([]);
   let inputDevices = $state<AudioDevice[]>([]);
   let outputDevices = $state<AudioDevice[]>([]);
   let selectedInputDevice = $state("");
   let selectedOutputDevice = $state("");
+  let audioDeviceError = $state("");
 
   const opId = "new-session";
 
@@ -157,6 +169,7 @@
       const s = await loadSettings();
       if (s.defaultLlm) defaultLlm = s.defaultLlm;
       thinking = s.thinking;
+      confirmRecordingConsent = s.confirmRecordingConsent;
     })();
   });
 
@@ -209,6 +222,7 @@
   });
 
   async function loadAudioDevices() {
+    audioDeviceError = "";
     try {
       const devices = await listAudioDevices();
       audioDevices = devices;
@@ -220,34 +234,84 @@
       if (outputDevices.length > 0 && !selectedOutputDevice) {
         selectedOutputDevice = outputDevices[0].name;
       }
+      if (inputDevices.length === 0) {
+        audioDeviceError = "No microphone is available. Connect a microphone, then allow Gist to use it in macOS Privacy & Security.";
+      }
     } catch (e) {
-      console.error("Failed to load audio devices:", e);
+      audioDeviceError = "Gist could not access microphones. Check that Gist is allowed in macOS Privacy & Security, then reopen the app.";
+    }
+  }
+
+  async function openMicrophonePrivacySettings() {
+    try {
+      await openUrl("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone");
+    } catch {
+      audioDeviceError = "Open System Settings, choose Privacy & Security, then allow Gist under Microphone.";
     }
   }
 
   async function handleStartRecording() {
     error = "";
+    if (confirmRecordingConsent && !recordingConsentConfirmed) {
+      error = "Confirm recording consent before starting.";
+      return;
+    }
+    if (inputDevices.length === 0) {
+      error = "A microphone is required to record. Check macOS Privacy & Security, then try again.";
+      return;
+    }
+    let createdSession: Session | null = null;
     try {
       const sortedFormats = [...selectedFormats].sort((a, b) => a.localeCompare(b));
+      createdSession = await invoke<Session>("create_session", {
+        data: {
+          patient_id: patientId,
+          date: sessionDate,
+          start_time: sessionTime || null,
+          title: sessionTitle.trim() || null,
+          session_type: null,
+        },
+      });
+      onProcessingStart(createdSession);
       const ctx: RecordingContext = {
         patientId,
+        occurrenceDate: sessionDate,
+        startTime: sessionTime || undefined,
+        title: sessionTitle.trim() || undefined,
         formats: sortedFormats,
         defaultLlm,
         thinking,
         inputKind: sourceKind,
         diarize: sourceKind === "session_transcript" && diarizeSession,
+        session: createdSession,
+        isNewSession: true,
       };
-      recordingContext.set(ctx);
-      await startRecording(
+      const job = await startRecording({
+        session_id: createdSession.id,
+        input_kind: sourceKind,
+        formats: sortedFormats,
+        llm_model: defaultLlm,
+        thinking,
+        diarize: ctx.diarize,
+        created_session: true,
+      },
         selectedInputDevice || undefined,
         inputMethod === "recording" ? selectedOutputDevice || undefined : undefined
       );
+      recordingContext.set({ ...ctx, jobId: job.id });
       isRecording.set(true);
       recordingPaused.set(false);
       recordingElapsed.set(0);
     } catch (e) {
       error = `Failed to start recording: ${e}`;
       recordingContext.set(null);
+      if (createdSession) {
+        try {
+          await invoke("delete_session", { id: createdSession.id });
+        } catch {
+          // Keep the empty session if cleanup fails; it is safer than hiding a failed record.
+        }
+      }
     }
   }
 
@@ -339,7 +403,9 @@
       session = await invoke<Session>("create_session", {
         data: {
           patient_id: patientId,
-          date: new Date().toISOString().slice(0, 10),
+          date: sessionDate,
+          start_time: sessionTime || null,
+          title: sessionTitle.trim() || null,
         },
       });
       currentOperation.set(`${opId}-${session.id}`);
@@ -392,6 +458,7 @@
         ...session,
         inputs: [input],
       };
+      onSessionUpdate(session);
     } catch (e) {
       error = `Failed to save session: ${e}`;
       finishOperation();
@@ -404,7 +471,7 @@
         defaultLlm,
         thinking,
         verb: "Creating",
-        onSessionUpdate: onComplete,
+        onSessionUpdate,
       });
     } catch (e) {
       const msg = String(e);
@@ -431,6 +498,22 @@
   {#if error}
     <div class="error-banner">{error}</div>
   {/if}
+
+  <div class="session-metadata-grid">
+    <div class="form-group">
+      <label for="session-date">Session date</label>
+      <input id="session-date" type="date" bind:value={sessionDate} disabled={phase !== "idle"} />
+    </div>
+    <div class="form-group">
+      <label for="session-time">Start time <span class="text-muted">(optional)</span></label>
+      <input id="session-time" type="time" bind:value={sessionTime} disabled={phase !== "idle"} />
+    </div>
+    <div class="form-group">
+      <label for="session-title">Session title <span class="text-muted">(optional)</span></label>
+      <input id="session-title" bind:value={sessionTitle} placeholder="Initial assessment" disabled={phase !== "idle"} />
+    </div>
+    <p class="session-metadata-help">This is when the appointment occurred. It is separate from when an audio file was imported.</p>
+  </div>
 
   <div class="session-start-grid" role="radiogroup" aria-label="Choose how to add the first source material">
     <button
@@ -540,6 +623,12 @@
         </div>
       {:else}
         <div class="record-controls">
+          {#if audioDeviceError}
+            <div class="error-banner" role="alert">
+              <span>{audioDeviceError}</span>
+              <button class="btn btn-sm" onclick={openMicrophonePrivacySettings}>Open Microphone Privacy Settings</button>
+            </div>
+          {/if}
           <div class="form-group">
             <label for="input-device">Microphone</label>
             <select id="input-device" bind:value={selectedInputDevice} disabled={phase !== "idle"}>
@@ -565,7 +654,14 @@
               <span>Identify speakers</span>
             </label>
           {/if}
-          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={phase !== "idle"}>
+          {#if confirmRecordingConsent}
+            <label class="recording-consent">
+              <input type="checkbox" bind:checked={recordingConsentConfirmed} disabled={phase !== "idle"} />
+              <span>I have confirmed consent to record according to my organization’s and jurisdiction’s requirements.</span>
+            </label>
+          {/if}
+          <p class="record-hint">Gist records at about 345 MB per hour (roughly 690 MB for two hours). Keep your Mac awake while recording; Gist also prevents idle sleep during recording and processing.</p>
+          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={phase !== "idle" || inputDevices.length === 0 || (confirmRecordingConsent && !recordingConsentConfirmed)}>
             Start recording
           </button>
         </div>

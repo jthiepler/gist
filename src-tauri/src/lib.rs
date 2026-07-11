@@ -1,11 +1,12 @@
 use chrono::Local;
 use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -14,69 +15,72 @@ mod audio;
 
 // ── Database ──────────────────────────────────────────────────────────────
 
-const SESSION_COLUMNS: &str = "id, patient_id, date, created_at";
+const SESSION_COLUMNS: &str =
+    "id, patient_id, date, start_time, title, session_type, updated_at, created_at";
 
 fn map_session(row: &Row) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
         patient_id: row.get(1)?,
         date: row.get(2)?,
-        created_at: row.get(3)?,
+        start_time: row.get(3)?,
+        title: row.get(4)?,
+        session_type: row.get(5)?,
+        updated_at: row.get(6)?,
+        created_at: row.get(7)?,
         inputs: Vec::new(),
         notes: Vec::new(),
     })
 }
 
-fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Vec<SessionInput> {
-    let mut stmt = match conn.prepare(
+fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Result<Vec<SessionInput>, String> {
+    let mut stmt = conn.prepare(
         "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, language, transcription_model, include_in_notes, created_at, updated_at
          FROM session_inputs
          WHERE session_id = ?1
          ORDER BY created_at ASC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map(params![session_id], |row| {
-        Ok(SessionInput {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            kind: row.get(2)?,
-            source: row.get(3)?,
-            title: row.get(4)?,
-            text: row.get(5)?,
-            audio_file: row.get(6)?,
-            duration_seconds: row.get(7)?,
-            language: row.get(8)?,
-            transcription_model: row.get(9)?,
-            include_in_notes: row.get::<_, i64>(10)? != 0,
-            created_at: row.get(11)?,
-            updated_at: row.get(12)?,
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            Ok(SessionInput {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                kind: row.get(2)?,
+                source: row.get(3)?,
+                title: row.get(4)?,
+                text: row.get(5)?,
+                audio_file: row.get(6)?,
+                duration_seconds: row.get(7)?,
+                language: row.get(8)?,
+                transcription_model: row.get(9)?,
+                include_in_notes: row.get::<_, i64>(10)? != 0,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
         })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
-fn fetch_session_notes(conn: &Connection, session_id: &str) -> Vec<SessionNote> {
-    let mut stmt = match conn.prepare(
+fn fetch_session_notes(conn: &Connection, session_id: &str) -> Result<Vec<SessionNote>, String> {
+    let mut stmt = conn.prepare(
         "SELECT id, session_id, format, note, llm_model, created_at FROM session_notes WHERE session_id = ?1 ORDER BY format ASC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map(params![session_id], |row| {
-        Ok(SessionNote {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            format: row.get(2)?,
-            note: row.get(3)?,
-            llm_model: row.get(4)?,
-            created_at: row.get(5)?,
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            Ok(SessionNote {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                format: row.get(2)?,
+                note: row.get(3)?,
+                llm_model: row.get(4)?,
+                created_at: row.get(5)?,
+            })
         })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 struct Database {
@@ -101,6 +105,10 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
                 date TEXT NOT NULL,
+                start_time TEXT,
+                title TEXT,
+                session_type TEXT,
+                updated_at TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS session_inputs (
@@ -130,7 +138,7 @@ impl Database {
                 hidden INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS session_notes (
+             CREATE TABLE IF NOT EXISTS session_notes (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 format TEXT NOT NULL,
@@ -138,11 +146,33 @@ impl Database {
                 llm_model TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(session_id, format)
+            );
+             CREATE TABLE IF NOT EXISTS recording_jobs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                audio_file TEXT NOT NULL,
+                input_kind TEXT NOT NULL,
+                formats_json TEXT NOT NULL,
+                llm_model TEXT NOT NULL,
+                thinking INTEGER NOT NULL,
+                diarize INTEGER NOT NULL,
+                created_session INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )
         .map_err(|e| e.to_string())?;
 
-        let _ = conn.execute("ALTER TABLE note_formats ADD COLUMN hidden INTEGER DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE note_formats ADD COLUMN hidden INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN start_time TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT", []);
 
         // Seed only missing defaults. Existing built-ins may have been edited by
         // the user and are reset explicitly through the templates UI.
@@ -183,6 +213,10 @@ struct Session {
     id: String,
     patient_id: String,
     date: String,
+    start_time: Option<String>,
+    title: Option<String>,
+    session_type: Option<String>,
+    updated_at: Option<String>,
     created_at: String,
     #[serde(default)]
     inputs: Vec<SessionInput>,
@@ -227,6 +261,34 @@ struct NoteFormatTemplate {
     created_at: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RecordingJob {
+    id: String,
+    session_id: String,
+    audio_file: String,
+    input_kind: String,
+    formats: Vec<String>,
+    llm_model: String,
+    thinking: bool,
+    diarize: bool,
+    created_session: bool,
+    state: String,
+    error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartRecordingData {
+    session_id: String,
+    input_kind: String,
+    formats: Vec<String>,
+    llm_model: String,
+    thinking: bool,
+    diarize: bool,
+    created_session: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreatePatient {
     name: String,
@@ -242,12 +304,24 @@ struct UpdatePatient {
 struct CreateSession {
     patient_id: String,
     date: String,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    session_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateSession {
     id: String,
     date: String,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    session_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,9 +393,13 @@ struct DefaultFormatCatalog {
 }
 
 fn default_formats() -> Vec<(String, String)> {
-    let catalog: DefaultFormatCatalog = serde_json::from_str(include_str!("../../gist/formats/defaults.json"))
-        .expect("bundled clinical note format defaults must be valid JSON");
-    let DefaultFormatCatalog { common_rules, formats } = catalog;
+    let catalog: DefaultFormatCatalog =
+        serde_json::from_str(include_str!("../../gist/formats/defaults.json"))
+            .expect("bundled clinical note format defaults must be valid JSON");
+    let DefaultFormatCatalog {
+        common_rules,
+        formats,
+    } = catalog;
     formats
         .into_iter()
         .map(|format| {
@@ -355,7 +433,7 @@ fn default_formats() -> Vec<(String, String)> {
 
 struct SidecarState {
     request_tx: Option<mpsc::UnboundedSender<String>>,
-    response_tx: Option<oneshot::Sender<Result<Value, String>>>,
+    response_tx: Option<(String, oneshot::Sender<Result<Value, String>>)>,
     child: Option<Child>,
     started: bool,
     busy: bool,
@@ -370,14 +448,20 @@ fn emit_sidecar_state(app: &AppHandle, busy: bool) {
 // ── Sidecar Commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> Result<String, String> {
+async fn start_sidecar(
+    app: AppHandle,
+    state: State<'_, SharedSidecarState>,
+) -> Result<String, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     if s.started {
         return Err("Sidecar already running".into());
     }
 
     let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
-    let sidecar_path = resource_dir.join("resources").join("gist-sidecar").join("gist-sidecar");
+    let sidecar_path = resource_dir
+        .join("resources")
+        .join("gist-sidecar")
+        .join("gist-sidecar");
 
     // Dev fallback: look for the sidecar in the project's dist directory
     let sidecar_path = if sidecar_path.exists() {
@@ -398,7 +482,8 @@ async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> 
     };
 
     // MLX needs to find libmlx.dylib via DYLD_FALLBACK_LIBRARY_PATH
-    let mlx_lib_dir = sidecar_path.parent()
+    let mlx_lib_dir = sidecar_path
+        .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("_internal/mlx/lib");
     let dyld_path = std::env::var("DYLD_FALLBACK_LIBRARY_PATH").unwrap_or_default();
@@ -456,7 +541,7 @@ async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> 
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(_) => break,  // EOF or error → sidecar died
+                Err(_) => break, // EOF or error → sidecar died
             };
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -472,20 +557,30 @@ async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> 
                     let _ = app_clone.emit("sidecar-progress", &parsed);
                 }
                 Some("result") | Some("pong") => {
+                    let request_id = parsed.get("request_id").and_then(|value| value.as_str());
                     let resp_tx = {
                         if let Ok(mut s) = state_clone.lock() {
-                            s.response_tx.take()
+                            if s.response_tx.as_ref().map(|(id, _)| Some(id.as_str()))
+                                == Some(request_id)
+                            {
+                                s.response_tx.take().map(|(_, tx)| tx)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
                     };
+                    let matched = resp_tx.is_some();
                     if let Some(tx) = resp_tx {
                         let _ = tx.send(Ok(parsed));
                     }
-                    if let Ok(mut s) = state_clone.lock() {
-                        s.busy = false;
+                    if matched {
+                        if let Ok(mut s) = state_clone.lock() {
+                            s.busy = false;
+                        }
+                        emit_sidecar_state(&app_clone, false);
                     }
-                    emit_sidecar_state(&app_clone, false);
                 }
                 Some("error") => {
                     let msg = parsed
@@ -493,20 +588,30 @@ async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> 
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown error")
                         .to_string();
+                    let request_id = parsed.get("request_id").and_then(|value| value.as_str());
                     let resp_tx = {
                         if let Ok(mut s) = state_clone.lock() {
-                            s.response_tx.take()
+                            if s.response_tx.as_ref().map(|(id, _)| Some(id.as_str()))
+                                == Some(request_id)
+                            {
+                                s.response_tx.take().map(|(_, tx)| tx)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
                     };
+                    let matched = resp_tx.is_some();
                     if let Some(tx) = resp_tx {
                         let _ = tx.send(Err(msg));
                     }
-                    if let Ok(mut s) = state_clone.lock() {
-                        s.busy = false;
+                    if matched {
+                        if let Ok(mut s) = state_clone.lock() {
+                            s.busy = false;
+                        }
+                        emit_sidecar_state(&app_clone, false);
                     }
-                    emit_sidecar_state(&app_clone, false);
                 }
                 _ => {}
             }
@@ -516,7 +621,7 @@ async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> 
         if let Ok(mut s) = state_clone.lock() {
             s.started = false;
             s.busy = false;
-            if let Some(tx) = s.response_tx.take() {
+            if let Some((_, tx)) = s.response_tx.take() {
                 let _ = tx.send(Err("Sidecar closed connection unexpectedly".into()));
             }
         }
@@ -532,13 +637,16 @@ async fn start_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> 
 }
 
 #[tauri::command]
-async fn stop_sidecar(app: AppHandle, state: State<'_, SharedSidecarState>) -> Result<String, String> {
+async fn stop_sidecar(
+    app: AppHandle,
+    state: State<'_, SharedSidecarState>,
+) -> Result<String, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.started = false;
     s.busy = false;
-    s.request_tx.take();  // drop → writer task exits, stdin closes
+    s.request_tx.take(); // drop → writer task exits, stdin closes
 
-    if let Some(tx) = s.response_tx.take() {
+    if let Some((_, tx)) = s.response_tx.take() {
         let _ = tx.send(Err("Sidecar stopped".into()));
     }
 
@@ -559,6 +667,30 @@ async fn rpc_call(
     request: String,
 ) -> Result<Value, String> {
     let (tx, rx) = oneshot::channel();
+    let request_id = Uuid::new_v4().to_string();
+    let mut request_value: Value = serde_json::from_str(&request)
+        .map_err(|_| "Invalid request for processing engine".to_string())?;
+    let operation_type = {
+        let request_object = request_value
+            .as_object_mut()
+            .ok_or("Invalid request for processing engine")?;
+        let operation_type = request_object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        request_object.insert("request_id".into(), Value::String(request_id.clone()));
+        operation_type
+    };
+    let request = serde_json::to_string(&request_value).map_err(|e| e.to_string())?;
+    // Prevent idle/system sleep while local transcription, model downloads, or
+    // note generation are using the sidecar. The assertion releases on every
+    // return path, including cancellation and timeout.
+    let _sleep_assertion = matches!(
+        operation_type.as_str(),
+        "transcribe" | "generate_note" | "download_model"
+    )
+    .then(|| audio::recorder::SleepAssertion::acquire("Gist is processing session data"));
     {
         let mut s = state.lock().map_err(|e| e.to_string())?;
         if !s.started {
@@ -572,7 +704,7 @@ async fn rpc_call(
             None => return Err("Sidecar not running".into()),
         };
         s.busy = true;
-        s.response_tx = Some(tx);
+        s.response_tx = Some((request_id.clone(), tx));
 
         if req_tx.send(request).is_err() {
             s.busy = false;
@@ -587,13 +719,19 @@ async fn rpc_call(
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
             let mut s = state.lock().map_err(|e| e.to_string())?;
-            s.busy = false;
+            if s.response_tx.as_ref().map(|(id, _)| id) == Some(&request_id) {
+                s.response_tx.take();
+                s.busy = false;
+            }
             emit_sidecar_state(&app, false);
             Err("Sidecar response channel closed".into())
         }
         Err(_) => {
             let mut s = state.lock().map_err(|e| e.to_string())?;
-            s.busy = false;
+            if s.response_tx.as_ref().map(|(id, _)| id) == Some(&request_id) {
+                s.response_tx.take();
+                s.busy = false;
+            }
             emit_sidecar_state(&app, false);
             Err("Sidecar operation timed out".into())
         }
@@ -622,7 +760,8 @@ async fn is_running(state: State<'_, SharedSidecarState>) -> Result<bool, String
 #[tauri::command]
 async fn list_patients(db: State<'_, Mutex<Database>>) -> Result<Vec<Patient>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let mut stmt = db.conn
+    let mut stmt = db
+        .conn
         .prepare("SELECT id, name, created_at FROM patients ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
     let patients = stmt
@@ -640,7 +779,10 @@ async fn list_patients(db: State<'_, Mutex<Database>>) -> Result<Vec<Patient>, S
 }
 
 #[tauri::command]
-async fn create_patient(db: State<'_, Mutex<Database>>, data: CreatePatient) -> Result<Patient, String> {
+async fn create_patient(
+    db: State<'_, Mutex<Database>>,
+    data: CreatePatient,
+) -> Result<Patient, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
     let now = Local::now().to_rfc3339();
@@ -660,8 +802,12 @@ async fn create_patient(db: State<'_, Mutex<Database>>, data: CreatePatient) -> 
 #[tauri::command]
 async fn update_patient(db: State<'_, Mutex<Database>>, data: UpdatePatient) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let affected = db.conn
-        .execute("UPDATE patients SET name = ?1 WHERE id = ?2", params![data.name, data.id])
+    let affected = db
+        .conn
+        .execute(
+            "UPDATE patients SET name = ?1 WHERE id = ?2",
+            params![data.name, data.id],
+        )
         .map_err(|e| e.to_string())?;
     if affected == 0 {
         return Err("Patient not found".into());
@@ -670,14 +816,21 @@ async fn update_patient(db: State<'_, Mutex<Database>>, data: UpdatePatient) -> 
 }
 
 #[tauri::command]
-async fn delete_patient(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+async fn delete_patient(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
+    let paths = audio_paths_for_patient(&db.conn, &id)?;
     let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM sessions WHERE patient_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM patients WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
+    drop(db);
+    remove_managed_audio_files(&app, paths)?;
     Ok(())
 }
 
@@ -690,9 +843,9 @@ async fn list_sessions(
 ) -> Result<Vec<Session>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let (sql, has_param) = if patient_id.is_some() {
-        (format!("SELECT {} FROM sessions WHERE patient_id = ?1 ORDER BY created_at DESC", SESSION_COLUMNS), true)
+        (format!("SELECT {} FROM sessions WHERE patient_id = ?1 ORDER BY date DESC, COALESCE(start_time, '') DESC, created_at DESC", SESSION_COLUMNS), true)
     } else {
-        (format!("SELECT {} FROM sessions ORDER BY created_at DESC", SESSION_COLUMNS), false)
+        (format!("SELECT {} FROM sessions ORDER BY date DESC, COALESCE(start_time, '') DESC, created_at DESC", SESSION_COLUMNS), false)
     };
     let mut stmt = db.conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut sessions: Vec<Session> = if has_param {
@@ -707,27 +860,34 @@ async fn list_sessions(
             .map_err(|e| e.to_string())?
     };
     for s in &mut sessions {
-        s.inputs = fetch_session_inputs(&db.conn, &s.id);
-        s.notes = fetch_session_notes(&db.conn, &s.id);
+        s.inputs = fetch_session_inputs(&db.conn, &s.id)?;
+        s.notes = fetch_session_notes(&db.conn, &s.id)?;
     }
     Ok(sessions)
 }
 
 #[tauri::command]
-async fn create_session(db: State<'_, Mutex<Database>>, data: CreateSession) -> Result<Session, String> {
+async fn create_session(
+    db: State<'_, Mutex<Database>>,
+    data: CreateSession,
+) -> Result<Session, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
     let now = Local::now().to_rfc3339();
     db.conn
         .execute(
-            "INSERT INTO sessions (id, patient_id, date, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, data.patient_id, data.date, now],
+            "INSERT INTO sessions (id, patient_id, date, start_time, title, session_type, updated_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, data.patient_id, data.date, data.start_time, data.title, data.session_type, now, now],
         )
         .map_err(|e| e.to_string())?;
     Ok(Session {
         id,
         patient_id: data.patient_id,
         date: data.date,
+        start_time: data.start_time,
+        title: data.title,
+        session_type: data.session_type,
+        updated_at: Some(now.clone()),
         created_at: now,
         inputs: Vec::new(),
         notes: Vec::new(),
@@ -737,10 +897,11 @@ async fn create_session(db: State<'_, Mutex<Database>>, data: CreateSession) -> 
 #[tauri::command]
 async fn update_session(db: State<'_, Mutex<Database>>, data: UpdateSession) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
+    let now = Local::now().to_rfc3339();
     let affected = db.conn
         .execute(
-            "UPDATE sessions SET date = ?1 WHERE id = ?2",
-            params![data.date, data.id],
+            "UPDATE sessions SET date = ?1, start_time = ?2, title = ?3, session_type = ?4, updated_at = ?5 WHERE id = ?6",
+            params![data.date, data.start_time, data.title, data.session_type, now, data.id],
         )
         .map_err(|e| e.to_string())?;
     if affected == 0 {
@@ -750,15 +911,20 @@ async fn update_session(db: State<'_, Mutex<Database>>, data: UpdateSession) -> 
 }
 
 #[tauri::command]
-async fn get_session(db: State<'_, Mutex<Database>>, id: String) -> Result<Option<Session>, String> {
+async fn get_session(
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<Option<Session>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let sql = format!("SELECT {} FROM sessions WHERE id = ?1", SESSION_COLUMNS);
     let mut stmt = db.conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query_map(params![id], map_session).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query_map(params![id], map_session)
+        .map_err(|e| e.to_string())?;
     match rows.next() {
         Some(Ok(mut session)) => {
-            session.inputs = fetch_session_inputs(&db.conn, &session.id);
-            session.notes = fetch_session_notes(&db.conn, &session.id);
+            session.inputs = fetch_session_inputs(&db.conn, &session.id)?;
+            session.notes = fetch_session_notes(&db.conn, &session.id)?;
             Ok(Some(session))
         }
         Some(Err(e)) => Err(e.to_string()),
@@ -767,11 +933,18 @@ async fn get_session(db: State<'_, Mutex<Database>>, id: String) -> Result<Optio
 }
 
 #[tauri::command]
-async fn delete_session(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+async fn delete_session(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
+    let paths = audio_paths_for_session(&db.conn, &id)?;
     db.conn
         .execute("DELETE FROM sessions WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    drop(db);
+    remove_managed_audio_files(&app, paths)?;
     Ok(())
 }
 
@@ -820,7 +993,8 @@ async fn update_session_input(
     let text = data.text.unwrap_or(existing.text);
     let include_in_notes = data.include_in_notes.unwrap_or(existing.include_in_notes);
     let updated_at = Local::now().to_rfc3339();
-    let affected = db.conn
+    let affected = db
+        .conn
         .execute(
             "UPDATE session_inputs
              SET title = ?1, text = ?2, include_in_notes = ?3, updated_at = ?4
@@ -841,14 +1015,30 @@ async fn update_session_input(
 }
 
 #[tauri::command]
-async fn delete_session_input(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+async fn delete_session_input(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
+    let audio_file: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT audio_file FROM session_inputs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     let affected = db
         .conn
         .execute("DELETE FROM session_inputs WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     if affected == 0 {
         return Err("Session input not found".into());
+    }
+    drop(db);
+    if let Some(path) = audio_file {
+        remove_managed_audio_files(&app, vec![path])?;
     }
     Ok(())
 }
@@ -891,13 +1081,14 @@ async fn create_session_note(
     let db = db.lock().map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
     let now = Local::now().to_rfc3339();
-    db.conn.execute(
-        "INSERT INTO session_notes (id, session_id, format, note, llm_model, created_at)
+    db.conn
+        .execute(
+            "INSERT INTO session_notes (id, session_id, format, note, llm_model, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(session_id, format) DO UPDATE SET note = ?4, llm_model = ?5",
-        params![id, session_id, format, note, llm_model, now],
-    )
-    .map_err(|e| e.to_string())?;
+            params![id, session_id, format, note, llm_model, now],
+        )
+        .map_err(|e| e.to_string())?;
     // Fetch the actual row back so id/created_at are correct on conflict
     let row = db.conn
         .query_row(
@@ -917,17 +1108,26 @@ async fn create_session_note(
 }
 
 #[tauri::command]
-async fn get_patient_formats(db: State<'_, Mutex<Database>>, patient_id: String) -> Result<Vec<String>, String> {
+async fn get_patient_formats(
+    db: State<'_, Mutex<Database>>,
+    patient_id: String,
+) -> Result<Vec<String>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let key = format!("patient_formats_{}", patient_id);
-    let mut stmt = db.conn
+    let mut stmt = db
+        .conn
         .prepare("SELECT value FROM settings WHERE key = ?1")
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))
+    let mut rows = stmt
+        .query_map(params![key], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
     match rows.next() {
         Some(Ok(v)) => {
-            let formats: Vec<String> = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let formats: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
             Ok(formats)
         }
         _ => Ok(Vec::new()),
@@ -935,7 +1135,11 @@ async fn get_patient_formats(db: State<'_, Mutex<Database>>, patient_id: String)
 }
 
 #[tauri::command]
-async fn set_patient_formats(db: State<'_, Mutex<Database>>, patient_id: String, formats: Vec<String>) -> Result<(), String> {
+async fn set_patient_formats(
+    db: State<'_, Mutex<Database>>,
+    patient_id: String,
+    formats: Vec<String>,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let key = format!("patient_formats_{}", patient_id);
     let value = formats.join(",");
@@ -951,12 +1155,17 @@ async fn set_patient_formats(db: State<'_, Mutex<Database>>, patient_id: String,
 // ── Settings ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn get_setting(db: State<'_, Mutex<Database>>, key: String) -> Result<Option<String>, String> {
+async fn get_setting(
+    db: State<'_, Mutex<Database>>,
+    key: String,
+) -> Result<Option<String>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let mut stmt = db.conn
+    let mut stmt = db
+        .conn
         .prepare("SELECT value FROM settings WHERE key = ?1")
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))
+    let mut rows = stmt
+        .query_map(params![key], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
     match rows.next() {
         Some(Ok(v)) => Ok(Some(v)),
@@ -966,7 +1175,11 @@ async fn get_setting(db: State<'_, Mutex<Database>>, key: String) -> Result<Opti
 }
 
 #[tauri::command]
-async fn set_setting(db: State<'_, Mutex<Database>>, key: String, value: String) -> Result<(), String> {
+async fn set_setting(
+    db: State<'_, Mutex<Database>>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     db.conn
         .execute(
@@ -991,7 +1204,9 @@ fn map_note_format(row: &Row) -> rusqlite::Result<NoteFormatTemplate> {
 }
 
 #[tauri::command]
-async fn list_note_formats(db: State<'_, Mutex<Database>>) -> Result<Vec<NoteFormatTemplate>, String> {
+async fn list_note_formats(
+    db: State<'_, Mutex<Database>>,
+) -> Result<Vec<NoteFormatTemplate>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let mut stmt = db.conn
         .prepare("SELECT id, name, prompt, is_builtin, hidden, created_at FROM note_formats ORDER BY hidden ASC, is_builtin DESC, name ASC")
@@ -1005,7 +1220,10 @@ async fn list_note_formats(db: State<'_, Mutex<Database>>) -> Result<Vec<NoteFor
 }
 
 #[tauri::command]
-async fn create_note_format(db: State<'_, Mutex<Database>>, data: CreateNoteFormat) -> Result<NoteFormatTemplate, String> {
+async fn create_note_format(
+    db: State<'_, Mutex<Database>>,
+    data: CreateNoteFormat,
+) -> Result<NoteFormatTemplate, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
     let now = Local::now().to_rfc3339();
@@ -1026,12 +1244,19 @@ async fn create_note_format(db: State<'_, Mutex<Database>>, data: CreateNoteForm
 }
 
 #[tauri::command]
-async fn update_note_format(db: State<'_, Mutex<Database>>, data: UpdateNoteFormat) -> Result<(), String> {
+async fn update_note_format(
+    db: State<'_, Mutex<Database>>,
+    data: UpdateNoteFormat,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
     // Get old name to cascade rename in session_notes
     let old_name: Option<String> = tx
-        .query_row("SELECT name FROM note_formats WHERE id = ?1", params![data.id], |row| row.get(0))
+        .query_row(
+            "SELECT name FROM note_formats WHERE id = ?1",
+            params![data.id],
+            |row| row.get(0),
+        )
         .ok();
     let affected = tx
         .execute(
@@ -1060,18 +1285,33 @@ async fn update_note_format(db: State<'_, Mutex<Database>>, data: UpdateNoteForm
 async fn delete_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     // Refuse to delete built-in formats — they can only be reset or hidden.
-    let is_builtin: i64 = db.conn
-        .query_row("SELECT is_builtin FROM note_formats WHERE id = ?1", params![id], |row| row.get(0))
+    let is_builtin: i64 = db
+        .conn
+        .query_row(
+            "SELECT is_builtin FROM note_formats WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
     if is_builtin != 0 {
         return Err("Built-in formats cannot be deleted. Use Reset or Hide instead.".into());
     }
     // Refuse to delete if session_notes reference this format
-    let name: String = db.conn
-        .query_row("SELECT name FROM note_formats WHERE id = ?1", params![id], |row| row.get(0))
+    let name: String = db
+        .conn
+        .query_row(
+            "SELECT name FROM note_formats WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
-    let note_count: i64 = db.conn
-        .query_row("SELECT COUNT(*) FROM session_notes WHERE format = ?1", params![name], |row| row.get(0))
+    let note_count: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_notes WHERE format = ?1",
+            params![name],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
     if note_count > 0 {
         return Err(format!(
@@ -1088,8 +1328,13 @@ async fn delete_note_format(db: State<'_, Mutex<Database>>, id: String) -> Resul
 #[tauri::command]
 async fn reset_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let name: String = db.conn
-        .query_row("SELECT name FROM note_formats WHERE id = ?1", params![id], |row| row.get(0))
+    let name: String = db
+        .conn
+        .query_row(
+            "SELECT name FROM note_formats WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
     let default_prompt = default_formats()
         .into_iter()
@@ -1098,7 +1343,10 @@ async fn reset_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result
     match default_prompt {
         Some(prompt) => {
             db.conn
-                .execute("UPDATE note_formats SET prompt = ?1 WHERE id = ?2", params![prompt, id])
+                .execute(
+                    "UPDATE note_formats SET prompt = ?1 WHERE id = ?2",
+                    params![prompt, id],
+                )
                 .map_err(|e| e.to_string())?;
             Ok(())
         }
@@ -1107,10 +1355,16 @@ async fn reset_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result
 }
 
 #[tauri::command]
-async fn toggle_note_format_hidden(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+async fn toggle_note_format_hidden(
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     db.conn
-        .execute("UPDATE note_formats SET hidden = NOT hidden WHERE id = ?1", params![id])
+        .execute(
+            "UPDATE note_formats SET hidden = NOT hidden WHERE id = ?1",
+            params![id],
+        )
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1123,7 +1377,10 @@ async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .add_filter("Audio", &["wav", "mp3", "m4a", "flac", "ogg", "aiff", "aac"])
+        .add_filter(
+            "Audio",
+            &["wav", "mp3", "m4a", "flac", "ogg", "aiff", "aac"],
+        )
         .pick_file(move |path| {
             let _ = tx.send(path);
         });
@@ -1139,6 +1396,293 @@ async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
 
 // ── Audio Recording ───────────────────────────────────────────────────────
 
+fn recordings_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let directory = app_dir.join("recordings");
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    Ok(directory)
+}
+
+const TWO_HOUR_RECORDING_BYTES: u64 = 48_000 * 2 * 60 * 60 * 2;
+const RECORDING_FREE_SPACE_RESERVE: u64 = 128 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+fn available_disk_space(path: &Path) -> Result<u64, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "Could not check available storage for recording".to_string())?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
+    if result != 0 {
+        return Err("Could not check available storage for recording".into());
+    }
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn available_disk_space(_path: &Path) -> Result<u64, String> {
+    Ok(u64::MAX)
+}
+
+fn ensure_recording_space(app: &AppHandle) -> Result<(), String> {
+    let directory = recordings_dir(app)?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|_| "Gist could not prepare its recordings folder.".to_string())?;
+    let available = available_disk_space(&directory)?;
+    let needed = TWO_HOUR_RECORDING_BYTES + RECORDING_FREE_SPACE_RESERVE;
+    if available < needed {
+        return Err("Not enough free storage to safely record a two-hour session. Free at least 800 MB, then try again.".into());
+    }
+    Ok(())
+}
+
+fn map_recording_job(row: &Row) -> rusqlite::Result<RecordingJob> {
+    let formats_json: String = row.get(4)?;
+    let formats = serde_json::from_str(&formats_json).unwrap_or_default();
+    Ok(RecordingJob {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        audio_file: row.get(2)?,
+        input_kind: row.get(3)?,
+        formats,
+        llm_model: row.get(5)?,
+        thinking: row.get::<_, i64>(6)? != 0,
+        diarize: row.get::<_, i64>(7)? != 0,
+        created_session: row.get::<_, i64>(8)? != 0,
+        state: row.get(9)?,
+        error: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+const RECORDING_JOB_COLUMNS: &str = "id, session_id, audio_file, input_kind, formats_json, llm_model, thinking, diarize, created_session, state, error, created_at, updated_at";
+
+fn get_recording_job_by_id(conn: &Connection, id: &str) -> Result<RecordingJob, String> {
+    let sql = format!(
+        "SELECT {} FROM recording_jobs WHERE id = ?1",
+        RECORDING_JOB_COLUMNS
+    );
+    conn.query_row(&sql, params![id], map_recording_job)
+        .map_err(|e| e.to_string())
+}
+
+fn repair_partial_wav(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if metadata.len() < 44 {
+        return Err("The interrupted recording is too short to recover.".into());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header).map_err(|e| e.to_string())?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err("The interrupted recording is not a WAV file Gist can recover.".into());
+    }
+    let riff_size = (metadata.len() - 8) as u32;
+    let data_size = (metadata.len() - 44) as u32;
+    file.seek(SeekFrom::Start(4)).map_err(|e| e.to_string())?;
+    file.write_all(&riff_size.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(40)).map_err(|e| e.to_string())?;
+    file.write_all(&data_size.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn managed_recording_path(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
+    let root = recordings_dir(app)?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let candidate = PathBuf::from(path);
+    let parent = candidate.parent().ok_or("Invalid recording path")?;
+    let canonical_parent = parent.canonicalize().map_err(|e| e.to_string())?;
+    if canonical_parent != root {
+        return Err(
+            "Refusing to operate on an audio file outside Gist's recordings folder.".into(),
+        );
+    }
+    Ok(candidate)
+}
+
+fn audio_paths_for_session(conn: &Connection, session_id: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT audio_file FROM session_inputs WHERE session_id = ?1 AND audio_file IS NOT NULL
+         UNION
+         SELECT audio_file FROM recording_jobs WHERE session_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let paths = stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(paths)
+}
+
+fn audio_paths_for_patient(conn: &Connection, patient_id: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT si.audio_file FROM session_inputs si
+         JOIN sessions s ON s.id = si.session_id
+         WHERE s.patient_id = ?1 AND si.audio_file IS NOT NULL
+         UNION
+         SELECT r.audio_file FROM recording_jobs r
+         JOIN sessions s ON s.id = r.session_id
+         WHERE s.patient_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let paths = stmt
+        .query_map(params![patient_id], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(paths)
+}
+
+fn remove_managed_audio_files(app: &AppHandle, paths: Vec<String>) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for source in paths {
+        let Ok(path) = managed_recording_path(app, &source) else {
+            continue;
+        };
+        if path.exists() {
+            if let Err(error) = std::fs::remove_file(&path) {
+                failures.push(format!("{} ({})", path.display(), error));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "The record was deleted, but Gist could not remove its managed audio file(s): {}",
+            failures.join(", ")
+        ))
+    }
+}
+
+#[tauri::command]
+async fn list_recoverable_recording_jobs(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+) -> Result<Vec<RecordingJob>, String> {
+    let active_job_id = audio::recorder::get_recording_state().job_id;
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT {} FROM recording_jobs WHERE state IN ('recording', 'recorded', 'failed') ORDER BY created_at ASC",
+        RECORDING_JOB_COLUMNS
+    );
+    let mut stmt = db.conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let jobs = stmt
+        .query_map([], map_recording_job)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+
+    let now = Local::now().to_rfc3339();
+    let mut recovered = Vec::with_capacity(jobs.len());
+    for mut job in jobs {
+        if job.state == "recording" && active_job_id.as_deref() == Some(job.id.as_str()) {
+            continue;
+        }
+        if job.state == "recording" {
+            let partial_path = managed_recording_path(&app, &job.audio_file)?;
+            match repair_partial_wav(&partial_path) {
+                Ok(()) => {
+                    let final_path =
+                        partial_path.with_file_name(format!("recording_{}.wav", job.id));
+                    std::fs::rename(&partial_path, &final_path).map_err(|e| e.to_string())?;
+                    job.audio_file = final_path.to_string_lossy().into_owned();
+                    job.state = "recorded".into();
+                    job.error = Some("Recording was recovered after Gist closed unexpectedly. Please review it before processing.".into());
+                    job.updated_at = now.clone();
+                    db.conn.execute(
+                        "UPDATE recording_jobs SET audio_file = ?1, state = ?2, error = ?3, updated_at = ?4 WHERE id = ?5",
+                        params![job.audio_file, job.state, job.error, job.updated_at, job.id],
+                    ).map_err(|e| e.to_string())?;
+                }
+                Err(error) => {
+                    job.state = "failed".into();
+                    job.error = Some(error);
+                    job.updated_at = now.clone();
+                    db.conn.execute(
+                        "UPDATE recording_jobs SET state = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+                        params![job.state, job.error, job.updated_at, job.id],
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        recovered.push(job);
+    }
+    Ok(recovered)
+}
+
+#[tauri::command]
+async fn get_recording_job(
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<RecordingJob, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    get_recording_job_by_id(&db.conn, &id)
+}
+
+#[tauri::command]
+async fn complete_recording_job(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.conn.execute(
+        "UPDATE recording_jobs SET state = 'completed', error = NULL, updated_at = ?1 WHERE id = ?2",
+        params![Local::now().to_rfc3339(), id],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_recording_job_error(
+    db: State<'_, Mutex<Database>>,
+    id: String,
+    error: String,
+) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.conn.execute(
+        "UPDATE recording_jobs SET state = 'recorded', error = ?1, updated_at = ?2 WHERE id = ?3",
+        params![error, Local::now().to_rfc3339(), id],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn discard_recording_job(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let job = get_recording_job_by_id(&db.conn, &id)?;
+    let path = managed_recording_path(&app, &job.audio_file)?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    db.conn
+        .execute("DELETE FROM recording_jobs WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    if job.created_session {
+        db.conn.execute(
+            "DELETE FROM sessions WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM session_inputs WHERE session_id = ?1) AND NOT EXISTS (SELECT 1 FROM session_notes WHERE session_id = ?1)",
+            params![job.session_id],
+        ).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn list_audio_devices() -> Result<Vec<audio::AudioDeviceInfo>, String> {
     audio::list_audio_devices().map_err(|e| e.to_string())
@@ -1147,15 +1691,69 @@ async fn list_audio_devices() -> Result<Vec<audio::AudioDeviceInfo>, String> {
 #[tauri::command]
 async fn start_recording(
     app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    data: StartRecordingData,
     mic_device: Option<String>,
     system_device: Option<String>,
-) -> Result<(), String> {
-    audio::recorder::start_recording(app, mic_device, system_device).map_err(|e| e.to_string())
+) -> Result<RecordingJob, String> {
+    ensure_recording_space(&app)?;
+    let id = Uuid::new_v4().to_string();
+    let partial_path = recordings_dir(&app)?.join(format!("recording_{}.partial.wav", id));
+    let now = Local::now().to_rfc3339();
+    let formats_json = serde_json::to_string(&data.formats).map_err(|e| e.to_string())?;
+    {
+        let db = db.lock().map_err(|e| e.to_string())?;
+        db.conn.execute(
+            "INSERT INTO recording_jobs (id, session_id, audio_file, input_kind, formats_json, llm_model, thinking, diarize, created_session, state, error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'recording', NULL, ?10, ?10)",
+            params![
+                id, data.session_id, partial_path.to_string_lossy(), data.input_kind, formats_json,
+                data.llm_model, if data.thinking { 1 } else { 0 }, if data.diarize { 1 } else { 0 },
+                if data.created_session { 1 } else { 0 }, now
+            ],
+        ).map_err(|e| e.to_string())?;
+    }
+    if let Err(error) = audio::recorder::start_recording(
+        app.clone(),
+        mic_device,
+        system_device,
+        id.clone(),
+        partial_path.clone(),
+    ) {
+        let db = db.lock().map_err(|e| e.to_string())?;
+        let _ = db.conn.execute(
+            "UPDATE recording_jobs SET state = 'failed', error = ?1, updated_at = ?2 WHERE id = ?3",
+            params![error.to_string(), Local::now().to_rfc3339(), id],
+        );
+        return Err(error.to_string());
+    }
+    let db = db.lock().map_err(|e| e.to_string())?;
+    get_recording_job_by_id(&db.conn, &id)
 }
 
 #[tauri::command]
-async fn stop_recording(app: AppHandle) -> Result<audio::recorder::StopRecordingResult, String> {
-    audio::recorder::stop_recording(app).map_err(|e| e.to_string())
+async fn stop_recording(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+) -> Result<audio::recorder::StopRecordingResult, String> {
+    let result = audio::recorder::stop_recording(app.clone()).map_err(|e| e.to_string())?;
+    let partial_path = managed_recording_path(&app, &result.file_path)?;
+    let final_path = partial_path.with_file_name(format!("recording_{}.wav", result.job_id));
+    std::fs::rename(&partial_path, &final_path).map_err(|e| e.to_string())?;
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.conn.execute(
+        "UPDATE recording_jobs SET audio_file = ?1, state = 'recorded', error = NULL, updated_at = ?2 WHERE id = ?3",
+        params![final_path.to_string_lossy(), Local::now().to_rfc3339(), result.job_id],
+    ).map_err(|e| e.to_string())?;
+    let finalized = audio::recorder::StopRecordingResult {
+        job_id: result.job_id,
+        file_path: final_path.to_string_lossy().into_owned(),
+        duration_seconds: result.duration_seconds,
+        is_short_recording: result.is_short_recording,
+    };
+    app.emit("recording-stopped", &finalized)
+        .map_err(|e| e.to_string())?;
+    Ok(finalized)
 }
 
 #[tauri::command]
@@ -1187,11 +1785,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            let db = Database::new(&handle)
-                .map_err(|e| {
-                    eprintln!("Failed to initialize database: {}", e);
-                    e
-                })?;
+            let db = Database::new(&handle).map_err(|e| {
+                log::error!(target: "gist.database", "event=database_initialization_failed");
+                e
+            })?;
             app.manage(Mutex::new(db));
             app.manage(Arc::new(Mutex::new(SidecarState {
                 request_tx: None,
@@ -1232,6 +1829,11 @@ pub fn run() {
             delete_note_format,
             reset_note_format,
             toggle_note_format_hidden,
+            list_recoverable_recording_jobs,
+            get_recording_job,
+            complete_recording_job,
+            set_recording_job_error,
+            discard_recording_job,
             list_audio_devices,
             start_recording,
             stop_recording,

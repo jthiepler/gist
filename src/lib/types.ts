@@ -8,6 +8,10 @@ export interface Session {
   id: string;
   patient_id: string;
   date: string;
+  start_time: string | null;
+  title: string | null;
+  session_type: string | null;
+  updated_at: string | null;
   created_at: string;
   inputs: SessionInput[];
   notes: SessionNote[];
@@ -38,6 +42,22 @@ export interface SessionNote {
   note: string | null;
   llm_model: string | null;
   created_at: string;
+}
+
+export interface RecordingJob {
+  id: string;
+  session_id: string;
+  audio_file: string;
+  input_kind: SessionInputKind | string;
+  formats: string[];
+  llm_model: string;
+  thinking: boolean;
+  diarize: boolean;
+  created_session: boolean;
+  state: "recording" | "recorded" | "failed" | "completed" | string;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface SidecarProgress {

@@ -3,6 +3,7 @@ pub mod devices;
 pub mod mic_capture;
 pub mod mixer;
 pub mod recorder;
+pub mod resampler;
 pub mod wav_writer;
 
 pub use devices::{enumerate_devices as list_audio_devices, AudioDeviceInfo};

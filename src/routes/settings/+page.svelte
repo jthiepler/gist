@@ -1,23 +1,19 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     deleteModel,
     downloadModel,
     listModels,
-    setSetting,
-    startSidecar,
-    stopSidecar,
   } from "$lib/rpc";
   import {
     activeOperation,
-    darkMode,
+    appearance,
     progressPercent,
     progressStage,
     sidecarBusy,
-    sidecarRunning,
   } from "$lib/stores";
   import { ensureSidecar } from "$lib/ensureSidecar";
-  import { loadSettings, saveSettings } from "$lib/settings";
+  import { loadSettings, saveSetting } from "$lib/settings";
   import type { ModelsResult } from "$lib/types";
 
   let models = $state<ModelsResult | null>(null);
@@ -26,8 +22,15 @@
   let thinking = $state(false);
   let selectedLlm = $state("");
   let error = $state("");
-  let saved = $state(false);
-  let showAdvanced = $state(false);
+  let saveState = $state<"idle" | "saving" | "saved">("idle");
+  let pendingSaves = 0;
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let saveQueue: Promise<void> = Promise.resolve();
+  let confirmRecordingConsent = $state(true);
+
+  onDestroy(() => {
+    if (saveTimer) clearTimeout(saveTimer);
+  });
 
   async function refreshModels() {
     models = await listModels();
@@ -53,7 +56,8 @@
     const s = await loadSettings();
     if (s.defaultLlm) selectedLlm = s.defaultLlm;
     thinking = s.thinking;
-    darkMode.set(s.darkMode);
+    confirmRecordingConsent = s.confirmRecordingConsent;
+    appearance.set(s.appearance);
   });
 
   async function handleDownload(model: string) {
@@ -68,8 +72,6 @@
     try {
       await downloadModel(model);
       await refreshModels();
-      saved = true;
-      setTimeout(() => (saved = false), 3000);
     } catch (e) {
       const msg = String(e);
       error =
@@ -107,56 +109,81 @@
     }
   }
 
-  function selectModel(name: string) {
+  async function persistSetting(key: string, value: string) {
+    pendingSaves += 1;
+    saveState = "saving";
+    if (saveTimer) clearTimeout(saveTimer);
+    error = "";
+
+    const save = saveQueue.then(() => saveSetting(key, value));
+    saveQueue = save.catch(() => {});
+    let succeeded = false;
+
+    try {
+      await save;
+      succeeded = true;
+    } catch (e) {
+      error = `Could not save setting: ${String(e)}`;
+    } finally {
+      pendingSaves -= 1;
+      if (pendingSaves > 0) {
+        saveState = "saving";
+      } else if (succeeded) {
+        saveState = "saved";
+        saveTimer = setTimeout(() => (saveState = "idle"), 2400);
+      } else {
+        saveState = "idle";
+      }
+    }
+  }
+
+  async function selectModel(name: string) {
     selectedLlm = name;
+    await persistSetting("default_llm", name);
   }
 
-  async function savePreferences() {
-    try {
-      await saveSettings({
-        defaultLlm: selectedLlm,
-        thinking,
-        darkMode: $darkMode,
-      });
-      saved = true;
-      setTimeout(() => (saved = false), 3000);
-    } catch (e) {
-      error = String(e);
-    }
+  async function toggleThinking() {
+    thinking = !thinking;
+    await persistSetting("thinking", String(thinking));
   }
 
-  async function handleRestart() {
-    try {
-      await stopSidecar();
-      sidecarRunning.set(false);
-      await startSidecar();
-      sidecarRunning.set(true);
-    } catch (e) {
-      error = String(e);
-    }
+  async function toggleRecordingConsent() {
+    confirmRecordingConsent = !confirmRecordingConsent;
+    await persistSetting("confirm_recording_consent", String(confirmRecordingConsent));
+  }
+
+  async function setAppearance(value: "system" | "light" | "dark") {
+    appearance.set(value);
+    await persistSetting("appearance", value);
+  }
+
+  function modelRamRecommendation(name: string) {
+    if (name.includes("9b")) return "Recommended for 16GB+ RAM";
+    if (name.includes("4b")) return "Recommended for 8GB+ RAM";
+    return "";
   }
 </script>
 
 <div class="workspace-header">
   <h2>Settings</h2>
-  <div class="header-meta">Manage AI models, appearance, and advanced settings.</div>
+  <div class="header-meta">Manage AI models, appearance, and local privacy settings.</div>
+  <div class="settings-save-status" aria-live="polite">
+    {#if saveState === "saving"}Saving changes…{:else if saveState === "saved"}Changes saved automatically{/if}
+  </div>
 </div>
 
 {#if error}
   <div class="error-banner">{error}</div>
 {/if}
 
-{#if saved}
-  <div class="success-banner">Saved.</div>
-{/if}
-
 <div class="settings-section">
-  <h3>AI models</h3>
-  <p class="text-muted settings-help">Manage the local model used to write notes.</p>
+  <h3>Note generation</h3>
 
-  {#if models}
-    <div class="model-group">
-      <div class="model-group-title">Note-writing model</div>
+  <div class="model-group">
+    <div class="model-group-title">Note-writing model</div>
+    <p class="text-muted settings-help">Models are downloaded once and run on this device for note generation.</p>
+
+    {#if models}
       <table class="model-table">
         <thead>
           <tr>
@@ -172,9 +199,23 @@
               class="model-row {info.downloaded ? 'model-available' : 'model-not-downloaded'}"
               class:model-selected={selectedLlm === name}
               onclick={() => info.downloaded && selectModel(name)}
+              onkeydown={(event) => {
+                if (info.downloaded && (event.key === "Enter" || event.key === " ")) {
+                  event.preventDefault();
+                  void selectModel(name);
+                }
+              }}
+              tabindex={info.downloaded ? 0 : undefined}
+              role={info.downloaded ? "button" : undefined}
             >
-              <td>{info.display}</td>
-              <td class="model-desc">{info.description}</td>
+              <td>
+                <div class="model-name">{info.display}</div>
+                <div class="model-lifecycle">{selectedLlm === name ? "Active" : info.downloaded ? "Installed" : downloading === name ? "Downloading" : "Not installed"}</div>
+              </td>
+              <td class="model-desc">
+                <div>{info.description}</div>
+                <div class="model-ram">{modelRamRecommendation(name)}</div>
+              </td>
               <td>{info.size_gb} GB</td>
               <td>
                 {#if info.downloaded}
@@ -186,7 +227,7 @@
                       onclick={(e) => { e.stopPropagation(); handleDelete(name); }}
                       disabled={deleting === name}
                     >
-                      {deleting === name ? "..." : "Delete"}
+                      {deleting === name ? "Removing…" : "Remove"}
                     </button>
                   {/if}
                 {:else}
@@ -195,7 +236,7 @@
                     onclick={(e) => { e.stopPropagation(); handleDownload(name); }}
                     disabled={downloading === name}
                   >
-                    {downloading === name ? "..." : "Download"}
+                    {downloading === name ? "Downloading…" : "Download"}
                   </button>
                 {/if}
               </td>
@@ -203,19 +244,15 @@
           {/each}
         </tbody>
       </table>
-    </div>
+    {:else}
+      <p class="text-muted">Loading models...</p>
+    {/if}
+  </div>
 
-  {:else}
-    <p class="text-muted">Loading models...</p>
-  {/if}
-</div>
-
-<div class="settings-section">
-  <h3>Preferences</h3>
   <div class="settings-row">
     <div>
-      <div class="setting-label">More detailed reasoning</div>
-      <div class="setting-desc">Allows the local model to spend more time reasoning before writing notes.</div>
+      <div class="setting-label">Detailed reasoning</div>
+      <div class="setting-desc">Give the model more time before writing notes.</div>
     </div>
     <button
       type="button"
@@ -223,58 +260,50 @@
       class:active={thinking}
       role="switch"
       aria-checked={thinking}
-      aria-label="More detailed reasoning"
-      onclick={() => (thinking = !thinking)}
+      aria-label="Detailed reasoning"
+      onclick={toggleThinking}
     >
       <div class="toggle-knob"></div>
     </button>
   </div>
 
+</div>
+
+<div class="settings-section">
+  <h3>Appearance</h3>
   <div class="settings-row">
     <div>
-      <div class="setting-label">Dark appearance</div>
-      <div class="setting-desc">Use the darker clinical workspace theme.</div>
+      <div class="setting-label">Appearance</div>
+      <div class="setting-desc">Choose whether Gist follows the system theme or uses a fixed appearance.</div>
+    </div>
+    <select class="appearance-select" value={$appearance} onchange={(event) => setAppearance((event.currentTarget as HTMLSelectElement).value as "system" | "light" | "dark")} aria-label="Appearance">
+      <option value="system">System</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+  </div>
+
+</div>
+
+<div class="settings-section local-privacy-panel">
+  <h3>Local processing and storage</h3>
+  <p class="settings-help">Session audio, transcripts, and generated notes are processed and stored on this device. No session content is sent to a remote AI service.</p>
+  <p class="settings-help">An internet connection may be required to download local model files or application updates.</p>
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Recording consent confirmation</div>
+      <div class="setting-desc">Ask for confirmation before starting a new session recording.</div>
     </div>
     <button
       type="button"
       class="toggle"
-      class:active={$darkMode}
+      class:active={confirmRecordingConsent}
       role="switch"
-      aria-checked={$darkMode}
-      aria-label="Dark appearance"
-      onclick={async () => {
-        darkMode.set(!$darkMode);
-        try {
-          await setSetting("dark_mode", String(!$darkMode));
-        } catch (e) {
-          console.error("Failed to persist dark mode:", e);
-        }
-      }}
+      aria-checked={confirmRecordingConsent}
+      aria-label="Recording consent confirmation"
+      onclick={toggleRecordingConsent}
     >
       <div class="toggle-knob"></div>
     </button>
-  </div>
-
-  <div style="margin-top: 16px;">
-    <button class="btn btn-primary" onclick={savePreferences}>Save Preferences</button>
-  </div>
-</div>
-
-<div class="settings-section">
-  <div class="debug-section">
-    <button class="debug-toggle" onclick={() => (showAdvanced = !showAdvanced)}>
-      <span>Advanced</span>
-      <span>{showAdvanced ? "v" : ">"}</span>
-    </button>
-
-    {#if showAdvanced}
-      <div class="debug-content">
-        <div class="debug-row">
-          <span class="status-dot" class:running={$sidecarRunning} class:stopped={!$sidecarRunning}></span>
-          <span>Local processing: {$sidecarRunning ? "Running" : "Stopped"}</span>
-          <button class="btn btn-sm" onclick={handleRestart} style="margin-left: auto;">Restart</button>
-        </div>
-      </div>
-    {/if}
   </div>
 </div>

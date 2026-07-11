@@ -2,6 +2,7 @@ import {
   transcribe,
   createSessionInput,
   getSession,
+  completeRecordingJob,
 } from "./rpc";
 import {
   SESSION_INPUT_LABELS,
@@ -22,6 +23,10 @@ import type { Session, SessionInputKind } from "./types";
 
 export interface RecordingContext {
   patientId: string;
+  occurrenceDate?: string;
+  startTime?: string;
+  title?: string;
+  sessionType?: string;
   formats: string[];
   defaultLlm: string;
   thinking: boolean;
@@ -30,6 +35,7 @@ export interface RecordingContext {
   session?: Session;
   isNewSession?: boolean;
   regenerateExisting?: boolean;
+  jobId?: string;
 }
 
 function resetProgress() {
@@ -114,6 +120,9 @@ export async function processSessionFromAudio(
     });
     updatedSession = (await getSession(session.id)) ?? session;
     sessionUpdate.set(updatedSession);
+    if (ctx.jobId) {
+      await completeRecordingJob(ctx.jobId);
+    }
   } catch (e) {
     resetProgress();
     throw new Error(`Failed to save session: ${String(e)}`);

@@ -88,7 +88,8 @@ rm -rf src-tauri/resources/gist-sidecar
 cp -R dist/gist-sidecar src-tauri/resources/gist-sidecar
 mkdir -p "$(dirname "$PARAKEET_RESOURCE")"
 rm -rf "$PARAKEET_RESOURCE"
-cp -R "$PARAKEET_SOURCE" "$PARAKEET_RESOURCE"
+mkdir -p "$PARAKEET_RESOURCE"
+rsync -a --exclude='.git' --exclude='.DS_Store' "$PARAKEET_SOURCE/" "$PARAKEET_RESOURCE/"
 mkdir -p "$(dirname "$DIARIZATION_RESOURCE")"
 rm -rf "$DIARIZATION_RESOURCE"
 mkdir -p "$DIARIZATION_RESOURCE"

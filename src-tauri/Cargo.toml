@@ -24,6 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 log = "0.4"
+libc = "=0.2.186"
 
 # Audio recording
 cpal = "0.15.3"
@@ -35,4 +36,3 @@ cidre = { git = "https://github.com/yury/cidre", rev = "a9587fa", features = ["a
 
 [patch.crates-io]
 cpal = { git = "https://github.com/RustAudio/cpal", rev = "51c3b43" }
-

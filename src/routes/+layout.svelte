@@ -4,13 +4,50 @@
   import { invoke } from "@tauri-apps/api/core";
   import { confirm } from "@tauri-apps/plugin-dialog";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { isRunning, startSidecar, onProgress, cancelSidecar, checkIsRecording, getRecordingState, stopRecording, pauseRecording, resumeRecording, onRecordingTick, onRecordingStopped } from "$lib/rpc";
+  import {
+    cancelSidecar,
+    checkIsRecording,
+    getRecordingState,
+    getRecordingJob,
+    isRunning,
+    listRecoverableRecordingJobs,
+    onProgress,
+    onRecordingStopped,
+    onRecordingError,
+    onRecordingTick,
+    pauseRecording,
+    resumeRecording,
+    startSidecar,
+    stopRecording,
+    discardRecordingJob,
+    setRecordingJobError,
+  } from "$lib/rpc";
   import { processSessionFromAudio } from "$lib/processSession";
-  import { patients, selectedPatientId, sidecarRunning, progressPercent, progressStage, progressEta, progressBase, progressScale, darkMode, sidecarBusy, activeOperation, isRecording, recordingPaused, recordingElapsed, recordingLevel, recordingContext, pendingSession, sessionUpdate } from "$lib/stores";
+  import {
+    activeOperation,
+    appearance,
+    darkMode,
+    isRecording,
+    patients,
+    progressBase,
+    progressEta,
+    progressPercent,
+    progressScale,
+    progressStage,
+    recordingContext,
+    recordingElapsed,
+    recordingLevel,
+    recordingPaused,
+    selectedPatientId,
+    sessionUpdate,
+    sidecarBusy,
+    sidecarRunning,
+  } from "$lib/stores";
   import { get } from "svelte/store";
-  import { loadDarkMode } from "$lib/settings";
+  import { loadAppearance } from "$lib/settings";
   import { page } from "$app/stores";
-import type { Patient, Session } from "$lib/types";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import type { Patient, RecordingJob, Session } from "$lib/types";
   import { confirmRegenerateAttachedNotes } from "$lib/confirmations";
 
   let { children } = $props();
@@ -19,10 +56,28 @@ import type { Patient, Session } from "$lib/types";
   let unlistenState: UnlistenFn | null = null;
   let unlistenRecTick: UnlistenFn | null = null;
   let unlistenRecStopped: UnlistenFn | null = null;
+  let unlistenRecError: UnlistenFn | null = null;
   let recordingPollInterval: ReturnType<typeof setInterval> | null = null;
+  let themeMediaQuery: MediaQueryList | null = null;
+  let handleSystemThemeChange: (() => void) | null = null;
   let showAddForm = $state(false);
   let newName = $state("");
   let addError = $state("");
+  let recoverableRecordingJobs = $state<RecordingJob[]>([]);
+  let recordingRecoveryError = $state("");
+  let patientSearch = $state("");
+  let patientSearchInput = $state<HTMLInputElement | null>(null);
+  let filteredPatients = $derived(
+    $patients.filter((patient) =>
+      patient.name.toLocaleLowerCase().includes(patientSearch.trim().toLocaleLowerCase())
+    )
+  );
+
+  function focusPatient(index: number) {
+    const items = [...document.querySelectorAll<HTMLAnchorElement>(".patient-item")];
+    if (items.length === 0) return;
+    items[Math.max(0, Math.min(index, items.length - 1))]?.focus();
+  }
 
   function formatEta(seconds: number): string {
     if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -63,7 +118,105 @@ import type { Patient, Session } from "$lib/types";
     return stage;
   }
 
+  function contextForRecordingJob(job: RecordingJob, session: Session): import("$lib/processSession").RecordingContext {
+    return {
+      patientId: session.patient_id,
+      formats: job.formats,
+      defaultLlm: job.llm_model,
+      thinking: job.thinking,
+      inputKind: job.input_kind as import("$lib/types").SessionInputKind,
+      diarize: job.diarize,
+      session,
+      isNewSession: job.created_session,
+      jobId: job.id,
+    };
+  }
+
+  async function processRecordingJob(job: RecordingJob) {
+    const session = await invoke<Session | null>("get_session", { id: job.session_id });
+    if (!session) throw new Error("The session for this recording is no longer available.");
+    const regenerateExisting = job.created_session
+      ? false
+      : await confirmRegenerateAttachedNotes(session.notes.length);
+    const processedSession = await processSessionFromAudio(
+      job.audio_file,
+      { ...contextForRecordingJob(job, session), regenerateExisting },
+    );
+    sessionUpdate.set(processedSession);
+    recoverableRecordingJobs = recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id);
+  }
+
+  async function handleRecordingStopped(data: { job_id: string; file_path: string; duration_seconds: number; is_short_recording: boolean }) {
+    isRecording.set(false);
+    recordingPaused.set(false);
+    recordingElapsed.set(0);
+    recordingLevel.set(0);
+    recordingContext.set(null);
+
+    try {
+      const job = await getRecordingJob(data.job_id);
+      if (data.is_short_recording) {
+        recordingRecoveryError = "This recording is shorter than five seconds. It was saved, but may not contain enough audio to transcribe. Process it only if that was intentional, or discard it.";
+        recoverableRecordingJobs = [job, ...recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id)];
+        return;
+      }
+      await processRecordingJob(job);
+    } catch (e) {
+      const message = `Gist saved the recording, but could not process it: ${String(e)}`;
+      recordingRecoveryError = message;
+      try {
+        await setRecordingJobError(data.job_id, message);
+        recoverableRecordingJobs = await listRecoverableRecordingJobs();
+      } catch {
+        // The file remains in the managed recordings folder even if its status cannot be updated.
+      }
+    }
+  }
+
+  async function handleRecordingError(data: { message: string }) {
+    isRecording.set(false);
+    recordingPaused.set(false);
+    recordingRecoveryError = `${data.message} Gist stopped recording to protect the saved audio.`;
+    try {
+      await stopRecording();
+    } catch {
+      // The partial recording remains recoverable through the durable job.
+    }
+    try {
+      recoverableRecordingJobs = await listRecoverableRecordingJobs();
+    } catch {
+      // Keep the actionable error even if recovery discovery also fails.
+    }
+  }
+
+  async function retryRecordingJob(job: RecordingJob) {
+    recordingRecoveryError = "";
+    try {
+      await processRecordingJob(job);
+    } catch (e) {
+      const message = `Could not process this recording: ${String(e)}`;
+      recordingRecoveryError = message;
+      await setRecordingJobError(job.id, message);
+      recoverableRecordingJobs = await listRecoverableRecordingJobs();
+    }
+  }
+
+  async function discardRecoveredRecording(job: RecordingJob) {
+    recordingRecoveryError = "";
+    try {
+      await discardRecordingJob(job.id);
+      recoverableRecordingJobs = recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id);
+    } catch (e) {
+      recordingRecoveryError = `Could not discard this recording: ${String(e)}`;
+    }
+  }
+
   onMount(async () => {
+    // Install this before any awaited startup work so a just-stopped recording
+    // is always routed through its durable job.
+    unlistenRecStopped = await onRecordingStopped(handleRecordingStopped);
+    unlistenRecError = await onRecordingError(handleRecordingError);
+
     // Auto-start sidecar silently
     try {
       const running = await isRunning();
@@ -117,7 +270,14 @@ import type { Patient, Session } from "$lib/types";
     });
 
     // Load dark mode setting
-    await loadDarkMode();
+    await loadAppearance();
+    themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    handleSystemThemeChange = () => {
+      if (get(appearance) !== "system") return;
+      darkMode.set(themeMediaQuery?.matches ?? false);
+      document.documentElement.classList.toggle("dark", themeMediaQuery?.matches ?? false);
+    };
+    themeMediaQuery.addEventListener("change", handleSystemThemeChange);
 
     // Recording state sync — recover state after navigation/reload
     try {
@@ -138,46 +298,11 @@ import type { Patient, Session } from "$lib/types";
       recordingLevel.set(data.level);
     });
 
-    // Recording stopped listener — triggers transcription + note generation
-    unlistenRecStopped = await onRecordingStopped(async (data) => {
-      isRecording.set(false);
-      recordingPaused.set(false);
-      recordingElapsed.set(0);
-      recordingLevel.set(0);
-
-      const ctx = get(recordingContext);
-      if (!ctx) {
-        return;
-      }
-      recordingContext.set(null);
-
-      try {
-        const isNewSession = !ctx.session;
-        const session = ctx.session ?? await invoke<Session>("create_session", {
-          data: {
-            patient_id: ctx.patientId,
-            date: new Date().toISOString().slice(0, 10),
-          },
-        });
-        if (isNewSession) {
-          pendingSession.set(session);
-        }
-
-        const regenerateExisting = await confirmRegenerateAttachedNotes(
-          ctx.session?.notes.length ?? 0
-        );
-        const processedSession = await processSessionFromAudio(data.file_path, {
-          ...ctx,
-          session,
-          isNewSession,
-          regenerateExisting,
-        });
-        pendingSession.set(processedSession);
-        sessionUpdate.set(null);
-      } catch (e) {
-        console.error("Session processing failed:", e);
-      }
-    });
+    try {
+      recoverableRecordingJobs = await listRecoverableRecordingJobs();
+    } catch (e) {
+      recordingRecoveryError = `Could not check for interrupted recordings: ${String(e)}`;
+    }
 
     // Fallback polling (every 1s) in case events are missed
     recordingPollInterval = setInterval(async () => {
@@ -199,7 +324,10 @@ import type { Patient, Session } from "$lib/types";
 
   // Apply dark mode class to <html>
   $effect(() => {
-    if ($darkMode) {
+    const systemDark = typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const useDark = $appearance === "dark" || ($appearance === "system" && systemDark);
+    darkMode.set(useDark);
+    if (useDark) {
       document.documentElement.classList.add("dark");
     } else {
       document.documentElement.classList.remove("dark");
@@ -211,7 +339,11 @@ import type { Patient, Session } from "$lib/types";
     unlistenState?.();
     unlistenRecTick?.();
     unlistenRecStopped?.();
+    unlistenRecError?.();
     if (recordingPollInterval) clearInterval(recordingPollInterval);
+    if (themeMediaQuery && handleSystemThemeChange) {
+      themeMediaQuery.removeEventListener("change", handleSystemThemeChange);
+    }
   });
 
   // Sync selectedPatientId from URL
@@ -276,10 +408,21 @@ import type { Patient, Session } from "$lib/types";
   let pathname = $derived($page.url.pathname);
   const isSettings = $derived(pathname === "/settings");
   const isTemplates = $derived(pathname === "/templates");
+
+  function startWindowDrag(event: MouseEvent) {
+    if (event.button !== 0) return;
+    void getCurrentWindow().startDragging().catch((error) => {
+      console.error("Failed to start window drag:", error);
+    });
+  }
 </script>
 
 <div class="app-shell">
-  <div class="window-drag-region" data-tauri-drag-region aria-hidden="true"></div>
+  <div
+    class="window-drag-region"
+    onmousedown={startWindowDrag}
+    role="presentation"
+  ></div>
 
   <aside class="sidebar">
     <div class="sidebar-header">
@@ -288,16 +431,51 @@ import type { Patient, Session } from "$lib/types";
 
     <div class="sidebar-section-label">Patients</div>
 
+    <div class="sidebar-search">
+      <svg class="sidebar-search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <circle cx="11" cy="11" r="7"></circle>
+        <path d="m20 20-4-4"></path>
+      </svg>
+      <input
+        bind:this={patientSearchInput}
+        bind:value={patientSearch}
+        placeholder="Search patients"
+        aria-label="Search patients by name"
+        onkeydown={(event) => {
+          if (event.key === "Escape") patientSearch = "";
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            focusPatient(0);
+          }
+        }}
+      />
+      {#if patientSearch}
+        <button class="sidebar-search-clear" type="button" onclick={() => patientSearch = ""} aria-label="Clear patient search">×</button>
+      {/if}
+    </div>
+
     <div class="patient-list">
-      {#each $patients as patient (patient.id)}
+      {#each filteredPatients as patient, index (patient.id)}
         <a
           href="/patients/{patient.id}"
           class="patient-item"
           class:active={$selectedPatientId === patient.id}
+          onkeydown={(event) => {
+            if (event.key === "ArrowDown") { event.preventDefault(); focusPatient(index + 1); }
+            if (event.key === "ArrowUp") { event.preventDefault(); index === 0 ? patientSearchInput?.focus() : focusPatient(index - 1); }
+            if (event.key === "Home") { event.preventDefault(); focusPatient(0); }
+            if (event.key === "End") { event.preventDefault(); focusPatient(filteredPatients.length - 1); }
+            if (event.key === "Escape") patientSearchInput?.focus();
+          }}
         >
           <span class="patient-name">{patient.name}</span>
         </a>
       {/each}
+      {#if $patients.length === 0}
+        <div class="sidebar-empty">No patients yet.</div>
+      {:else if filteredPatients.length === 0}
+        <div class="sidebar-empty">No patients match <strong>“{patientSearch}”</strong>.</div>
+      {/if}
     </div>
 
     <div class="sidebar-footer">
@@ -337,7 +515,7 @@ import type { Patient, Session } from "$lib/types";
 </div>
 
 {#if $sidecarBusy}
-  <div class="progress-card">
+  <div class="progress-card" role="status" aria-live="polite">
     <div class="progress-card-header">
       <span class="progress-card-title">
         {$activeOperation.label || $progressStage || "Processing..."}
@@ -371,4 +549,22 @@ import type { Patient, Session } from "$lib/types";
       <div class="recording-level-fill" style="width: {Math.min($recordingLevel * 100, 100)}%;"></div>
     </div>
   </div>
+{/if}
+
+{#if recordingRecoveryError || recoverableRecordingJobs.length > 0}
+  <section class="recording-recovery-card" role="alert" aria-live="assertive">
+    <div>
+      <strong>Recording recovery needed</strong>
+      <p>{recordingRecoveryError || "Gist found a recording that was not fully processed. Your audio is kept locally until you choose what to do."}</p>
+    </div>
+    {#each recoverableRecordingJobs as job (job.id)}
+      <div class="recording-recovery-actions">
+        <span>{job.error || "Saved recording awaiting processing"}</span>
+        {#if job.state !== "failed"}
+          <button class="btn btn-sm btn-primary" onclick={() => retryRecordingJob(job)}>Process recording</button>
+        {/if}
+        <button class="btn btn-sm btn-danger" onclick={() => discardRecoveredRecording(job)}>Discard recording</button>
+      </div>
+    {/each}
+  </section>
 {/if}

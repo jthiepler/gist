@@ -26,6 +26,7 @@ export const activeOperation = writable<{ type: string | null; label: string }>(
 
 // Dark mode
 export const darkMode = writable<boolean>(false);
+export const appearance = writable<"system" | "light" | "dark">("system");
 
 // Recording state
 export const isRecording = writable<boolean>(false);
@@ -38,10 +39,7 @@ export const recordingLevel = writable<number>(0);
 // the NewSessionPanel component has been unmounted.
 export const recordingContext = writable<RecordingContext | null>(null);
 
-// Pending session — set by the layout after processing a recording,
-// consumed by the patient page to prepend to its session list.
-export const pendingSession = writable<Session | null>(null);
-
-// Live session update — fires at each step of processing (source material saved,
-// each note generated) so the patient page can update in real time.
+// Latest session snapshot produced by background processing. Keeping the latest
+// value ensures Svelte cannot batch away the final update and lets a newly
+// mounted patient page consume it as well.
 export const sessionUpdate = writable<Session | null>(null);

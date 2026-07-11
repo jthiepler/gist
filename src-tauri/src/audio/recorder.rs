@@ -2,19 +2,23 @@ use crate::audio::core_audio_tap::CoreAudioTapHandle;
 use crate::audio::devices;
 use crate::audio::mic_capture::MicCapture;
 use crate::audio::mixer::Mixer;
+use crate::audio::resampler::LinearResampler;
 use crate::audio::wav_writer::StreamingWavWriter;
 use anyhow::Result;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 
 struct RecordingState {
+    job_id: String,
     mic: Option<MicCapture>,
     tap: Option<CoreAudioTapHandle>,
+    mic_resampler: LinearResampler,
+    tap_resampler: LinearResampler,
     mixer: Mixer,
     wav_writer: Option<StreamingWavWriter>,
     active_started_at: Option<Instant>,
@@ -22,6 +26,7 @@ struct RecordingState {
     is_paused: bool,
     file_path: String,
     tick_handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    _sleep_assertion: SleepAssertion,
 }
 
 unsafe impl Send for RecordingState {}
@@ -29,6 +34,47 @@ unsafe impl Send for RecordingState {}
 static RECORDER: Mutex<Option<RecordingState>> = Mutex::new(None);
 
 const TARGET_SAMPLE_RATE: u32 = 48000;
+const MIN_RECORDING_SECONDS: f64 = 5.0;
+
+/// Keeps macOS awake while audio is being captured. This is deliberately
+/// process-scoped and released automatically when recording stops or fails.
+pub struct SleepAssertion {
+    #[cfg(target_os = "macos")]
+    child: Option<std::process::Child>,
+}
+
+impl SleepAssertion {
+    pub fn acquire(reason: &str) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let child = std::process::Command::new("/usr/bin/caffeinate")
+                .args(["-i", "-m", "-s", "-w"])
+                .arg(std::process::id().to_string())
+                .env("GIST_ACTIVITY_REASON", reason)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+            return Self { child };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = reason;
+            Self {}
+        }
+    }
+}
+
+impl Drop for SleepAssertion {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct RecordingTickPayload {
@@ -38,12 +84,18 @@ pub struct RecordingTickPayload {
 }
 
 #[derive(Clone, Serialize)]
+pub struct RecordingErrorPayload {
+    pub message: String,
+}
+
+#[derive(Clone, Serialize)]
 pub struct RecordingStatePayload {
     pub is_recording: bool,
     pub is_paused: bool,
     pub elapsed_seconds: f64,
     pub has_recording: bool,
     pub file_path: Option<String>,
+    pub job_id: Option<String>,
 }
 
 pub fn is_recording() -> bool {
@@ -67,35 +119,36 @@ pub fn get_recording_state() -> RecordingStatePayload {
     } else {
         None
     };
+    let job_id = if let Some(ref state) = *recorder {
+        Some(state.job_id.clone())
+    } else {
+        None
+    };
     RecordingStatePayload {
         is_recording: IS_RECORDING.load(Ordering::Acquire),
         is_paused,
         elapsed_seconds: elapsed,
         has_recording: recorder.is_some(),
         file_path,
+        job_id,
     }
 }
 
 pub fn start_recording(
     app: AppHandle,
     mic_device: Option<String>,
-    _system_device: Option<String>,
+    system_device: Option<String>,
+    job_id: String,
+    file_path: std::path::PathBuf,
 ) -> Result<()> {
-    if IS_RECORDING.load(Ordering::Acquire) {
+    if IS_RECORDING.load(Ordering::Acquire)
+        || RECORDER
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Recording state is unavailable"))?
+            .is_some()
+    {
         anyhow::bail!("Recording is already in progress");
     }
-
-    eprintln!("Recorder: Starting recording...");
-
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| anyhow::anyhow!("Failed to get app data dir: {}", e))?;
-    let recordings_dir = app_data_dir.join("recordings");
-    std::fs::create_dir_all(&recordings_dir)?;
-
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let file_path = recordings_dir.join(format!("recording_{}.wav", timestamp));
 
     let wav_writer = StreamingWavWriter::create(&file_path, TARGET_SAMPLE_RATE)?;
 
@@ -103,22 +156,11 @@ pub fn start_recording(
 
     // Start mic capture
     let mic = match devices::resolve_input_device(mic_device.as_deref()) {
-        Ok(device) => {
-            match MicCapture::create(&device, TARGET_SAMPLE_RATE) {
-                Ok(mic) => {
-                    eprintln!("Recorder: Mic capture started");
-                    Some(mic)
-                }
-                Err(e) => {
-                    eprintln!("Recorder: Failed to start mic capture: {}", e);
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Recorder: Failed to resolve input device: {}", e);
-            None
-        }
+        Ok(device) => match MicCapture::create(&device, TARGET_SAMPLE_RATE) {
+            Ok(mic) => Some(mic),
+            Err(_) => None,
+        },
+        Err(_) => None,
     };
 
     if mic.is_none() {
@@ -127,22 +169,19 @@ pub fn start_recording(
     }
 
     // Start system audio tap (macOS)
-    let tap = match CoreAudioTapHandle::create() {
-        Ok(tap) => {
-            eprintln!("Recorder: System audio tap started");
-            Some(tap)
-        }
-        Err(e) => {
-            eprintln!("Recorder: Failed to start system audio tap: {} — mic-only mode", e);
-            None
-        }
+    let tap = match CoreAudioTapHandle::create(system_device.as_deref()) {
+        Ok(tap) => Some(tap),
+        Err(_) => None,
     };
 
     let file_path_str = file_path.to_string_lossy().to_string();
 
     let state = RecordingState {
+        job_id: job_id.clone(),
         mic,
         tap,
+        mic_resampler: LinearResampler::new(TARGET_SAMPLE_RATE, TARGET_SAMPLE_RATE),
+        tap_resampler: LinearResampler::new(TARGET_SAMPLE_RATE, TARGET_SAMPLE_RATE),
         mixer,
         wav_writer: Some(wav_writer),
         active_started_at: Some(Instant::now()),
@@ -150,6 +189,7 @@ pub fn start_recording(
         is_paused: false,
         file_path: file_path_str.clone(),
         tick_handle: None,
+        _sleep_assertion: SleepAssertion::acquire("Gist is recording session audio"),
     };
 
     {
@@ -179,7 +219,19 @@ pub fn start_recording(
                         drain_and_discard(state);
                         0.0
                     } else {
-                        let mixed = drain_and_write(state);
+                        let mixed = match drain_and_write(state) {
+                            Ok(mixed) => mixed,
+                            Err(error) => {
+                                IS_RECORDING.store(false, Ordering::Release);
+                                let _ = app_handle.emit(
+                                    "recording-error",
+                                    RecordingErrorPayload {
+                                        message: error.to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                        };
                         compute_level(&mixed)
                     };
 
@@ -205,7 +257,6 @@ pub fn start_recording(
         }
     }
 
-    eprintln!("Recorder: Recording started to {}", file_path_str);
     Ok(())
 }
 
@@ -217,43 +268,54 @@ fn recorded_elapsed(state: &RecordingState) -> Duration {
             .unwrap_or(Duration::ZERO)
 }
 
-fn drain_inputs(state: &mut RecordingState) {
+fn drain_inputs(state: &mut RecordingState) -> Result<()> {
     if let Some(ref mut mic) = state.mic {
+        if let Some(error) = mic.error() {
+            anyhow::bail!(error);
+        }
         let mic_samples = mic.drain();
         if !mic_samples.is_empty() {
-            state.mixer.add_mic(&mic_samples);
+            let samples = state
+                .mic_resampler
+                .resample(&mic_samples, mic.sample_rate());
+            state.mixer.add_mic(&samples);
         }
     }
 
     if let Some(ref mut tap) = state.tap {
-        let sys_samples = tap.pop_batch(48000);
+        if let Some(error) = tap.error() {
+            anyhow::bail!(error);
+        }
+        let sys_samples = tap.pop_batch(TARGET_SAMPLE_RATE as usize);
         if !sys_samples.is_empty() {
-            state.mixer.add_sys(&sys_samples);
+            let samples = state
+                .tap_resampler
+                .resample(&sys_samples, tap.sample_rate());
+            state.mixer.add_sys(&samples);
         }
     }
+    Ok(())
 }
 
 fn drain_and_discard(state: &mut RecordingState) {
-    drain_inputs(state);
+    let _ = drain_inputs(state);
     let _ = state.mixer.drain_mixed();
 }
 
-fn drain_and_write(state: &mut RecordingState) -> Vec<f32> {
-    drain_inputs(state);
+fn drain_and_write(state: &mut RecordingState) -> Result<Vec<f32>> {
+    drain_inputs(state)?;
 
     let mixed = state.mixer.drain_mixed();
     if !mixed.is_empty() {
         let should_flush = recorded_elapsed(state).as_secs() % 5 == 0;
         if let Some(ref mut writer) = state.wav_writer {
-            if let Err(e) = writer.write_samples(&mixed) {
-                eprintln!("Recorder: WAV write error: {}", e);
-            }
+            writer.write_samples(&mixed)?;
             if should_flush {
-                let _ = writer.flush();
+                writer.flush()?;
             }
         }
     }
-    mixed
+    Ok(mixed)
 }
 
 fn compute_level(samples: &[f32]) -> f32 {
@@ -280,7 +342,7 @@ pub fn pause_recording(app: AppHandle) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("No recording state found"))?;
 
         if !state.is_paused {
-            drain_and_write(state);
+            drain_and_write(state)?;
             if let Some(started_at) = state.active_started_at.take() {
                 state.accumulated_elapsed += started_at.elapsed();
             }
@@ -330,20 +392,16 @@ pub fn resume_recording(app: AppHandle) -> Result<()> {
 
 #[derive(Clone, Serialize)]
 pub struct StopRecordingResult {
+    pub job_id: String,
     pub file_path: String,
     pub duration_seconds: f64,
+    pub is_short_recording: bool,
 }
 
-pub fn stop_recording(app: AppHandle) -> Result<StopRecordingResult> {
-    if !IS_RECORDING.load(Ordering::Acquire) {
-        anyhow::bail!("No recording in progress");
-    }
-
-    eprintln!("Recorder: Stopping recording...");
-
+pub fn stop_recording(_app: AppHandle) -> Result<StopRecordingResult> {
     IS_RECORDING.store(false, Ordering::Release);
 
-    let (file_path, duration) = {
+    let (job_id, file_path, duration) = {
         let mut recorder = RECORDER.lock().unwrap();
         let state = recorder
             .take()
@@ -358,7 +416,7 @@ pub fn stop_recording(app: AppHandle) -> Result<StopRecordingResult> {
         if state.is_paused {
             drain_and_discard(&mut state);
         } else {
-            drain_and_write(&mut state);
+            drain_and_write(&mut state)?;
             if let Some(started_at) = state.active_started_at.take() {
                 state.accumulated_elapsed += started_at.elapsed();
             }
@@ -373,24 +431,13 @@ pub fn stop_recording(app: AppHandle) -> Result<StopRecordingResult> {
         }
 
         let duration = state.accumulated_elapsed.as_secs_f64();
-        (state.file_path.clone(), duration)
+        (state.job_id.clone(), state.file_path.clone(), duration)
     };
 
-    let _ = app.emit(
-        "recording-stopped",
-        serde_json::json!({
-            "file_path": file_path,
-            "duration_seconds": duration,
-        }),
-    );
-
-    eprintln!(
-        "Recorder: Recording stopped, file: {}, duration: {:.1}s",
-        file_path, duration
-    );
-
     Ok(StopRecordingResult {
+        job_id,
         file_path,
         duration_seconds: duration,
+        is_short_recording: duration < MIN_RECORDING_SECONDS,
     })
 }
