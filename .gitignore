@@ -1,42 +1,66 @@
+# macOS
 .DS_Store
 
-# Node / Svelte
-node_modules
-/build
-/.svelte-kit
-/package
-.env
-.env.*
-!.env.example
+# Node / Svelte / Vite
+node_modules/
+/build/
+/.svelte-kit/
+/package/
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
-# Python
-.venv
-__pycache__/
-*.pyc
-*.pyo
-/dist
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+.serena/
 
-# PyInstaller sidecar build output
-/dist/gist-sidecar
-/src-tauri/resources/
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python / PyInstaller build output
+/dist/
+/build/
+*.spec.bak
 
 # Rust / Tauri
-/src-tauri/target
-/src-tauri/gen
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/resources/
 
-# Logs
+# Local model checkouts and model caches
+/speaker-diarization-community-1/
+/parakeet-tdt-0.6b-v3-mlx-4bit/
+.cache/
+/.cache/
+/models/
+*.safetensors
+
+# Logs and local databases
 *.log
+*.db
+*.sqlite
+*.sqlite3
 
-# Test scratch
+# Recordings and other local clinical/sample data
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.aac
+*.aiff
+*.caf
+/recordings/
+/samples/
 test*.md
 
-# Reference codebase
-/meetily
-
-# Local PyAnnote model checkout (large, gated model artifacts)
-/speaker-diarization-community-1/
-
-# Local quantized Parakeet model checkout (bundled during macOS builds)
-/parakeet-tdt-0.6b-v3-mlx-4bit/
+# Local reference checkout
+/meetily/
