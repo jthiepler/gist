@@ -2,6 +2,8 @@ use chrono::Local;
 use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -35,7 +37,7 @@ fn map_session(row: &Row) -> rusqlite::Result<Session> {
 
 fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Result<Vec<SessionInput>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, language, transcription_model, include_in_notes, created_at, updated_at
+        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, transcription_model, include_in_notes, created_at, updated_at
          FROM session_inputs
          WHERE session_id = ?1
          ORDER BY created_at ASC",
@@ -51,11 +53,10 @@ fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Result<Vec<Sessi
                 text: row.get(5)?,
                 audio_file: row.get(6)?,
                 duration_seconds: row.get(7)?,
-                language: row.get(8)?,
-                transcription_model: row.get(9)?,
-                include_in_notes: row.get::<_, i64>(10)? != 0,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
+                transcription_model: row.get(8)?,
+                include_in_notes: row.get::<_, i64>(9)? != 0,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -120,7 +121,6 @@ impl Database {
                 text TEXT NOT NULL,
                 audio_file TEXT,
                 duration_seconds REAL,
-                language TEXT,
                 transcription_model TEXT,
                 include_in_notes INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
@@ -234,7 +234,6 @@ struct SessionInput {
     text: String,
     audio_file: Option<String>,
     duration_seconds: Option<f64>,
-    language: Option<String>,
     transcription_model: Option<String>,
     include_in_notes: bool,
     created_at: String,
@@ -335,8 +334,6 @@ struct CreateSessionInput {
     audio_file: Option<String>,
     #[serde(default)]
     duration_seconds: Option<f64>,
-    #[serde(default)]
-    language: Option<String>,
     #[serde(default)]
     transcription_model: Option<String>,
     #[serde(default = "default_include_in_notes")]
@@ -666,7 +663,7 @@ async fn rpc_call(
     state: State<'_, SharedSidecarState>,
     request: String,
 ) -> Result<Value, String> {
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
     let request_id = Uuid::new_v4().to_string();
     let mut request_value: Value = serde_json::from_str(&request)
         .map_err(|_| "Invalid request for processing engine".to_string())?;
@@ -715,7 +712,7 @@ async fn rpc_call(
 
     emit_sidecar_state(&app, true);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(600), &mut rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
             let mut s = state.lock().map_err(|e| e.to_string())?;
@@ -727,9 +724,29 @@ async fn rpc_call(
             Err("Sidecar response channel closed".into())
         }
         Err(_) => {
-            let mut s = state.lock().map_err(|e| e.to_string())?;
-            if s.response_tx.as_ref().map(|(id, _)| id) == Some(&request_id) {
+            let cancel_tx = {
+                let s = state.lock().map_err(|e| e.to_string())?;
+                s.request_tx.clone()
+            };
+            if let Some(tx) = cancel_tx {
+                let _ = tx.send(r#"{"type":"cancel"}"#.to_string());
+            }
+
+            // Give cooperative MLX cancellation a short chance to unwind. If it
+            // remains stuck, stop the process; ensureSidecar will start a fresh
+            // one before the next operation.
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut rx)
+                .await
+                .is_err()
+            {
+                let mut s = state.lock().map_err(|e| e.to_string())?;
+                s.request_tx.take();
                 s.response_tx.take();
+                if let Some(mut child) = s.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                s.started = false;
                 s.busy = false;
             }
             emit_sidecar_state(&app, false);
@@ -739,10 +756,40 @@ async fn rpc_call(
 }
 
 #[tauri::command]
-async fn cancel_sidecar(state: State<'_, SharedSidecarState>) -> Result<(), String> {
-    let s = state.lock().map_err(|e| e.to_string())?;
-    if let Some(tx) = &s.request_tx {
-        let _ = tx.send(r#"{"type":"cancel"}"#.to_string());
+async fn cancel_sidecar(
+    app: AppHandle,
+    state: State<'_, SharedSidecarState>,
+) -> Result<(), String> {
+    let active_request_id = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        let active_request_id = s.response_tx.as_ref().map(|(id, _)| id.clone());
+        if let Some(tx) = &s.request_tx {
+            let _ = tx.send(r#"{"type":"cancel"}"#.to_string());
+        }
+        active_request_id
+    };
+
+    let Some(active_request_id) = active_request_id else {
+        return Ok(());
+    };
+
+    // MLX normally observes the cancellation between generated tokens. Prompt
+    // prefill can hold control for longer, so force-stop only if this exact
+    // request is still active after a short cooperative grace period.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    if s.response_tx.as_ref().map(|(id, _)| id) == Some(&active_request_id) {
+        s.request_tx.take();
+        if let Some((_, tx)) = s.response_tx.take() {
+            let _ = tx.send(Err("Operation cancelled".into()));
+        }
+        if let Some(mut child) = s.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        s.started = false;
+        s.busy = false;
+        emit_sidecar_state(&app, false);
     }
     Ok(())
 }
@@ -960,8 +1007,8 @@ async fn create_session_input(
         .execute(
             "INSERT INTO session_inputs (
                 id, session_id, kind, source, title, text, audio_file, duration_seconds,
-                language, transcription_model, include_in_notes, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+                transcription_model, include_in_notes, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
                 id,
                 data.session_id,
@@ -971,7 +1018,6 @@ async fn create_session_input(
                 data.text,
                 data.audio_file,
                 data.duration_seconds,
-                data.language,
                 data.transcription_model,
                 if data.include_in_notes { 1 } else { 0 },
                 now
@@ -1045,7 +1091,7 @@ async fn delete_session_input(
 
 fn get_session_input_by_id(conn: &Connection, id: &str) -> Result<SessionInput, String> {
     conn.query_row(
-        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, language, transcription_model, include_in_notes, created_at, updated_at
+        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, transcription_model, include_in_notes, created_at, updated_at
          FROM session_inputs
          WHERE id = ?1",
         params![id],
@@ -1059,11 +1105,10 @@ fn get_session_input_by_id(conn: &Connection, id: &str) -> Result<SessionInput, 
                 text: row.get(5)?,
                 audio_file: row.get(6)?,
                 duration_seconds: row.get(7)?,
-                language: row.get(8)?,
-                transcription_model: row.get(9)?,
-                include_in_notes: row.get::<_, i64>(10)? != 0,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
+                transcription_model: row.get(8)?,
+                include_in_notes: row.get::<_, i64>(9)? != 0,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         },
     )
@@ -1188,6 +1233,50 @@ async fn set_setting(
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn total_memory_bytes() -> Result<u64, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let name = CString::new("hw.memsize").map_err(|e| e.to_string())?;
+        let mut bytes = 0_u64;
+        let mut size = std::mem::size_of::<u64>();
+        let result = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut bytes as *mut u64).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || size != std::mem::size_of::<u64>() || bytes == 0 {
+            return Err("Could not determine system memory".into());
+        }
+        return Ok(bytes);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if pages <= 0 || page_size <= 0 {
+            return Err("Could not determine system memory".into());
+        }
+        return (pages as u64)
+            .checked_mul(page_size as u64)
+            .ok_or_else(|| "Could not determine system memory".into());
+    }
+
+    #[cfg(not(unix))]
+    {
+        Err("System memory detection is unavailable on this platform".into())
+    }
+}
+
+#[tauri::command]
+async fn get_system_memory_bytes() -> Result<u64, String> {
+    total_memory_bytes()
 }
 
 // ── Note Format Templates ─────────────────────────────────────────────────
@@ -1822,6 +1911,7 @@ pub fn run() {
             set_patient_formats,
             get_setting,
             set_setting,
+            get_system_memory_bytes,
             pick_audio_file,
             list_note_formats,
             create_note_format,

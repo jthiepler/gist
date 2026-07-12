@@ -20,7 +20,6 @@ class TranscriptResult:
     text: str
     segments: List[Segment] = field(default_factory=list)
     duration: float = 0.0
-    language: str = ""
 
 
 ProgressCallback = Callable[..., None]
@@ -35,7 +34,6 @@ class TranscriptionBackend(ABC):
     def transcribe(
         self,
         audio_path: str,
-        language: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> TranscriptResult:

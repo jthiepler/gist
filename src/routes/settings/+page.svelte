@@ -3,6 +3,7 @@
   import {
     deleteModel,
     downloadModel,
+    getSystemMemoryBytes,
     listModels,
   } from "$lib/rpc";
   import {
@@ -13,51 +14,88 @@
     sidecarBusy,
   } from "$lib/stores";
   import { ensureSidecar } from "$lib/ensureSidecar";
+  import {
+    AVAILABLE_LLM_MODELS,
+    createModelState,
+    DEFAULT_LLM,
+    mergeDownloadedState,
+    recommendedLlmForMemory,
+  } from "$lib/models";
   import { loadSettings, saveSetting } from "$lib/settings";
   import type { ModelsResult } from "$lib/types";
 
-  let models = $state<ModelsResult | null>(null);
+  let models = $state<ModelsResult>(createModelState());
+  let modelStatus = $state<"unknown" | "loading" | "ready">("unknown");
   let downloading = $state("");
   let deleting = $state("");
-  let thinking = $state(false);
-  let selectedLlm = $state("");
+  let selectedLlm = $state(DEFAULT_LLM);
   let error = $state("");
   let saveState = $state<"idle" | "saving" | "saved">("idle");
   let pendingSaves = 0;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let saveQueue: Promise<void> = Promise.resolve();
   let confirmRecordingConsent = $state(true);
+  let settingVersions = new Map<string, number>();
+  let sidecarAvailable = false;
+  let modelRefreshInFlight = false;
+  let stopBusySubscription: (() => void) | undefined;
+  let totalMemoryGb = $state<number | null>(null);
+  let recommendedLlm = $derived(
+    totalMemoryGb === null ? null : recommendedLlmForMemory(totalMemoryGb),
+  );
 
   onDestroy(() => {
     if (saveTimer) clearTimeout(saveTimer);
+    sidecarAvailable = false;
+    stopBusySubscription?.();
   });
 
   async function refreshModels() {
-    models = await listModels();
+    if (!sidecarAvailable || $sidecarBusy || modelRefreshInFlight) return;
+    modelRefreshInFlight = true;
+    modelStatus = "loading";
+    try {
+      const result = await listModels();
+      models = mergeDownloadedState(result);
+      modelStatus = "ready";
+    } catch (e) {
+      // The catalog is local and remains usable when the sidecar is busy or
+      // unavailable. A later busy-state transition will retry this refresh.
+      console.warn("Could not refresh model availability:", e);
+      modelStatus = "unknown";
+    } finally {
+      modelRefreshInFlight = false;
+    }
   }
 
   onMount(async () => {
-    const ok = await ensureSidecar();
+    // Settings are local Tauri state and should not wait for Python.
+    const [s, ok] = await Promise.all([
+      loadSettings(),
+      ensureSidecar(),
+      getSystemMemoryBytes()
+        .then((bytes) => {
+          totalMemoryGb = bytes / (1024 ** 3);
+        })
+        .catch((e) => {
+          console.warn("Could not detect system memory:", e);
+        }),
+    ]);
+    if (s.defaultLlm) selectedLlm = s.defaultLlm;
+    confirmRecordingConsent = s.confirmRecordingConsent;
+    appearance.set(s.appearance);
+
+    sidecarAvailable = ok;
     if (!ok) {
-      error = "Failed to start the processing engine.";
+      error = "Failed to start the processing engine. Model availability will be checked when it is running.";
       return;
     }
 
-    try {
-      await refreshModels();
-      if (models && Object.keys(models.llm).length > 0) {
-        selectedLlm = Object.keys(models.llm)[0];
-      }
-    } catch (e) {
-      console.error("Failed to load models:", e);
-      error = "Failed to load models.";
-    }
-
-    const s = await loadSettings();
-    if (s.defaultLlm) selectedLlm = s.defaultLlm;
-    thinking = s.thinking;
-    confirmRecordingConsent = s.confirmRecordingConsent;
-    appearance.set(s.appearance);
+    // Retry after any operation that was already in progress finishes.
+    stopBusySubscription = sidecarBusy.subscribe((busy) => {
+      if (!busy) void refreshModels();
+    });
+    void refreshModels();
   });
 
   async function handleDownload(model: string) {
@@ -109,7 +147,7 @@
     }
   }
 
-  async function persistSetting(key: string, value: string) {
+  async function persistSetting(key: string, value: string): Promise<boolean> {
     pendingSaves += 1;
     saveState = "saving";
     if (saveTimer) clearTimeout(saveTimer);
@@ -135,32 +173,59 @@
         saveState = "idle";
       }
     }
+    return succeeded;
   }
 
   async function selectModel(name: string) {
+    const previous = selectedLlm;
+    const version = (settingVersions.get("default_llm") ?? 0) + 1;
+    settingVersions.set("default_llm", version);
     selectedLlm = name;
-    await persistSetting("default_llm", name);
-  }
-
-  async function toggleThinking() {
-    thinking = !thinking;
-    await persistSetting("thinking", String(thinking));
+    if (!(await persistSetting("default_llm", name)) && settingVersions.get("default_llm") === version) {
+      selectedLlm = previous;
+    }
   }
 
   async function toggleRecordingConsent() {
+    const previous = confirmRecordingConsent;
+    const version = (settingVersions.get("confirm_recording_consent") ?? 0) + 1;
+    settingVersions.set("confirm_recording_consent", version);
     confirmRecordingConsent = !confirmRecordingConsent;
-    await persistSetting("confirm_recording_consent", String(confirmRecordingConsent));
+    if (
+      !(await persistSetting("confirm_recording_consent", String(confirmRecordingConsent))) &&
+      settingVersions.get("confirm_recording_consent") === version
+    ) {
+      confirmRecordingConsent = previous;
+    }
   }
 
   async function setAppearance(value: "system" | "light" | "dark") {
+    const previous = $appearance;
+    const version = (settingVersions.get("appearance") ?? 0) + 1;
+    settingVersions.set("appearance", version);
     appearance.set(value);
-    await persistSetting("appearance", value);
+    if (!(await persistSetting("appearance", value)) && settingVersions.get("appearance") === version) {
+      appearance.set(previous);
+    }
   }
 
-  function modelRamRecommendation(name: string) {
-    if (name.includes("9b")) return "Recommended for 16GB+ RAM";
-    if (name.includes("4b")) return "Recommended for 8GB+ RAM";
-    return "";
+  function isRecommendedModel(name: string) {
+    return name === recommendedLlm;
+  }
+
+  function modelPresentation(name: string, info: ModelsResult["llm"][string]) {
+    return AVAILABLE_LLM_MODELS.find((model) => model.name === name) ?? {
+      title: info.display,
+      caption: info.description,
+      description: info.description,
+    };
+  }
+
+  function modelLifecycle(name: string, info: ModelsResult["llm"][string]) {
+    if (downloading === name) return "Downloading";
+    if (selectedLlm === name) return "Selected";
+    if (info.downloaded === null) return $sidecarBusy ? "Checking when processing finishes" : "Checking availability";
+    return info.downloaded ? "Installed" : "Not installed";
   }
 </script>
 
@@ -173,7 +238,7 @@
 </div>
 
 {#if error}
-  <div class="error-banner">{error}</div>
+  <div class="error-banner" role="alert">{error}</div>
 {/if}
 
 <div class="settings-section">
@@ -183,88 +248,76 @@
     <div class="model-group-title">Note-writing model</div>
     <p class="text-muted settings-help">Models are downloaded once and run on this device for note generation.</p>
 
-    {#if models}
-      <table class="model-table">
-        <thead>
-          <tr>
-            <th style="width: 30%;">Name</th>
-            <th>Description</th>
-            <th style="width: 70px;">Size</th>
-            <th style="width: 110px;"></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each Object.entries(models.llm) as [name, info]}
-            <tr
-              class="model-row {info.downloaded ? 'model-available' : 'model-not-downloaded'}"
-              class:model-selected={selectedLlm === name}
-              onclick={() => info.downloaded && selectModel(name)}
-              onkeydown={(event) => {
-                if (info.downloaded && (event.key === "Enter" || event.key === " ")) {
-                  event.preventDefault();
-                  void selectModel(name);
-                }
-              }}
-              tabindex={info.downloaded ? 0 : undefined}
-              role={info.downloaded ? "button" : undefined}
-            >
-              <td>
-                <div class="model-name">{info.display}</div>
-                <div class="model-lifecycle">{selectedLlm === name ? "Active" : info.downloaded ? "Installed" : downloading === name ? "Downloading" : "Not installed"}</div>
-              </td>
-              <td class="model-desc">
-                <div>{info.description}</div>
-                <div class="model-ram">{modelRamRecommendation(name)}</div>
-              </td>
-              <td>{info.size_gb} GB</td>
-              <td>
-                {#if info.downloaded}
-                  {#if selectedLlm === name}
-                    <span class="model-selected-marker">Selected</span>
-                  {:else}
-                    <button
-                      class="btn btn-sm btn-danger"
-                      onclick={(e) => { e.stopPropagation(); handleDelete(name); }}
-                      disabled={deleting === name}
-                    >
-                      {deleting === name ? "Removing…" : "Remove"}
-                    </button>
-                  {/if}
+    <table class="model-table">
+      <thead>
+        <tr>
+          <th style="width: 30%;">Name</th>
+          <th>What to expect</th>
+          <th style="width: 70px;">Size</th>
+          <th style="width: 110px;"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each Object.entries(models.llm) as [name, info]}
+          {@const presentation = modelPresentation(name, info)}
+          <tr
+            class="model-row {info.downloaded === true ? 'model-available' : 'model-not-downloaded'}"
+            class:model-selected={selectedLlm === name}
+            onclick={() => info.downloaded === true && selectModel(name)}
+            onkeydown={(event) => {
+              if (info.downloaded === true && (event.key === "Enter" || event.key === " ")) {
+                event.preventDefault();
+                void selectModel(name);
+              }
+            }}
+            tabindex={info.downloaded === true ? 0 : undefined}
+            role={info.downloaded === true ? "button" : undefined}
+          >
+            <td>
+              <div class="model-name">{presentation.title}</div>
+              <div class="model-caption">
+                {presentation.caption}{#if isRecommendedModel(name)} · Recommended for this device{/if}
+              </div>
+              <div class="model-lifecycle">{modelLifecycle(name, info)}</div>
+            </td>
+            <td class="model-desc">
+              <div>{presentation.description}</div>
+            </td>
+            <td>{info.size_gb} GB</td>
+            <td>
+              {#if info.downloaded === true}
+                {#if selectedLlm === name}
+                  <span class="model-selected-marker">Selected</span>
                 {:else}
                   <button
-                    class="btn btn-sm btn-primary"
-                    onclick={(e) => { e.stopPropagation(); handleDownload(name); }}
-                    disabled={downloading === name}
+                    class="btn btn-sm btn-danger"
+                    onclick={(e) => { e.stopPropagation(); handleDelete(name); }}
+                    disabled={$sidecarBusy || downloading !== "" || deleting !== ""}
                   >
-                    {downloading === name ? "Downloading…" : "Download"}
+                    {deleting === name ? "Removing…" : "Remove"}
                   </button>
                 {/if}
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    {:else}
-      <p class="text-muted">Loading models...</p>
+              {:else if info.downloaded === false}
+                <button
+                  class="btn btn-sm btn-primary"
+                  onclick={(e) => { e.stopPropagation(); handleDownload(name); }}
+                  disabled={$sidecarBusy || downloading !== "" || deleting !== ""}
+                >
+                  {downloading === name ? "Downloading…" : "Download"}
+                </button>
+              {:else}
+                <button class="btn btn-sm" disabled>
+                  {modelStatus === "loading" ? "Checking…" : "Unavailable"}
+                </button>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+    {#if modelStatus === "unknown" && $sidecarBusy}
+      <p class="text-muted settings-help">Download status will update when the current processing operation finishes.</p>
     {/if}
-  </div>
-
-  <div class="settings-row">
-    <div>
-      <div class="setting-label">Detailed reasoning</div>
-      <div class="setting-desc">Give the model more time before writing notes.</div>
-    </div>
-    <button
-      type="button"
-      class="toggle"
-      class:active={thinking}
-      role="switch"
-      aria-checked={thinking}
-      aria-label="Detailed reasoning"
-      onclick={toggleThinking}
-    >
-      <div class="toggle-knob"></div>
-    </button>
   </div>
 
 </div>

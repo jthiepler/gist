@@ -12,7 +12,6 @@ from pathlib import Path
 import click
 
 from . import __version__
-from .config import DEFAULT_OPENAI_ENDPOINT
 from .formats.registry import list_formats
 from .models import (
     DEFAULT_LLM,
@@ -39,13 +38,12 @@ def cli(ctx, verbose):
 @cli.command()
 @click.argument("audio_file", type=click.Path(exists=True))
 @click.option("-o", "--output", type=click.Path(), help="Write transcript to file (default: stdout).")
-@click.option("--language", help="Force language code (e.g. en, de, fr). Default: auto-detect.")
-def transcribe(audio_file, output, language):
+def transcribe(audio_file, output):
     """Transcribe an audio file to text."""
     from .pipeline import transcribe_audio
 
     click.echo("Transcribing...", err=True)
-    result = transcribe_audio(audio_file, language=language)
+    result = transcribe_audio(audio_file)
 
     output_text = result.text
     if output:
@@ -55,8 +53,7 @@ def transcribe(audio_file, output, language):
         click.echo(output_text)
 
     click.echo(
-        f"\nDuration: {result.duration:.1f}s  |  Language: {result.language}  |  "
-        f"Segments: {len(result.segments)}",
+        f"\nDuration: {result.duration:.1f}s  |  Segments: {len(result.segments)}",
         err=True,
     )
 
@@ -66,11 +63,9 @@ def transcribe(audio_file, output, language):
 @click.option("-f", "--format", "format_name", default="soap", help="Note format name (default: soap). Use 'gist formats' to list available formats.")
 @click.option("-o", "--output", type=click.Path(), help="Write note to file (default: stdout).")
 @click.option("--model", default=DEFAULT_LLM, help=f"LLM model (default: {DEFAULT_LLM}). Use 'gist models' to list.")
-@click.option("--backend", type=click.Choice(["mlx", "openai"]), help="Override backend (mlx, openai). Default: auto-detected from model.")
-@click.option("--endpoint", default=DEFAULT_OPENAI_ENDPOINT, help=f"OpenAI-compatible endpoint (default: {DEFAULT_OPENAI_ENDPOINT})")
-@click.option("--max-tokens", default=16384, help="Maximum tokens for LLM generation (default: 16384)")
-@click.option("--thinking/--no-thinking", default=True, help="Enable or disable chain-of-thought reasoning (default: enabled)")
-def note(transcript_file, format_name, output, model, backend, endpoint, max_tokens, thinking):
+@click.option("--max-tokens", default=4096, help="Maximum tokens for LLM generation (default: 4096)")
+@click.option("--thinking/--no-thinking", default=False, help="Enable or disable chain-of-thought reasoning (default: disabled)")
+def note(transcript_file, format_name, output, model, max_tokens, thinking):
     """Generate a clinical note from a transcript."""
     from .formats.registry import get_format
     from .pipeline import generate_note as _generate_note
@@ -89,8 +84,6 @@ def note(transcript_file, format_name, output, model, backend, endpoint, max_tok
         transcript=transcript,
         format_name=format_name,
         llm_model=model,
-        backend_type=backend,
-        endpoint=endpoint,
         max_tokens=max_tokens,
         thinking=thinking,
     )

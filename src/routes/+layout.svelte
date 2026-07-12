@@ -49,8 +49,10 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import type { Patient, RecordingJob, Session } from "$lib/types";
   import { confirmRegenerateAttachedNotes } from "$lib/confirmations";
+  import Onboarding from "$lib/components/Onboarding.svelte";
 
   let { children } = $props();
+  let onboardingComplete = $state(false);
 
   let unlistenProgress: UnlistenFn | null = null;
   let unlistenState: UnlistenFn | null = null;
@@ -58,6 +60,7 @@
   let unlistenRecStopped: UnlistenFn | null = null;
   let unlistenRecError: UnlistenFn | null = null;
   let recordingPollInterval: ReturnType<typeof setInterval> | null = null;
+  let layoutDestroyed = false;
   let themeMediaQuery: MediaQueryList | null = null;
   let handleSystemThemeChange: (() => void) | null = null;
   let showAddForm = $state(false);
@@ -65,6 +68,7 @@
   let addError = $state("");
   let recoverableRecordingJobs = $state<RecordingJob[]>([]);
   let recordingRecoveryError = $state("");
+  const processingRecordingJobs = new Set<string>();
   let patientSearch = $state("");
   let patientSearchInput = $state<HTMLInputElement | null>(null);
   let filteredPatients = $derived(
@@ -133,17 +137,23 @@
   }
 
   async function processRecordingJob(job: RecordingJob) {
-    const session = await invoke<Session | null>("get_session", { id: job.session_id });
-    if (!session) throw new Error("The session for this recording is no longer available.");
-    const regenerateExisting = job.created_session
-      ? false
-      : await confirmRegenerateAttachedNotes(session.notes.length);
-    const processedSession = await processSessionFromAudio(
-      job.audio_file,
-      { ...contextForRecordingJob(job, session), regenerateExisting },
-    );
-    sessionUpdate.set(processedSession);
-    recoverableRecordingJobs = recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id);
+    if (processingRecordingJobs.has(job.id)) return;
+    processingRecordingJobs.add(job.id);
+    try {
+      const session = await invoke<Session | null>("get_session", { id: job.session_id });
+      if (!session) throw new Error("The session for this recording is no longer available.");
+      const regenerateExisting = job.created_session
+        ? false
+        : await confirmRegenerateAttachedNotes(session.notes.length);
+      const processedSession = await processSessionFromAudio(
+        job.audio_file,
+        { ...contextForRecordingJob(job, session), regenerateExisting },
+      );
+      sessionUpdate.set(processedSession);
+      recoverableRecordingJobs = recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id);
+    } finally {
+      processingRecordingJobs.delete(job.id);
+    }
   }
 
   async function handleRecordingStopped(data: { job_id: string; file_path: string; duration_seconds: number; is_short_recording: boolean }) {
@@ -215,7 +225,15 @@
     // Install this before any awaited startup work so a just-stopped recording
     // is always routed through its durable job.
     unlistenRecStopped = await onRecordingStopped(handleRecordingStopped);
+    if (layoutDestroyed) {
+      unlistenRecStopped();
+      return;
+    }
     unlistenRecError = await onRecordingError(handleRecordingError);
+    if (layoutDestroyed) {
+      unlistenRecError();
+      return;
+    }
 
     // Auto-start sidecar silently
     try {
@@ -255,6 +273,10 @@
         activeOperation.set({ ...operation, label: safeStage });
       }
     });
+    if (layoutDestroyed) {
+      unlistenProgress();
+      return;
+    }
 
     // Sidecar busy state listener
     unlistenState = await listen<{ busy: boolean }>("sidecar-state", (event) => {
@@ -268,9 +290,14 @@
         progressScale.set(100);
       }
     });
+    if (layoutDestroyed) {
+      unlistenState();
+      return;
+    }
 
     // Load dark mode setting
     await loadAppearance();
+    if (layoutDestroyed) return;
     themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
     handleSystemThemeChange = () => {
       if (get(appearance) !== "system") return;
@@ -297,6 +324,10 @@
       recordingPaused.set(data.is_paused);
       recordingLevel.set(data.level);
     });
+    if (layoutDestroyed) {
+      unlistenRecTick();
+      return;
+    }
 
     try {
       recoverableRecordingJobs = await listRecoverableRecordingJobs();
@@ -320,6 +351,10 @@
         }
       } catch {}
     }, 1000);
+    if (layoutDestroyed && recordingPollInterval) {
+      clearInterval(recordingPollInterval);
+      recordingPollInterval = null;
+    }
   });
 
   // Apply dark mode class to <html>
@@ -335,6 +370,7 @@
   });
 
   onDestroy(() => {
+    layoutDestroyed = true;
     unlistenProgress?.();
     unlistenState?.();
     unlistenRecTick?.();
@@ -408,6 +444,7 @@
   let pathname = $derived($page.url.pathname);
   const isSettings = $derived(pathname === "/settings");
   const isTemplates = $derived(pathname === "/templates");
+  let lastWindowMouseDownAt = 0;
 
   function startWindowDrag(event: MouseEvent) {
     if (event.button !== 0) return;
@@ -415,12 +452,34 @@
       console.error("Failed to start window drag:", error);
     });
   }
+
+  function handleWindowMouseDown(event: MouseEvent) {
+    if (event.button !== 0) return;
+
+    const now = Date.now();
+    const isDoubleClick = event.detail >= 2 || now - lastWindowMouseDownAt < 400;
+    lastWindowMouseDownAt = now;
+
+    if (isDoubleClick) {
+      event.preventDefault();
+      toggleWindowMaximize();
+      return;
+    }
+
+    startWindowDrag(event);
+  }
+
+  function toggleWindowMaximize() {
+    void getCurrentWindow().toggleMaximize().catch((error) => {
+      console.error("Failed to toggle window maximize:", error);
+    });
+  }
 </script>
 
 <div class="app-shell">
   <div
     class="window-drag-region"
-    onmousedown={startWindowDrag}
+    onmousedown={handleWindowMouseDown}
     role="presentation"
   ></div>
 
@@ -513,6 +572,10 @@
     {@render children()}
   </main>
 </div>
+
+{#if !onboardingComplete}
+  <Onboarding onComplete={() => (onboardingComplete = true)} />
+{/if}
 
 {#if $sidecarBusy}
   <div class="progress-card" role="status" aria-live="polite">

@@ -3,14 +3,12 @@ import { appearance } from "./stores";
 
 export interface Settings {
   defaultLlm: string;
-  thinking: boolean;
   appearance: "system" | "light" | "dark";
   confirmRecordingConsent: boolean;
 }
 
 const DEFAULTS: Settings = {
   defaultLlm: "",
-  thinking: false,
   appearance: "system",
   confirmRecordingConsent: true,
 };
@@ -20,8 +18,6 @@ export async function loadSettings(): Promise<Settings> {
   try {
     const llm = await getSetting("default_llm");
     if (llm) s.defaultLlm = llm;
-    const th = await getSetting("thinking");
-    if (th !== null) s.thinking = th === "true";
     const ap = await getSetting("appearance");
     if (ap === "system" || ap === "light" || ap === "dark") s.appearance = ap;
     const consent = await getSetting("confirm_recording_consent");

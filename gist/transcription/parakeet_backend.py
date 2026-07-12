@@ -57,7 +57,6 @@ class ParakeetBackend(TranscriptionBackend):
     def transcribe(
         self,
         audio_path: str,
-        language: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> TranscriptResult:
@@ -68,7 +67,7 @@ class ParakeetBackend(TranscriptionBackend):
         if not path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        log.info("Transcribing %s (language=%s ignored)", audio_path, language or "auto")
+        log.info("Transcribing audio")
 
         segments: list[Segment] = []
 
@@ -115,7 +114,6 @@ class ParakeetBackend(TranscriptionBackend):
             text=full_text,
             segments=segments,
             duration=duration,
-            language="",
         )
 
     def cleanup(self):

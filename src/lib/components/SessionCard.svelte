@@ -2,15 +2,17 @@
   import { onDestroy, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { ask, confirm } from "@tauri-apps/plugin-dialog";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { renderSafeMarkdown } from "$lib/markdown";
+  import { formatLocalDate } from "$lib/date";
   import MarkdownToolbar from "$lib/components/MarkdownToolbar.svelte";
   import {
     createSessionInput,
     createSessionNote,
     deleteSessionInput,
     getSession,
-    getPatientFormats,
     listAudioDevices,
+    listNoteFormats,
     pauseRecording,
     resumeRecording,
     startRecording,
@@ -24,7 +26,6 @@
   import type { RecordingContext } from "$lib/processSession";
   import {
     getSessionDurationSeconds,
-    getSessionLanguage,
     getInputLabel,
     SESSION_INPUT_LABELS,
     SESSION_INPUT_SOURCES,
@@ -45,12 +46,13 @@
     sidecarBusy,
   } from "$lib/stores";
   import { loadSettings } from "$lib/settings";
-  import type { Session, SessionInput, SessionInputKind } from "$lib/types";
+  import type { NoteFormatTemplate, Session, SessionInput, SessionInputKind } from "$lib/types";
 
   let {
     session,
     initiallyExpanded = true,
     isGenerating = false,
+    deletionDisabled = false,
     onGenerateNote,
     onDelete,
     onChange,
@@ -58,10 +60,11 @@
     session: Session;
     initiallyExpanded?: boolean;
     isGenerating?: boolean;
+    deletionDisabled?: boolean;
     onGenerateNote: (
       session: Session,
-      options?: { regenerateExisting?: boolean }
-    ) => void | Promise<void>;
+      options?: { regenerateExisting?: boolean; formats?: string[] }
+    ) => boolean | Promise<boolean>;
     onDelete: (session: Session) => void;
     onChange: (session: Session) => void;
   } = $props();
@@ -100,12 +103,16 @@
   let thinking = $state(false);
   let openSessionMenu = $state(false);
   let openNoteMenu = $state(false);
+  let openAddNoteMenu = $state(false);
   let openInputMenu = $state<string | null>(null);
   let openAddSourceMenu = $state(false);
   let expandedInputId = $state<string | null>(null);
   let initializedSessionId = $state<string | null>(null);
   let previousNoteCount = $state(0);
   let inlineRecordingStarted = $state(false);
+  let noteFormats = $state<NoteFormatTemplate[]>([]);
+  let noteFormatsLoading = $state(false);
+  let generatingFormat = $state<string | null>(null);
   let noteSaveTimer: ReturnType<typeof setTimeout> | null = null;
   let inputSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -136,9 +143,26 @@
   let visibleSourceInputs = $derived.by(() => {
     const query = transcriptSearch.trim().toLocaleLowerCase();
     if (!query) return session.inputs;
-    return session.inputs.filter((input) => input.text.toLocaleLowerCase().includes(query));
+    return session.inputs.filter((input) => {
+      const searchableText = [
+        getInputLabel(input),
+        input.kind,
+        input.source,
+        input.title,
+        input.text,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase();
+      return searchableText.includes(query);
+    });
   });
   let hasSources = $derived(sourceInputs.length > 0);
+  let missingNoteFormats = $derived(
+    noteFormats
+      .filter((format) => !format.hidden && !session.notes.some((note) => note.format === format.name))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  );
   let sessionSummary = $derived.by(() => {
     const parts: string[] = [];
     if (session.inputs.length > 0) {
@@ -151,11 +175,11 @@
   });
 
   let formattedDate = $derived(
-    new Date(session.date).toLocaleDateString("en-US", {
+    formatLocalDate(session.date, {
       year: "numeric",
       month: "long",
       day: "numeric",
-    })
+    }, "en-US")
   );
 
   let formattedTime = $derived.by(() => {
@@ -182,7 +206,6 @@
     durationSeconds ? Math.round(durationSeconds / 60) : null
   );
 
-  let language = $derived(getSessionLanguage(session));
   let noteDirty = $derived(activeNote ? noteDraft !== (activeNote.note ?? "") : false);
   let inputDirty = $derived(
     editingInputId
@@ -305,11 +328,77 @@
     if (noteSaveTimer) clearTimeout(noteSaveTimer);
     if (inputSaveTimer) clearTimeout(inputSaveTimer);
     if (noteDirty) void saveNote(true);
-    if (inputDirty) void saveInput(true);
+    if (inputDirty && editingInputId) void saveInput(true);
   });
 
   function renderMarkdown(content: string) {
     return renderSafeMarkdown(content);
+  }
+
+  async function openMarkdownLink(event: MouseEvent) {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const link = target.closest("a");
+    if (!(link instanceof HTMLAnchorElement) || !link.href) return;
+    event.preventDefault();
+    try {
+      await openUrl(link.href);
+    } catch (e) {
+      const status = `Could not open link: ${String(e)}`;
+      if ((event.currentTarget as Element).classList.contains("source-input-rendered")) {
+        inputStatus = status;
+      } else {
+        noteStatus = status;
+      }
+    }
+  }
+
+  function openMarkdownLinkFromKeyboard(event: KeyboardEvent) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    if (!(event.target instanceof HTMLAnchorElement)) return;
+    event.preventDefault();
+    void openMarkdownLink(event as unknown as MouseEvent);
+  }
+
+  function escapeHtml(value: string) {
+    return value.replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    })[character] ?? character);
+  }
+
+  function escapeRegExp(value: string) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function highlightSearchText(text: string) {
+    const query = transcriptSearch.trim();
+    if (!query) return escapeHtml(text);
+
+    const pattern = new RegExp(escapeRegExp(query), "gi");
+    let html = "";
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      html += escapeHtml(text.slice(lastIndex, match.index));
+      html += `<mark>${escapeHtml(match[0])}</mark>`;
+      lastIndex = match.index + match[0].length;
+    }
+    return html + escapeHtml(text.slice(lastIndex));
+  }
+
+  function highlightRenderedMarkdown(content: string) {
+    const html = renderMarkdown(content);
+    const query = transcriptSearch.trim();
+    if (!query) return html;
+
+    const pattern = new RegExp(escapeRegExp(query), "gi");
+    return html.replace(/(<[^>]*>)|([^<]+)/g, (segment, tag) =>
+      tag ? segment : segment.replace(pattern, "<mark>$&</mark>")
+    );
   }
 
   function inputFor(id: string) {
@@ -319,6 +408,15 @@
   function sourcePreview(input: SessionInput) {
     const text = input.text.replace(/\s+/g, " ").trim();
     if (!text) return "No text yet";
+
+    const query = transcriptSearch.trim().toLocaleLowerCase();
+    const matchIndex = query ? text.toLocaleLowerCase().indexOf(query) : -1;
+    if (matchIndex >= 0) {
+      const contextStart = Math.max(0, matchIndex - 60);
+      const contextEnd = Math.min(text.length, contextStart + 160);
+      return `${contextStart > 0 ? "..." : ""}${text.slice(contextStart, contextEnd)}${contextEnd < text.length ? "..." : ""}`;
+    }
+
     return text.length > 160 ? `${text.slice(0, 157)}...` : text;
   }
 
@@ -342,15 +440,16 @@
       status.startsWith("Copy failed") ||
       status.startsWith("Delete failed") ||
       status.startsWith("Transcription failed") ||
+      status.startsWith("Regeneration failed") ||
       status.startsWith("Failed") ||
       status.startsWith("Audio devices unavailable") ||
       status.startsWith("Another operation")
     );
   }
 
-  async function confirmDocumentationRefresh() {
-    if (session.notes.length === 0) return false;
-    return confirmRegenerateAttachedNotes(session.notes.length);
+  async function confirmDocumentationRefresh(sessionToRefresh = session) {
+    if (sessionToRefresh.notes.length === 0) return false;
+    return confirmRegenerateAttachedNotes(sessionToRefresh.notes.length);
   }
 
   function clearCopiedStatus(target: "note" | "input") {
@@ -394,9 +493,9 @@
     }
   }
 
-  function toggle() {
-    if (noteDirty) void saveNote(true);
-    if (inputDirty) void saveInput(true);
+  async function toggle() {
+    if (noteDirty && !(await saveNote(true))) return;
+    if (inputDirty && editingInputId && !(await saveInput(true))) return;
     expanded = !expanded;
     openSessionMenu = false;
     openNoteMenu = false;
@@ -450,8 +549,8 @@
     }
   }
 
-  function selectTab(key: string) {
-    if (noteDirty) void saveNote(true);
+  async function selectTab(key: string) {
+    if (noteDirty && !(await saveNote(true))) return;
     currentTab = key;
     if (workspaceMode === "focus") focusPane = "note";
     noteEditing = false;
@@ -467,11 +566,67 @@
     openNoteMenu = false;
   }
 
-  function cancelNoteEditing() {
-    if (noteSaveTimer) clearTimeout(noteSaveTimer);
-    noteDraft = activeNote?.note ?? "";
+  async function loadAvailableNoteFormats() {
+    if (noteFormatsLoading) return;
+    noteFormatsLoading = true;
+    try {
+      noteFormats = await listNoteFormats();
+    } catch (e) {
+      noteStatus = `Could not load note types: ${String(e)}`;
+    } finally {
+      noteFormatsLoading = false;
+    }
+  }
+
+  async function toggleAddNoteMenu() {
+    openAddNoteMenu = !openAddNoteMenu;
+    if (openAddNoteMenu) await loadAvailableNoteFormats();
+  }
+
+  async function addNote(format: string) {
+    if (!hasSources || isGenerating) return;
+    openAddNoteMenu = false;
+    generatingFormat = format;
+    noteStatus = `Generating ${format.toUpperCase()} note…`;
+    const generated = await onGenerateNote(session, { formats: [format] });
+    if (generated) {
+      currentTab = format;
+      focusPane = "note";
+      noteStatus = "Generated";
+    }
+    generatingFormat = null;
+  }
+
+  async function regenerateActiveNote() {
+    if (!activeNote || !hasSources || isGenerating) return;
+    openNoteMenu = false;
+    const format = activeNote.format;
+    const approved = await confirm(
+      `Regenerate the ${format.toUpperCase()} note? This will replace the current note, including any manual edits.`,
+      { title: "Regenerate note", kind: "warning" }
+    );
+    if (!approved) return;
+
+    if (noteSaveTimer) {
+      clearTimeout(noteSaveTimer);
+      noteSaveTimer = null;
+    }
     noteEditing = false;
-    noteStatus = "";
+    noteDraft = activeNote.note ?? "";
+    generatingFormat = format;
+    noteStatus = "Regenerating…";
+    const generated = await onGenerateNote(session, {
+      regenerateExisting: true,
+      formats: [format],
+    });
+    noteStatus = generated ? "Regenerated" : "Regeneration failed";
+    generatingFormat = null;
+  }
+
+  async function closeNoteEditing() {
+    if (noteSaveTimer) clearTimeout(noteSaveTimer);
+    if (noteDirty && !(await saveNote(false))) return;
+    noteEditing = false;
   }
 
   function startInputEditing(input: SessionInput) {
@@ -486,8 +641,9 @@
     queueMicrotask(() => inputEditorEl?.focus());
   }
 
-  function cancelInputEditing() {
+  async function closeInputEditing() {
     if (inputSaveTimer) clearTimeout(inputSaveTimer);
+    if (editingInputId && inputDirty && !(await saveInput(false))) return;
     inputDraft = "";
     editingInputId = null;
     addingInputKind = null;
@@ -518,7 +674,6 @@
   async function loadExistingInputSettings() {
     const settings = await loadSettings();
     defaultLlm = settings.defaultLlm;
-    thinking = settings.thinking;
   }
 
   async function loadAudioDevices() {
@@ -563,6 +718,7 @@
   }
 
   function queueAutosave(target: EditTarget) {
+    if (target === "input" && !editingInputId) return;
     const existingTimer = target === "note" ? noteSaveTimer : inputSaveTimer;
     if (existingTimer) clearTimeout(existingTimer);
     const timer = setTimeout(() => {
@@ -592,6 +748,7 @@
     selectionEnd: number
   ) {
     updateEditorDraft(target, nextValue);
+    queueAutosave(target);
     queueMicrotask(() => {
       const { element } = getEditorState(target);
       if (!element) return;
@@ -654,15 +811,17 @@
     replaceSelection(target, nextValue, lineStart, lineStart + replacement.length);
   }
 
-  async function saveNote(autosave = false) {
-    if (!activeNote || savingNote || !noteDirty) return;
+  async function saveNote(autosave = false): Promise<boolean> {
+    if (!activeNote || !noteDirty) return true;
+    if (savingNote) return false;
     savingNote = true;
     noteStatus = "";
+    const draftAtStart = noteDraft;
     try {
       const saved = await createSessionNote(
         session.id,
         activeNote.format,
-        noteDraft,
+        draftAtStart,
         activeNote.llm_model
       );
       onChange({
@@ -671,27 +830,32 @@
       });
       if (!autosave) noteEditing = false;
       noteStatus = autosave ? "Saved automatically" : "Saved";
+      return true;
     } catch (e) {
       noteStatus = `Save failed: ${String(e)}`;
+      return false;
     } finally {
       savingNote = false;
+      if (noteEditing && noteDraft !== draftAtStart) queueAutosave("note");
     }
   }
 
-  async function saveInput(autosave = false) {
-    if ((!editingInputId && !addingInputKind) || savingInput || !inputDraft.trim()) return;
+  async function saveInput(autosave = false): Promise<boolean> {
+    if ((!editingInputId && !addingInputKind) || !inputDraft.trim()) return true;
+    if (savingInput) return false;
     savingInput = true;
     inputStatus = "";
+    const draftAtStart = inputDraft;
     try {
       const existing = editingInputId ? inputFor(editingInputId) : null;
       const saved = existing
-        ? await updateSessionInput({ id: existing.id, text: inputDraft })
+        ? await updateSessionInput({ id: existing.id, text: draftAtStart })
         : await createSessionInput({
             session_id: session.id,
             kind: addingInputKind!,
             source: SESSION_INPUT_SOURCES.typed,
             title: SESSION_INPUT_LABELS[addingInputKind!],
-            text: inputDraft,
+            text: draftAtStart,
             include_in_notes: true,
           });
       const inputs = existing
@@ -699,23 +863,23 @@
         : [...session.inputs, saved];
       const updatedSession = { ...session, inputs };
       onChange(updatedSession);
-      if (autosave && !existing) {
-        editingInputId = saved.id;
-        addingInputKind = null;
-      } else if (!autosave) {
+      if (!autosave || !existing) {
         editingInputId = null;
         addingInputKind = null;
         inputDraft = "";
       }
-      if (!autosave && await confirmDocumentationRefresh()) {
+      if (!autosave && await confirmDocumentationRefresh(updatedSession)) {
         inputStatus = "Updating notes...";
         await onGenerateNote(updatedSession, { regenerateExisting: true });
       }
       inputStatus = autosave ? "Saved automatically" : "Saved";
+      return true;
     } catch (e) {
       inputStatus = `Save failed: ${String(e)}`;
+      return false;
     } finally {
       savingInput = false;
+      if (editingInputId && inputDraft !== draftAtStart) queueAutosave("input");
     }
   }
 
@@ -740,7 +904,7 @@
       onChange(updatedSession);
       openInputMenu = null;
       expandedInputId = null;
-      if (await confirmDocumentationRefresh()) {
+      if (await confirmDocumentationRefresh(updatedSession)) {
         inputStatus = "Updating notes...";
         await onGenerateNote(updatedSession, { regenerateExisting: true });
       }
@@ -788,13 +952,12 @@
         text: result.transcript,
         audio_file: inputAudioPath,
         duration_seconds: result.duration,
-        language: result.language || null,
         include_in_notes: true,
       });
       const updated = await getSession(session.id);
       if (updated) {
         onChange(updated);
-        if (await confirmDocumentationRefresh()) {
+        if (await confirmDocumentationRefresh(updated)) {
           await onGenerateNote(updated, { regenerateExisting: true });
         }
       }
@@ -827,11 +990,15 @@
     if ($isRecording || processingInput) return;
     await loadAudioDevices();
     if (inputStatus.startsWith("Audio devices unavailable")) return;
+    if (inputDevices.length === 0) {
+      inputStatus = "No microphone is available. Connect one and allow Gist to use it in macOS Privacy & Security.";
+      return;
+    }
 
     try {
       const ctx: RecordingContext = {
         patientId: session.patient_id,
-        formats: await getPatientFormats(session.patient_id),
+        formats: session.notes.map((note) => note.format),
         defaultLlm,
         thinking,
         inputKind: kind,
@@ -913,9 +1080,6 @@
       {#if durationMin}
         <span>{durationMin} min</span>
       {/if}
-      {#if language}
-        <span>{language}</span>
-      {/if}
       {#if sessionSummary}
         <span>{sessionSummary}</span>
       {/if}
@@ -930,7 +1094,7 @@
             e.stopPropagation();
             openSessionMenu = !openSessionMenu;
           }}
-          disabled={isGenerating}
+          disabled={isGenerating || deletionDisabled}
           title="Session actions"
           aria-label="Session actions"
           aria-expanded={openSessionMenu}
@@ -946,6 +1110,7 @@
             <button
               class="action-menu-item danger"
               role="menuitem"
+              disabled={deletionDisabled}
               onclick={(e) => {
                 e.stopPropagation();
                 openSessionMenu = false;
@@ -993,6 +1158,41 @@
           Details
         </button>
       </div>
+      <div class="action-menu add-note-menu">
+          <button
+            class="session-tab add-note-trigger"
+            onclick={toggleAddNoteMenu}
+            disabled={isGenerating || !hasSources || (noteFormats.length > 0 && missingNoteFormats.length === 0)}
+            aria-expanded={openAddNoteMenu}
+            title={!hasSources
+              ? "Add source material before generating a note"
+              : noteFormats.length > 0 && missingNoteFormats.length === 0
+                ? "All note types have been added"
+                : "Generate another note type"}
+          >
+            + Add note
+          </button>
+          {#if openAddNoteMenu}
+            <div class="action-menu-popover add-note-popover" role="menu" aria-label="Add note">
+              {#if noteFormatsLoading}
+                <div class="action-menu-message">Loading note types…</div>
+              {:else if missingNoteFormats.length === 0}
+                <div class="action-menu-message">All note types added</div>
+              {:else}
+                {#each missingNoteFormats as format (format.id)}
+                  <button
+                    class="action-menu-item"
+                    role="menuitem"
+                    onclick={() => addNote(format.name)}
+                  >
+                    <strong>{format.name.toUpperCase()}</strong>
+                    <span>{format.is_builtin ? format.name.toUpperCase() + " note" : format.name}</span>
+                  </button>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+      </div>
       {#if activeNote}
         <div class="workspace-controls" aria-label="Workspace view">
           <div class="workspace-segmented" role="group" aria-label="Workspace mode">
@@ -1018,7 +1218,7 @@
     </div>
 
     <div class="session-card-body">
-      {#if isGenerating}
+      {#if isGenerating && !activeNote}
         <div class="spinner-container">
           <div class="spinner"></div>
           <p class="text-muted spinner-message">Generating notes...</p>
@@ -1051,7 +1251,7 @@
                 {/if}
                 <div class="editor-actions">
                   {#if noteStatus}
-                    <span class:error={statusIsError(noteStatus)} class="save-status">{noteStatus}</span>
+                    <span class:error={statusIsError(noteStatus)} class="save-status" aria-live="polite">{noteStatus}</span>
                   {/if}
                   {#if !noteEditing}
                     <div class="action-menu">
@@ -1076,6 +1276,14 @@
                           <button class="action-menu-item" role="menuitem" onclick={startNoteEditing}>
                             Edit note
                           </button>
+                          <button
+                            class="action-menu-item"
+                            role="menuitem"
+                            onclick={regenerateActiveNote}
+                            disabled={!hasSources || generatingFormat === activeNote.format}
+                          >
+                            Regenerate note
+                          </button>
                         </div>
                       {/if}
                     </div>
@@ -1098,13 +1306,18 @@
                   onkeydown={(e) => handleEditorShortcut(e, saveNote)}
                 ></textarea>
                 <div class="editor-footer">
-                  <button class="btn btn-sm" onclick={cancelNoteEditing} disabled={savingNote}>Cancel</button>
+                  <button class="btn btn-sm" onclick={closeNoteEditing} disabled={savingNote}>Close</button>
                   <button class="btn btn-sm btn-primary" onclick={() => saveNote()} disabled={savingNote || !noteDirty}>
                     {savingNote ? "Saving..." : "Save"}
                   </button>
                 </div>
               {:else}
-                <div class="rendered-content markdown-content">{@html renderedNote}</div>
+                <div
+                  class="rendered-content markdown-content"
+                  role="presentation"
+                  onclick={openMarkdownLink}
+                  onkeydown={openMarkdownLinkFromKeyboard}
+                >{@html renderedNote}</div>
               {/if}
             </section>
           {/if}
@@ -1116,7 +1329,7 @@
                   <div class="editor-pane-title">Session details</div>
                   <div class="editor-pane-subtitle">Appointment information associated with this session</div>
                 </div>
-                {#if metadataStatus}<span class:error={metadataStatus.startsWith("Could not")} class="save-status">{metadataStatus}</span>{/if}
+                {#if metadataStatus}<span class:error={metadataStatus.startsWith("Could not")} class="save-status" aria-live="polite">{metadataStatus}</span>{/if}
               </div>
 
               <div class="session-details-form">
@@ -1154,7 +1367,7 @@
               <div class="editor-pane-header">
                 <div class="editor-actions">
                   {#if inputStatus}
-                    <span class:error={statusIsError(inputStatus)} class="save-status">{inputStatus}</span>
+                    <span class:error={statusIsError(inputStatus)} class="save-status" aria-live="polite">{inputStatus}</span>
                   {/if}
                   {#if hasSources && !activeNote}
                     <button class="btn btn-sm btn-primary" onclick={() => onGenerateNote(session)}>
@@ -1167,8 +1380,8 @@
                       <input
                         bind:value={transcriptSearch}
                         type="search"
-                        placeholder="Search session material"
-                        aria-label="Search session material"
+                        placeholder="Search source materials"
+                        aria-label="Search source materials"
                       />
                     </div>
                   {/if}
@@ -1212,15 +1425,15 @@
                     <div class="source-input-header">
                       <div>
                         <div class="source-input-title">
-                          {getInputLabel(input)}
+                          {@html highlightSearchText(getInputLabel(input))}
                         </div>
-                        <div class="source-input-meta">{sourceMetadata(input)}</div>
+                        <div class="source-input-meta">{@html highlightSearchText(sourceMetadata(input))}</div>
                         <button
                           class="source-input-preview"
                           onclick={() => expandedInputId = expandedInputId === input.id ? null : input.id}
                           aria-expanded={expandedInputId === input.id}
                         >
-                          {sourcePreview(input)}
+                          {@html highlightSearchText(sourcePreview(input))}
                         </button>
                       </div>
                       <div class="editor-actions">
@@ -1284,14 +1497,19 @@
                         onkeydown={(e) => handleEditorShortcut(e, saveInput)}
                       ></textarea>
                       <div class="editor-footer">
-                        <button class="btn btn-sm" onclick={cancelInputEditing} disabled={savingInput}>Cancel</button>
+                        <button class="btn btn-sm" onclick={closeInputEditing} disabled={savingInput}>Close</button>
                         <button class="btn btn-sm btn-primary" onclick={() => saveInput()} disabled={savingInput || !inputDirty || !inputDraft.trim()}>
                           {savingInput ? "Saving..." : "Save"}
                         </button>
                       </div>
                     {:else if expandedInputId === input.id}
-                      <div class="rendered-content markdown-content source-input-rendered">
-                        {@html renderMarkdown(input.text)}
+                      <div
+                        class="rendered-content markdown-content source-input-rendered"
+                        role="presentation"
+                        onclick={openMarkdownLink}
+                        onkeydown={openMarkdownLinkFromKeyboard}
+                      >
+                        {@html highlightRenderedMarkdown(input.text)}
                       </div>
                     {/if}
                   </div>
@@ -1306,7 +1524,7 @@
                     <div class="source-input-header">
                       <div class="source-input-title">{SESSION_INPUT_LABELS[addingInputKind]}</div>
                       {#if inputMethod === "audio_file" || (inputMethod === "recording" || inputMethod === "dictation") && !$isRecording}
-                        <button class="btn btn-sm" onclick={cancelInputEditing} disabled={processingInput}>Cancel</button>
+                        <button class="btn btn-sm" onclick={closeInputEditing} disabled={processingInput}>Cancel</button>
                       {/if}
                     </div>
 
@@ -1321,11 +1539,10 @@
                         bind:this={inputEditorEl}
                         bind:value={inputDraft}
                         disabled={savingInput}
-                        oninput={() => queueAutosave("input")}
                         onkeydown={(e) => handleEditorShortcut(e, saveInput)}
                       ></textarea>
                       <div class="editor-footer">
-                        <button class="btn btn-sm" onclick={cancelInputEditing} disabled={savingInput}>Cancel</button>
+                        <button class="btn btn-sm" onclick={closeInputEditing} disabled={savingInput}>Cancel</button>
                         <button class="btn btn-sm btn-primary" onclick={() => saveInput()} disabled={savingInput || !inputDirty}>
                           {savingInput ? "Saving..." : "Save"}
                         </button>
@@ -1403,7 +1620,7 @@
                               </label>
                             {/if}
                             <p class="record-hint">About 345 MB per hour (roughly 690 MB for two hours). Gist prevents idle sleep while recording and processing.</p>
-                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")}>
+                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")} disabled={processingInput || inputDevices.length === 0}>
                               Start recording
                             </button>
                           </div>

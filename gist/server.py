@@ -6,6 +6,7 @@ import logging
 import queue
 import sys
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from .downloader import download_model, is_model_downloaded, delete_model
@@ -14,7 +15,7 @@ from .models import (
     DEFAULT_LLM,
     LLM_MODELS,
 )
-from .pipeline import generate_note, transcribe_audio
+from .pipeline import generate_note, release_cached_llm, transcribe_audio
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +24,47 @@ _cancel_event = threading.Event()
 # Request queue — stdin reader thread puts messages here, main thread processes
 _request_queue: "queue.Queue[Optional[dict]]" = queue.Queue()
 _active_request_id: Optional[str] = None
+
+
+def _log_event(operation: str, event: str, started_at: Optional[float] = None, **fields: Any) -> None:
+    """Write privacy-safe structured diagnostics without source content or paths."""
+    payload: Dict[str, Any] = {"operation": operation, "event": event}
+    if started_at is not None:
+        payload["elapsed_ms"] = round((time.monotonic() - started_at) * 1000)
+    payload.update(fields)
+    log.info("sidecar_event=%s", json.dumps(payload, sort_keys=True))
+
+
+def _params_for(msg: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
+    params = msg.get("params", msg)
+    if not isinstance(params, dict):
+        raise ValueError("Request params must be a JSON object")
+
+    def optional_string(name: str) -> None:
+        value = params.get(name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"'{name}' must be a string")
+
+    if msg_type == "transcribe":
+        if not isinstance(params.get("audio_file"), str) or not params["audio_file"].strip():
+            raise ValueError("'audio_file' must be a non-empty string")
+        if not isinstance(params.get("diarize", False), bool):
+            raise ValueError("'diarize' must be true or false")
+    elif msg_type == "generate_note":
+        if not isinstance(params.get("transcript"), str) or not params["transcript"].strip():
+            raise ValueError("'transcript' must be a non-empty string")
+        for name in ("format", "model", "prompt"):
+            optional_string(name)
+        max_tokens = params.get("max_tokens", 4096)
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 4096:
+            raise ValueError("'max_tokens' must be an integer between 1 and 4096")
+        if not isinstance(params.get("thinking", False), bool):
+            raise ValueError("'thinking' must be true or false")
+    elif msg_type in {"download_model", "delete_model"}:
+        optional_string("model")
+        if params.get("kind", "llm") != "llm":
+            raise ValueError("'kind' must be 'llm'")
+    return params
 
 
 def _user_facing_error(operation: str, error: Exception) -> str:
@@ -93,8 +135,9 @@ def _stdin_reader():
 
 def _handle_transcribe(params: Dict[str, Any]):
     audio_file = params.get("audio_file", "")
-    language = params.get("language")
     diarize = params.get("diarize", False)
+    started_at = time.monotonic()
+    _log_event("transcription", "started", diarize=diarize)
 
     duration_sent = False
 
@@ -108,7 +151,6 @@ def _handle_transcribe(params: Dict[str, Any]):
     try:
         result = transcribe_audio(
             audio_file,
-            language=language,
             diarize=diarize,
             progress_callback=progress,
             cancel_event=_cancel_event,
@@ -121,11 +163,13 @@ def _handle_transcribe(params: Dict[str, Any]):
                 for s in result.segments
             ],
             "duration": result.duration,
-            "language": result.language,
         })
+        _log_event("transcription", "completed", started_at, diarize=diarize, segments=len(result.segments))
     except InterruptedError:
+        _log_event("transcription", "cancelled", started_at, diarize=diarize)
         _send({"type": "error", "message": "Transcription cancelled"})
     except Exception as e:
+        _log_event("transcription", "failed", started_at, error_type=type(e).__name__)
         log.exception("Transcription failed")
         _send({"type": "error", "message": _user_facing_error("transcription", e)})
 
@@ -134,10 +178,11 @@ def _handle_generate_note(params: Dict[str, Any]):
     transcript = params.get("transcript", "")
     format_name = params.get("format", "soap")
     llm_model = params.get("model", DEFAULT_LLM)
-    backend_type = params.get("backend")
-    max_tokens = params.get("max_tokens", 16384)
-    thinking = params.get("thinking", True)
+    max_tokens = params.get("max_tokens", 4096)
+    thinking = params.get("thinking", False)
     prompt = params.get("prompt")
+    started_at = time.monotonic()
+    _log_event("note_generation", "started", model=llm_model, format=format_name, thinking=thinking)
 
     def progress(pct, stage):
         _send_progress(pct, stage)
@@ -147,7 +192,6 @@ def _handle_generate_note(params: Dict[str, Any]):
             transcript=transcript,
             format_name=format_name,
             llm_model=llm_model,
-            backend_type=backend_type,
             max_tokens=max_tokens,
             thinking=thinking,
             progress_callback=progress,
@@ -155,9 +199,12 @@ def _handle_generate_note(params: Dict[str, Any]):
             cancel_event=_cancel_event,
         )
         _send({"type": "result", "note": note, "format": format_name})
+        _log_event("note_generation", "completed", started_at, model=llm_model, format=format_name)
     except InterruptedError:
+        _log_event("note_generation", "cancelled", started_at, model=llm_model, format=format_name)
         _send({"type": "error", "message": "Note generation cancelled"})
     except Exception as e:
+        _log_event("note_generation", "failed", started_at, model=llm_model, format=format_name, error_type=type(e).__name__)
         log.exception("Note generation failed")
         _send({"type": "error", "message": _user_facing_error("note_generation", e)})
 
@@ -165,6 +212,8 @@ def _handle_generate_note(params: Dict[str, Any]):
 def _handle_download_model(params: Dict[str, Any]):
     model_name = params.get("model", DEFAULT_LLM)
     kind = params.get("kind", "llm")
+    started_at = time.monotonic()
+    _log_event("model_download", "started", model=model_name)
 
     def progress(pct, stage):
         _send_progress(pct, stage)
@@ -173,9 +222,12 @@ def _handle_download_model(params: Dict[str, Any]):
         _send_progress(0, "Preparing model download...")
         download_model(model_name, kind=kind, progress_callback=progress, cancel_event=_cancel_event)
         _send({"type": "result", "ok": True, "model": model_name})
+        _log_event("model_download", "completed", started_at, model=model_name)
     except InterruptedError:
+        _log_event("model_download", "cancelled", started_at, model=model_name)
         _send({"type": "error", "message": "Download cancelled"})
     except Exception as e:
+        _log_event("model_download", "failed", started_at, model=model_name, error_type=type(e).__name__)
         log.exception("Download failed")
         _send({"type": "error", "message": _user_facing_error("model_download", e)})
 
@@ -185,6 +237,7 @@ def _handle_delete_model(params: Dict[str, Any]):
     kind = params.get("kind", "llm")
 
     try:
+        release_cached_llm(model_name)
         delete_model(model_name, kind=kind)
         _send({"type": "result", "ok": True, "model": model_name})
     except Exception as e:
@@ -211,41 +264,45 @@ def run_server():
             break
 
         msg_type = msg.get("type", "")
-        params = msg.get("params", msg)
         _active_request_id = msg.get("request_id")
 
         # Clear cancel event before each operation
         _cancel_event.clear()
 
-        if msg_type == "ping":
-            _send({"type": "pong"})
-        elif msg_type == "exit":
-            _send({"type": "ok"})
-            break
-        elif msg_type == "list_models":
-            llm_info = {
-                name: {
-                    "display": spec.display,
-                    "backend": spec.backend,
-                    "size_gb": spec.size_gb,
-                    "description": spec.description,
-                    "downloaded": is_model_downloaded(name, "llm"),
+        try:
+            params = _params_for(msg, msg_type)
+            if msg_type == "ping":
+                _send({"type": "pong"})
+            elif msg_type == "exit":
+                _send({"type": "ok"})
+                break
+            elif msg_type == "list_models":
+                llm_info = {
+                    name: {
+                        "display": spec.display,
+                        "backend": spec.backend,
+                        "size_gb": spec.size_gb,
+                        "description": spec.description,
+                        "downloaded": is_model_downloaded(name, "llm"),
+                    }
+                    for name, spec in LLM_MODELS.items()
                 }
-                for name, spec in LLM_MODELS.items()
-            }
-            _send({"type": "result", "llm": llm_info})
-        elif msg_type == "list_formats":
-            _send({"type": "result", "formats": list_formats()})
-        elif msg_type == "transcribe":
-            _handle_transcribe(params)
-        elif msg_type == "generate_note":
-            _handle_generate_note(params)
-        elif msg_type == "download_model":
-            _handle_download_model(params)
-        elif msg_type == "delete_model":
-            _handle_delete_model(params)
-        else:
-            _send({"type": "error", "message": f"Unknown message type: {msg_type}"})
+                _send({"type": "result", "llm": llm_info})
+            elif msg_type == "list_formats":
+                _send({"type": "result", "formats": list_formats()})
+            elif msg_type == "transcribe":
+                _handle_transcribe(params)
+            elif msg_type == "generate_note":
+                _handle_generate_note(params)
+            elif msg_type == "download_model":
+                _handle_download_model(params)
+            elif msg_type == "delete_model":
+                _handle_delete_model(params)
+            else:
+                _send({"type": "error", "message": f"Unknown message type: {msg_type}"})
+        except Exception as e:
+            log.warning("Rejected sidecar request: %s", e)
+            _send({"type": "error", "message": f"Invalid request: {e}"})
 
         _active_request_id = None
 

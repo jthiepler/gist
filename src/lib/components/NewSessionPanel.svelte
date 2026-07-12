@@ -74,8 +74,11 @@
   let formats = $state<NoteFormatTemplate[]>([]);
   let selectedFormats = $state<Set<string>>(new Set());
   let formatsLoaded = $state(false);
+  let formatsLoadFailed = $state(false);
   let error = $state("");
   let phase = $state<"idle" | "transcribing" | "generating">("idle");
+  let submitting = $state(false);
+  let startingRecording = $state(false);
 
   let defaultLlm = $state("");
   let thinking = $state(false);
@@ -146,8 +149,13 @@
 
   $effect(() => {
     (async () => {
+      formatsLoadFailed = false;
       const ok = await ensureSidecar();
-      if (!ok) return;
+      if (!ok) {
+        formatsLoadFailed = true;
+        error = "The processing engine could not start, so note types could not be loaded.";
+        return;
+      }
       try {
         formats = await listNoteFormats();
         const saved = await getPatientFormats(patientId);
@@ -163,12 +171,13 @@
         }
       } catch (e) {
         console.error("Failed to load formats/patient formats:", e);
+        formatsLoadFailed = true;
+        error = "Note types could not be loaded. Close and reopen this panel to try again.";
       }
       formatsLoaded = true;
 
       const s = await loadSettings();
       if (s.defaultLlm) defaultLlm = s.defaultLlm;
-      thinking = s.thinking;
       confirmRecordingConsent = s.confirmRecordingConsent;
     })();
   });
@@ -204,6 +213,28 @@
     if ((inputMethod === "recording" || inputMethod === "dictation") && audioDevices.length === 0) {
       loadAudioDevices();
     }
+  }
+
+  const startOptions: SessionStartOption[] = [
+    "record_session",
+    "upload_recording",
+    "paste_transcript",
+    "type_note",
+    "dictate_note",
+  ];
+
+  function handleStartOptionKeydown(event: KeyboardEvent, option: SessionStartOption) {
+    if (!["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = startOptions.indexOf(option);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? startOptions.length - 1
+        : (currentIndex + (event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : -1) + startOptions.length) % startOptions.length;
+    const next = startOptions[nextIndex];
+    selectStartOption(next);
+    queueMicrotask(() => document.querySelector<HTMLElement>(`[data-start-option="${next}"]`)?.focus());
   }
 
   $effect(() => {
@@ -251,6 +282,15 @@
   }
 
   async function handleStartRecording() {
+    if (startingRecording || phase !== "idle" || $isRecording) return;
+    if (!formatsLoaded || selectedFormats.size === 0) {
+      error = "Please wait for note types to load and select at least one note type.";
+      return;
+    }
+    if ($sidecarBusy) {
+      error = "Another operation is in progress. Please wait or cancel it first.";
+      return;
+    }
     error = "";
     if (confirmRecordingConsent && !recordingConsentConfirmed) {
       error = "Confirm recording consent before starting.";
@@ -260,9 +300,11 @@
       error = "A microphone is required to record. Check macOS Privacy & Security, then try again.";
       return;
     }
+    startingRecording = true;
     let createdSession: Session | null = null;
     try {
       const sortedFormats = [...selectedFormats].sort((a, b) => a.localeCompare(b));
+      await setPatientFormats(patientId, sortedFormats);
       createdSession = await invoke<Session>("create_session", {
         data: {
           patient_id: patientId,
@@ -272,7 +314,6 @@
           session_type: null,
         },
       });
-      onProcessingStart(createdSession);
       const ctx: RecordingContext = {
         patientId,
         occurrenceDate: sessionDate,
@@ -302,6 +343,7 @@
       isRecording.set(true);
       recordingPaused.set(false);
       recordingElapsed.set(0);
+      onProcessingStart(createdSession);
     } catch (e) {
       error = `Failed to start recording: ${e}`;
       recordingContext.set(null);
@@ -312,6 +354,8 @@
           // Keep the empty session if cleanup fails; it is safer than hiding a failed record.
         }
       }
+    } finally {
+      startingRecording = false;
     }
   }
 
@@ -348,6 +392,7 @@
   }
 
   async function start() {
+    if (submitting || phase !== "idle" || $isRecording) return;
     const startsFromText = inputMethod === "text";
     const startsFromAudioFile = inputMethod === "audio_file";
     const cleanedText = textDraft.trim();
@@ -372,9 +417,11 @@
       return;
     }
 
+    submitting = true;
     const ok = await ensureSidecar();
     if (!ok) {
       error = "Failed to start the processing engine.";
+      submitting = false;
       return;
     }
 
@@ -383,6 +430,7 @@
       await setPatientFormats(patientId, sortedFormats);
     } catch (e) {
       error = `Failed to save note type preferences: ${String(e)}`;
+      submitting = false;
       return;
     }
 
@@ -398,6 +446,31 @@
     });
     phase = startsFromText ? "generating" : "transcribing";
 
+    let sourceText = "";
+    let duration: number | null = null;
+
+    if (startsFromAudioFile) {
+      try {
+        const result = await transcribe(
+          audioPath,
+          sourceKind === "session_transcript" && diarizeSession,
+        );
+        sourceText = result.transcript;
+        duration = result.duration;
+      } catch (e) {
+        const msg = String(e);
+        error =
+          msg === "sidecar_busy"
+            ? "Another operation is in progress. Please wait or cancel it first."
+            : `Transcription failed: ${msg}`;
+        finishOperation();
+        submitting = false;
+        return;
+      }
+    } else {
+      sourceText = cleanedText;
+    }
+
     let session: Session;
     try {
       session = await invoke<Session>("create_session", {
@@ -409,37 +482,11 @@
         },
       });
       currentOperation.set(`${opId}-${session.id}`);
-      onProcessingStart(session);
     } catch (e) {
       error = `Failed to create session: ${e}`;
       finishOperation();
+      submitting = false;
       return;
-    }
-
-    let sourceText = "";
-    let duration: number | null = null;
-    let language: string | null = null;
-
-    if (startsFromAudioFile) {
-      try {
-        const result = await transcribe(
-          audioPath,
-          sourceKind === "session_transcript" && diarizeSession,
-        );
-        sourceText = result.transcript;
-        duration = result.duration;
-        language = result.language;
-      } catch (e) {
-        const msg = String(e);
-        error =
-          msg === "sidecar_busy"
-            ? "Another operation is in progress. Please wait or cancel it first."
-            : `Transcription failed: ${msg}`;
-        finishOperation();
-        return;
-      }
-    } else {
-      sourceText = cleanedText;
     }
 
     try {
@@ -450,7 +497,6 @@
         title: sourceLabel,
         text: sourceText,
         audio_file: startsFromAudioFile ? audioPath : null,
-        language: startsFromAudioFile ? language || null : null,
         duration_seconds: startsFromAudioFile ? duration : null,
         include_in_notes: true,
       });
@@ -461,9 +507,17 @@
       onSessionUpdate(session);
     } catch (e) {
       error = `Failed to save session: ${e}`;
+      try {
+        await invoke("delete_session", { id: session.id });
+      } catch (cleanupError) {
+        console.error("Failed to remove incomplete session:", cleanupError);
+      }
       finishOperation();
+      submitting = false;
       return;
     }
+
+    onProcessingStart(session);
 
     phase = "generating";
     try {
@@ -480,11 +534,13 @@
           ? "Another operation is in progress. Please wait or cancel it first."
           : msg;
       finishOperation();
+      submitting = false;
       return;
     }
 
     progressPercent.set(100);
     finishOperation();
+    submitting = false;
     onComplete(session);
   }
 </script>
@@ -496,7 +552,7 @@
   </div>
 
   {#if error}
-    <div class="error-banner">{error}</div>
+    <div class="error-banner" role="alert">{error}</div>
   {/if}
 
   <div class="session-metadata-grid">
@@ -524,6 +580,9 @@
       disabled={phase !== "idle" || $isRecording}
       aria-checked={selectedStartOption === "record_session"}
       role="radio"
+      data-start-option="record_session"
+      tabindex={selectedStartOption === "record_session" ? 0 : -1}
+      onkeydown={(event) => handleStartOptionKeydown(event, "record_session")}
     >
       <span class="session-start-title">Record session</span>
       <span class="session-start-desc">Capture session audio and create a transcript.</span>
@@ -536,6 +595,9 @@
       disabled={phase !== "idle" || $isRecording}
       aria-checked={selectedStartOption === "upload_recording"}
       role="radio"
+      data-start-option="upload_recording"
+      tabindex={selectedStartOption === "upload_recording" ? 0 : -1}
+      onkeydown={(event) => handleStartOptionKeydown(event, "upload_recording")}
     >
       <span class="session-start-title">Upload session recording</span>
       <span class="session-start-desc">Transcribe an existing audio file.</span>
@@ -548,6 +610,9 @@
       disabled={phase !== "idle" || $isRecording}
       aria-checked={selectedStartOption === "paste_transcript"}
       role="radio"
+      data-start-option="paste_transcript"
+      tabindex={selectedStartOption === "paste_transcript" ? 0 : -1}
+      onkeydown={(event) => handleStartOptionKeydown(event, "paste_transcript")}
     >
       <span class="session-start-title">Paste session transcript</span>
       <span class="session-start-desc">Use text from a completed session.</span>
@@ -560,6 +625,9 @@
       disabled={phase !== "idle" || $isRecording}
       aria-checked={selectedStartOption === "type_note"}
       role="radio"
+      data-start-option="type_note"
+      tabindex={selectedStartOption === "type_note" ? 0 : -1}
+      onkeydown={(event) => handleStartOptionKeydown(event, "type_note")}
     >
       <span class="session-start-title">Write clinician note</span>
       <span class="session-start-desc">Add observations, corrections, and plan details.</span>
@@ -572,6 +640,9 @@
       disabled={phase !== "idle" || $isRecording}
       aria-checked={selectedStartOption === "dictate_note"}
       role="radio"
+      data-start-option="dictate_note"
+      tabindex={selectedStartOption === "dictate_note" ? 0 : -1}
+      onkeydown={(event) => handleStartOptionKeydown(event, "dictate_note")}
     >
       <span class="session-start-title">Record clinician note</span>
       <span class="session-start-desc">Record your own post-session note.</span>
@@ -661,7 +732,7 @@
             </label>
           {/if}
           <p class="record-hint">Gist records at about 345 MB per hour (roughly 690 MB for two hours). Keep your Mac awake while recording; Gist also prevents idle sleep during recording and processing.</p>
-          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={phase !== "idle" || inputDevices.length === 0 || (confirmRecordingConsent && !recordingConsentConfirmed)}>
+          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || !formatsLoaded || selectedFormats.size === 0 || inputDevices.length === 0 || (confirmRecordingConsent && !recordingConsentConfirmed)}>
             Start recording
           </button>
         </div>
@@ -709,7 +780,7 @@
         <button
           class="btn btn-primary"
           onclick={start}
-          disabled={phase !== "idle" || !formatsLoaded || selectedFormats.size === 0 || (inputMethod === "text" ? !textDraft.trim() : !audioPath)}
+          disabled={submitting || phase !== "idle" || !formatsLoaded || formatsLoadFailed || selectedFormats.size === 0 || (inputMethod === "text" ? !textDraft.trim() : !audioPath)}
         >
           {primaryActionLabel}
         </button>

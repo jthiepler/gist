@@ -139,21 +139,23 @@ def diarize_audio(
     return turns
 
 
-def _speaker_for_interval(start: float, end: float, turns: List[Dict[str, Any]]) -> Optional[str]:
-    best_speaker: Optional[str] = None
-    best_overlap = 0.0
-    for turn in turns:
-        overlap = min(end, turn["end"]) - max(start, turn["start"])
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_speaker = turn["speaker"]
-    return best_speaker
-
-
 def attach_speakers(segments: List[Segment], turns: List[Dict[str, Any]]) -> None:
-    """Assign each timestamped transcription segment its best speaker."""
+    """Assign best-overlap speakers with a linear chronological interval scan."""
+    turn_idx = 0
     for segment in segments:
-        segment.speaker = _speaker_for_interval(segment.start, segment.end, turns)
+        while turn_idx < len(turns) and turns[turn_idx]["end"] <= segment.start:
+            turn_idx += 1
+        best_speaker: Optional[str] = None
+        best_overlap = 0.0
+        candidate_idx = turn_idx
+        while candidate_idx < len(turns) and turns[candidate_idx]["start"] < segment.end:
+            turn = turns[candidate_idx]
+            overlap = min(segment.end, turn["end"]) - max(segment.start, turn["start"])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = turn["speaker"]
+            candidate_idx += 1
+        segment.speaker = best_speaker
 
 
 def render_speaker_transcript(segments: List[Segment]) -> str:

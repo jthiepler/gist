@@ -51,7 +51,3 @@ export function getSessionDurationSeconds(session: Session): number | null {
   if (durations.length === 0) return null;
   return durations.reduce((sum, duration) => sum + duration, 0);
 }
-
-export function getSessionLanguage(session: Session): string | null {
-  return session.inputs.find((input) => input.language)?.language ?? null;
-}

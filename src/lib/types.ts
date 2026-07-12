@@ -28,7 +28,6 @@ export interface SessionInput {
   text: string;
   audio_file: string | null;
   duration_seconds: number | null;
-  language: string | null;
   transcription_model: string | null;
   include_in_notes: boolean;
   created_at: string;
@@ -73,7 +72,8 @@ export interface ModelInfo {
   backend: string;
   size_gb: number;
   description: string;
-  downloaded: boolean;
+  // null means the sidecar has not confirmed the local cache state yet.
+  downloaded: boolean | null;
 }
 
 export interface ModelsResult {

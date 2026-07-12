@@ -42,7 +42,6 @@ export interface TranscriptionSegment {
 
 export interface TranscriptionResult {
   transcript: string;
-  language: string;
   duration: number;
   segments: TranscriptionSegment[];
 }
@@ -70,7 +69,7 @@ export async function generateNote(
     transcript: sourceMaterial,
     format,
     model: model || undefined,
-    thinking: thinking ?? true,
+    thinking: thinking ?? false,
     prompt: prompt || undefined,
   });
 }
@@ -91,6 +90,10 @@ export async function getSetting(key: string): Promise<string | null> {
 
 export async function setSetting(key: string, value: string): Promise<void> {
   return invoke<void>("set_setting", { key, value });
+}
+
+export async function getSystemMemoryBytes(): Promise<number> {
+  return invoke<number>("get_system_memory_bytes");
 }
 
 // ── Note Format Templates ─────────────────────────────────────────────────
@@ -120,7 +123,6 @@ export async function createSessionInput(data: {
   text: string;
   audio_file?: string | null;
   duration_seconds?: number | null;
-  language?: string | null;
   transcription_model?: string | null;
   include_in_notes?: boolean;
 }): Promise<SessionInput> {

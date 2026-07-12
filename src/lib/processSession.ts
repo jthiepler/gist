@@ -78,7 +78,6 @@ export async function processSessionFromAudio(
 
   let transcript = "";
   let duration: number | null = null;
-  let language: string | null = null;
 
   try {
     const result = await transcribe(
@@ -87,7 +86,6 @@ export async function processSessionFromAudio(
     );
     transcript = result.transcript;
     duration = result.duration;
-    language = result.language;
   } catch (e) {
     const msg = String(e);
     resetProgress();
@@ -115,7 +113,6 @@ export async function processSessionFromAudio(
       text: transcript,
       audio_file: audioPath,
       duration_seconds: duration,
-      language,
       include_in_notes: true,
     });
     updatedSession = (await getSession(session.id)) ?? session;
@@ -136,9 +133,7 @@ export async function processSessionFromAudio(
 
   const formatsToRefresh = ctx.isNewSession
     ? ctx.formats
-    : ctx.formats.length > 0
-      ? ctx.formats
-      : updatedSession.notes.map((note) => note.format);
+    : updatedSession.notes.map((note) => note.format);
 
   try {
     const processedSession = await generateSessionDocumentation(updatedSession, formatsToRefresh, {

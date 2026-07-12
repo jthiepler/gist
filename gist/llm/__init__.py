@@ -1,4 +1,3 @@
-__all__ = ["ChatMessage", "LLMBackend", "create_backend"]
+__all__ = ["ChatMessage", "LLMBackend"]
 
 from .base import ChatMessage, LLMBackend
-from .factory import create_backend

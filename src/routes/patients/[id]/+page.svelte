@@ -19,8 +19,11 @@
   } from "$lib/stores";
   import { getPatientFormats } from "$lib/rpc";
   import { hasNoteSourceMaterial } from "$lib/sessionInputs";
+  import { selectNoteFormats, type NoteGenerationSelection } from "$lib/noteGeneration";
   import { generateSessionDocumentation } from "$lib/documentation";
   import { loadSettings } from "$lib/settings";
+  import { formatLocalDate } from "$lib/date";
+  import { isNewSessionRecording } from "$lib/releaseGuards";
   import type { Patient, Session } from "$lib/types";
   import SessionCard from "$lib/components/SessionCard.svelte";
   import NewSessionPanel from "$lib/components/NewSessionPanel.svelte";
@@ -85,7 +88,7 @@
   $effect(() => {
     const ctx = $recordingContext;
     if ($isRecording && ctx?.patientId === patientId) {
-      recordingNewSession = !ctx.session;
+      recordingNewSession = isNewSessionRecording(ctx);
       showNewSession = recordingNewSession;
       return;
     }
@@ -122,11 +125,11 @@
 
   let lastSessionDate = $derived(
     sessions.length > 0
-      ? new Date(sessions[0].date).toLocaleDateString("en-US", {
+      ? formatLocalDate(sessions[0].date, {
           year: "numeric",
           month: "short",
           day: "numeric",
-        })
+        }, "en-US")
       : null
   );
 
@@ -149,11 +152,15 @@
   });
 
   async function deleteSession(session: Session) {
-    const formattedDate = new Date(session.date).toLocaleDateString("en-US", {
+    if ($isRecording && $recordingContext?.session?.id === session.id) {
+      error = "Stop the active recording before deleting this session.";
+      return;
+    }
+    const formattedDate = formatLocalDate(session.date, {
       year: "numeric",
       month: "long",
       day: "numeric",
-    });
+    }, "en-US");
     if (!(await confirm(`Delete the session from ${formattedDate}?`, {
       title: "Delete session",
       kind: "warning",
@@ -168,55 +175,46 @@
 
   async function generateNoteForSession(
     session: Session,
-    options: { regenerateExisting?: boolean } = {}
-  ) {
-    if (!hasNoteSourceMaterial(session)) return;
+    options: NoteGenerationSelection = {}
+  ): Promise<boolean> {
+    if (!hasNoteSourceMaterial(session)) return false;
     if ($sidecarBusy) {
       error = "Another operation is in progress. Please wait or cancel it first.";
-      return;
+      return false;
     }
     generatingNoteFor = session.id;
     error = "";
-
-    // Load settings
-    const settings = await loadSettings();
-    const llm = settings.defaultLlm;
-    const thinking = settings.thinking;
-
-    // Determine formats: patient's saved selection, or default to "soap"
-    let formatsToGenerate = await getPatientFormats(patientId);
-    if (formatsToGenerate.length === 0) {
-      formatsToGenerate = ["soap"];
-    }
-
-    const existingFormats = new Set(session.notes.map((n) => n.format));
-    const formatsToRefresh = formatsToGenerate
-      .filter((f) => options.regenerateExisting || !existingFormats.has(f))
-      .sort((a, b) => a.localeCompare(b));
-
-    if (formatsToRefresh.length === 0) {
-      error = "All selected note formats already exist for this session.";
-      generatingNoteFor = null;
-      return;
-    }
-
-    const opId = `gen-note-${session.id}`;
-    currentOperation.set(opId);
-    progressBase.set(0);
-    progressScale.set(100);
-    progressPercent.set(30);
-    progressStage.set(options.regenerateExisting ? "Updating notes..." : "Creating notes...");
-    activeOperation.set({
-      type: "generate_note",
-      label: options.regenerateExisting ? "Updating notes..." : "Creating notes...",
-    });
     try {
+      const settings = await loadSettings();
+      const preferredFormats = options.formats || options.regenerateExisting
+        ? []
+        : await getPatientFormats(patientId);
+      const formatsToRefresh = selectNoteFormats(
+        session.notes.map((note) => note.format),
+        preferredFormats,
+        options,
+      );
+      if (formatsToRefresh.length === 0) {
+        error = "All selected note formats already exist for this session.";
+        return false;
+      }
+
+      currentOperation.set(`gen-note-${session.id}`);
+      progressBase.set(0);
+      progressScale.set(100);
+      progressPercent.set(30);
+      progressStage.set(options.regenerateExisting ? "Updating notes..." : "Creating notes...");
+      activeOperation.set({
+        type: "generate_note",
+        label: options.regenerateExisting ? "Updating notes..." : "Creating notes...",
+      });
       await generateSessionDocumentation(session, formatsToRefresh, {
-        defaultLlm: llm,
-        thinking,
+        defaultLlm: settings.defaultLlm,
+        thinking: false,
         verb: "Generating",
         onSessionUpdate: upsertSession,
       });
+      return true;
     } catch (e) {
       const msg = String(e);
       if (msg === "sidecar_busy") {
@@ -224,6 +222,7 @@
       } else {
         error = `Note generation failed: ${msg}`;
       }
+      return false;
     } finally {
       generatingNoteFor = null;
       currentOperation.set(null);
@@ -237,7 +236,6 @@
 
   function onNewSessionProcessingStart(session: Session) {
     upsertSession(session);
-    showNewSession = false;
   }
 
   function onNewSessionComplete(session: Session) {
@@ -283,6 +281,10 @@
 
   async function deletePatient() {
     if (!patient) return;
+    if ($isRecording && $recordingContext?.patientId === patient.id) {
+      error = "Stop the active recording before deleting this patient.";
+      return;
+    }
     showPatientMenu = false;
     if (!(await confirm(`Delete "${patient.name}"? All related sessions and notes will be permanently deleted. This cannot be undone.`, { title: "Delete patient", kind: "warning" }))) return;
     try {
@@ -344,9 +346,14 @@
               </svg>
             </button>
             {#if showPatientMenu}
-              <div class="patient-menu-popover">
-                <button class="patient-menu-item" onclick={startEditName}>Edit patient name</button>
-                <button class="patient-menu-item danger" onclick={deletePatient}>Delete patient</button>
+              <div class="patient-menu-popover" role="menu" aria-label="Patient actions">
+                <button class="patient-menu-item" role="menuitem" onclick={startEditName}>Edit patient name</button>
+                <button
+                  class="patient-menu-item danger"
+                  role="menuitem"
+                  onclick={deletePatient}
+                  disabled={$isRecording && $recordingContext?.patientId === patient.id}
+                >Delete patient</button>
               </div>
             {/if}
           </div>
@@ -395,6 +402,7 @@
                 {session}
                 initiallyExpanded={groupIndex === 0 && sessionIndex === 0}
                 isGenerating={generatingNoteFor === session.id}
+                deletionDisabled={$isRecording && $recordingContext?.session?.id === session.id}
                 onGenerateNote={generateNoteForSession}
                 onDelete={deleteSession}
                 onChange={updateSessionInList}
