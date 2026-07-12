@@ -18,6 +18,17 @@ clinicians to upload intimate conversations to an unrelated cloud service or
 pay another subscription. The project is early, practical, and open to input
 from the people who do this work every day.
 
+## Why I'm building Gist
+
+Gist is a passion project from a machine-learning engineer with a psychology
+background. I wanted to build something that helps people spend more time
+helping other people, and less time wrestling with avoidable administrative
+work.
+
+The idea is simple: make useful documentation assistance private, accessible,
+and honest about its limits. Gist is early software, and feedback from the
+people who do this work every day is especially welcome.
+
 ## Privacy promise
 
 > **In the normal bundled workflow, session audio, transcripts, notes, and
