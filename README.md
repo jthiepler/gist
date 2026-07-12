@@ -193,3 +193,6 @@ build.
 - Add a `social_preview.png` at 1200×630 pixels once an app screenshot or
   mockup is available, then set it under **Settings → General → Social
   preview**.
+- A lightweight project landing page lives in [`docs/`](docs/) and is deployed
+  by [`.github/workflows/pages.yml`](.github/workflows/pages.yml). In the
+  repository settings, set **Pages → Source** to **GitHub Actions**.
