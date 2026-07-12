@@ -7,7 +7,9 @@ professionals turn session recordings into structured clinical notes. Audio,
 transcription, speaker diarization, and note generation are designed to run
 locally on Apple Silicon, so your clinical data can stay on your Mac.
 
-<!-- Screenshot to be added later: add a 1200px-wide app screenshot or product mockup here. -->
+<img width="1448" height="939" alt="Screenshot 2026-07-12 at 11 08 57" src="https://github.com/user-attachments/assets/35445d25-df40-4613-a3fd-9eb30011a49a" />
+
+<img width="1448" height="939" alt="Screenshot 2026-07-12 at 11 04 48" src="https://github.com/user-attachments/assets/0783cf82-d9c4-4595-b646-f89503c2f0c6" />
 
 ## Why Gist exists
 
