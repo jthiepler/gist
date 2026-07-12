@@ -1,61 +1,99 @@
 # Gist
 
-> Privacy-first clinical note-taking for therapists. 100% on-device.
+**Turn a therapy session into an editable clinical note without sending the
+conversation to the cloud.**
 
-Gist is a free, open-source macOS app that helps therapists and mental-health
-professionals turn session recordings into structured clinical notes. Audio,
-transcription, speaker diarization, and note generation are designed to run
-locally on Apple Silicon, so your clinical data can stay on your Mac.
+Gist is a free, open-source macOS app for solo therapists and private
+practitioners. It records or imports session material, transcribes it, and
+creates a structured first draft in the note format you use. In the bundled
+workflow, the recording, transcript, client record, and generated note remain
+on your Mac.
 
-<img width="2016" height="1151" alt="Screenshot 2026-07-12 at 12 42 23" src="https://github.com/user-attachments/assets/4816f664-e183-43ac-a1f2-ce7487254322" />
+> Gist is an early beta. It has not yet been validated in clinical practice.
+> Treat every generated note as a draft: review it against the source before
+> putting it in a clinical record.
 
-## Why Gist exists
+<img width="2016" height="1151" alt="Gist showing a generated clinical note beside the synthetic transcript it was based on" src="docs/assets/split-review.png" />
 
-Therapists spend too much of their limited time turning session memories and
-rough notes into compliant progress notes. Gist was built from a simple,
-altruistic idea: useful clinical documentation assistance should not require
-clinicians to upload intimate conversations to an unrelated cloud service or
-pay another subscription. The project is early, practical, and open to input
-from the people who do this work every day.
+## Why I built it
 
-## Why I'm building Gist
+Most clinical documentation assistants are subscription services, and many
+depend on sending sensitive conversations to someone else's infrastructure.
+For an independent practitioner, that can mean another recurring bill and
+another company that must be trusted with deeply private material.
 
-Gist is a passion project from a machine-learning engineer with a psychology
-background. I wanted to build something that helps people spend more time
-helping other people, and less time wrestling with avoidable administrative
-work.
+I studied Economics and Psychology before becoming a machine-learning
+engineer. I have since built ML systems in finance and legal research—two other
+fields where plausible but incorrect output is not good enough. Gist brings
+those parts of my background together: a deliberately local tool that makes a
+routine task easier without trying to replace clinical judgment.
 
-The idea is simple: make useful documentation assistance private, accessible,
-and honest about its limits. Gist is early software, and feedback from the
-people who do this work every day is especially welcome.
+This is a personal open-source project, not a clinical platform or a startup
+sales funnel. My aim is to make it polished enough to be genuinely useful,
+then shape it through honest feedback from working therapists.
 
-## Privacy promise
+— [Joshua Hiepler](https://jthiepler.com)
 
-> **In the normal bundled workflow, session audio, transcripts, notes, and
-> client data never leave your device.** Gist has no accounts, cloud sync,
-> telemetry, or subscription. Processing uses local models on your Mac, and
-> the app continues to work without internet access after its model assets
-> have been downloaded.
+## What the workflow looks like
 
-The codebase also includes an optional OpenAI-compatible backend for local
-development and advanced setups. Configure it only if you understand where
-that endpoint sends data; the bundled local workflow does not require it.
+1. Add a client and start a session.
+2. Record with the microphone, import audio, paste a transcript, or add your
+   own written observations.
+3. Let Gist transcribe the audio and separate speakers locally.
+4. Generate one or more structured drafts.
+5. Review the draft beside its source, edit it, and export it as plain text.
 
-## Features
+<table>
+  <tr>
+    <td width="50%"><img alt="A synthetic session transcript in Gist" src="docs/assets/session-transcript.png" /></td>
+    <td width="50%"><img alt="Local model selection in Gist settings" src="docs/assets/local-models.png" /></td>
+  </tr>
+  <tr>
+    <td><em>Keep the source material with the session.</em></td>
+    <td><em>Choose and manage the note-writing model on your Mac.</em></td>
+  </tr>
+</table>
 
-- Record therapy sessions locally from the microphone.
-- Pause and resume recordings.
-- Transcribe speech with Parakeet TDT through `mlx-audio`, optimized for Apple
-  Silicon.
-- Identify speakers with local `pyannote` diarization.
-- Generate concise, structured notes from session transcripts.
-- Choose SOAP, DAP, BIRP, GIRP, PIRP, SIRP, DART, CBT, or intake formats.
-- Create custom note templates with user-defined prompts.
-- Manage clients and browse session history.
-- Review an editable draft beside its source transcript.
-- Export notes as plain text.
-- Download and manage local note-generation models.
-- Keep the entire workflow local after the initial model download.
+All names and clinical material shown in these screenshots are synthetic.
+
+## Local means local
+
+In the normal bundled workflow:
+
+- Gist has no account, cloud sync, telemetry, or subscription.
+- Client records are stored in a local SQLite database.
+- Audio transcription runs with Parakeet TDT through `mlx-audio`.
+- Speaker diarization runs with `pyannote` Community-1.
+- Note generation runs with a Qwen 3.5 MLX model you download and manage.
+- The app can continue working offline once its model assets are present.
+
+The initial model downloads require an internet connection. The codebase also
+contains an optional OpenAI-compatible backend for development and advanced
+setups; it is not required by the bundled app. If you configure it, you are
+responsible for understanding where that endpoint sends data.
+
+Local processing reduces the number of parties and systems that handle
+clinical data. It does **not**, by itself, make a clinician or practice
+compliant with HIPAA or any other regulation. Device security, access control,
+backups, consent, retention, and the way the app is used remain the
+practitioner's responsibility.
+
+## What works today
+
+- Local recording with pause and resume
+- Audio import, pasted transcripts, and clinician-written source material
+- On-device transcription and speaker diarization
+- Editable notes shown beside their supporting transcript
+- SOAP, DAP, BIRP, GIRP, PIRP, SIRP, DART, CBT, and intake formats
+- Custom note templates and prompts
+- Local client and session history
+- Plain-text export
+- Downloadable 4B and 9B local note-writing models
+
+Transcription is already useful on clear audio. Speaker diarization is less
+consistent and remains one of the rougher parts of the beta. Generated note
+quality depends on the recording, transcript, selected model, and template;
+Gist deliberately presents every output as a draft.
 
 ## Requirements
 
@@ -63,93 +101,66 @@ that endpoint sends data; the bundled local workflow does not require it.
 - macOS 14 or later
 - 8 GB RAM minimum
 - 16 GB RAM recommended for the Qwen 3.5 9B model
-- Microphone access for recording sessions
+- Roughly 1 GB for the app and bundled speech models
+- An additional 2.5 GB for the smallest note-writing model, or 5.5 GB for the
+  9B model
+- Microphone access when recording directly in Gist
 
-Gist is currently a macOS-only application. The first model download requires
-an internet connection and enough local disk space; later transcription and
-note generation can run offline.
+Gist is currently macOS-only.
 
-## Installation
+## Install the beta
 
-1. Download the latest `Gist_*.dmg` from [GitHub Releases](../../releases).
-2. Open the downloaded DMG and drag **Gist** to **Applications**.
-3. Because early releases are unsigned, right-click **Gist**, choose **Open**,
-   and confirm the macOS warning on first launch.
-4. Grant microphone access when macOS asks. Download a local note-generation
-   model when prompted or from Settings.
+1. Download `Gist_*.dmg` from the
+   [v0.1.0 beta release](https://github.com/jthiepler/gist/releases/tag/v0.1.0).
+2. Open the DMG and drag **Gist** to **Applications**.
+3. The beta is not yet notarized. On first launch, right-click **Gist**, choose
+   **Open**, and confirm the macOS warning.
+4. Grant microphone access if you plan to record sessions, then download a
+   note-writing model when prompted.
 
-## Quick start
-
-1. Create a client in Gist.
-2. Start a session, choose the desired inputs, and record; pause or resume as
-   needed.
-3. Stop the recording and let Gist transcribe it and identify speakers.
-4. Choose a note format, generate the note, edit the draft beside the
-   transcript, and export it as plain text.
-
-Review every generated note against the source material before using it in a
-clinical record. Gist is documentation assistance, not a diagnostic or
-clinical decision-making system.
+If something is confusing or breaks, please
+[open an issue](https://github.com/jthiepler/gist/issues). Therapists who would
+rather not use GitHub can [share structured feedback](https://tally.so/r/EkEWVo)
+or write to [gist@jthiepler.com](mailto:gist@jthiepler.com). Do not send real
+patient information, recordings, or transcripts through any of these channels.
 
 ## Note formats
 
-<details>
-<summary>Supported formats</summary>
+| Format | Sections |
+| --- | --- |
+| SOAP | Subjective, Objective, Assessment, Plan |
+| DAP | Data, Assessment, Plan |
+| BIRP | Behavior, Intervention, Response, Plan |
+| GIRP | Goal, Intervention, Response, Plan |
+| PIRP | Problem, Intervention, Response, Plan |
+| SIRP | Situation, Intervention, Response, Plan |
+| DART | Description, Assessment, Response, Treatment |
+| CBT | Session Overview, Cognitive Conceptualization, Behavioral Interventions, Cognitive Interventions, Progress and Plan |
+| Intake | Presenting Problem, Relevant History and Context, Mental Status, Risk Assessment, Clinical Impressions, Initial Plan |
 
-| Format | Sections | Typical use |
-| --- | --- | --- |
-| SOAP | Subjective, Objective, Assessment, Plan | Standard progress notes separating client report, observations, synthesis, and next steps. |
-| DAP | Data, Assessment, Plan | A compact format combining report and observations in the Data section. |
-| BIRP | Behavior, Intervention, Response, Plan | Documents the presenting behavior, care delivered, response, and follow-up. |
-| GIRP | Goal, Intervention, Response, Plan | Keeps the note centered on a documented treatment goal. |
-| PIRP | Problem, Intervention, Response, Plan | Focuses on one primary problem addressed during the session. |
-| SIRP | Situation, Intervention, Response, Plan | Organizes the current situation, intervention, client response, and plan. |
-| DART | Description, Assessment, Response, Treatment | Separates factual session description from clinical assessment and treatment. |
-| CBT | Session Overview, Cognitive Conceptualization, Behavioral Interventions, Cognitive Interventions, Progress and Plan | Captures explicitly documented cognitive-behavioral work. |
-| Intake | Presenting Problem, Relevant History and Context, Mental Status, Risk Assessment, Clinical Impressions, Initial Plan | Structures a comprehensive first-session evaluation. |
+Templates instruct the model to stay within the source material and state when
+information is missing. That guardrail is useful, but it is not infallible.
 
-Gist is instructed to use only information supported by the source materials.
-When information is missing, it should say so rather than inventing symptoms,
-diagnoses, risk findings, or treatment details.
+## Build it locally
 
-</details>
-
-## Built with
-
-- [Tauri 2](https://v2.tauri.app/) and [Rust](https://www.rust-lang.org/)
-- [Svelte](https://svelte.dev/), [SvelteKit](https://svelte.dev/docs/kit),
-  [Vite](https://vite.dev/), and TypeScript
-- [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm)
-  for Apple Silicon inference
-- [mlx-audio](https://github.com/Blaizzy/mlx-audio) with
-  [Parakeet TDT](https://huggingface.co/animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit)
-  for transcription
-- [pyannote Community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
-  for speaker diarization
-- [Qwen 3.5](https://huggingface.co/Qwen) MLX community models for local note
-  generation
-- Python, SQLite, JSON-RPC, and PyInstaller
-
-See [CREDITS.md](CREDITS.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
-for dependency, model, and license acknowledgments.
-
-## Development
-
-Clone the repository and install the frontend and Python dependencies:
+Gist has a SvelteKit frontend, a Tauri/Rust desktop layer, and a Python
+JSON-RPC sidecar for inference. Install the frontend and Python dependencies:
 
 ```bash
 npm install
 uv sync
 ```
 
-For a local sidecar smoke test:
+Run the routine checks:
 
 ```bash
+npm run check
+cargo check --manifest-path src-tauri/Cargo.toml
 uv run gist formats
 ```
 
-For a macOS application build, provide the two local model checkouts expected
-by the build script, then build the sidecar and Tauri app:
+Building the distributable app requires local checkouts of the Parakeet and
+pyannote models expected by `scripts/build-macos.sh`:
 
 ```text
 parakeet-tdt-0.6b-v3-mlx-4bit/
@@ -161,49 +172,37 @@ bash scripts/build-macos.sh
 npm run tauri:dmg
 ```
 
-The build creates an unsigned Apple Silicon DMG at
-`src-tauri/target/release/bundle/dmg/`. The model checkouts, PyInstaller
-output, Tauri resources, and Rust build artifacts are intentionally ignored
-by Git. The DMG build automatically detaches stale generated Gist images
-before packaging so an interrupted prior build does not block the next one.
+The unsigned Apple Silicon DMG is written to
+`src-tauri/target/release/bundle/dmg/`. Model checkouts, generated resources,
+PyInstaller output, and Rust build artifacts are ignored by Git.
 
-Useful checks:
+## Built with
 
-```bash
-npm run check
-cargo check --manifest-path src-tauri/Cargo.toml
-```
+[Tauri 2](https://v2.tauri.app/) · [SvelteKit](https://svelte.dev/) ·
+[MLX](https://github.com/ml-explore/mlx) ·
+[mlx-audio](https://github.com/Blaizzy/mlx-audio) ·
+[Parakeet TDT](https://huggingface.co/animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit) ·
+[pyannote Community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) ·
+[Qwen 3.5](https://huggingface.co/Qwen) · Python · Rust · SQLite
 
-## Project status
+See [CREDITS.md](CREDITS.md) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for model, dependency, and
+license acknowledgements.
 
-Gist is **v0.1 beta**. It is looking for early feedback from therapists,
-counselors, psychologists, psychiatrists, social workers, and developers who
-care about private clinical tooling. Expect rough edges and verify output
-carefully before relying on it in practice.
+## Contributing
 
-## Contributing and feedback
+The most useful contribution right now is candid feedback from therapists and
+private practitioners who have tried the workflow. You can complete the
+[therapist feedback form](https://tally.so/r/EkEWVo), email
+[gist@jthiepler.com](mailto:gist@jthiepler.com), or use
+[GitHub Issues](https://github.com/jthiepler/gist/issues) for technical reports.
+Documentation improvements and focused code contributions are also welcome.
 
-Feedback, bug reports, documentation improvements, and code contributions are
-welcome through [GitHub Issues](../../issues). Please do not include real
-patient information, recordings, transcripts, or other protected health
-information in issues or pull requests. Use synthetic examples instead.
+Please never include protected health information or real client material in
+an issue, discussion, commit, or pull request.
 
 ## License
 
-Gist is released under the [MIT License](LICENSE). Some model files and
-third-party packages have their own terms; consult [CREDITS.md](CREDITS.md)
-and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before redistributing a
-build.
-
-## Suggested GitHub setup
-
-- Recommended repository name: `gist` (use `gist-notes` if the shorter name
-  is unavailable).
-- Suggested topics: `therapy`, `clinical-notes`, `soap-notes`, `tauri`,
-  `macos`, `rust`, `python`, `mlx`, `privacy-first`, `apple-silicon`.
-- Add a `social_preview.png` at 1200×630 pixels once an app screenshot or
-  mockup is available, then set it under **Settings → General → Social
-  preview**.
-- A lightweight project landing page lives in [`docs/`](docs/) and is deployed
-  by [`.github/workflows/pages.yml`](.github/workflows/pages.yml). In the
-  repository settings, set **Pages → Source** to **GitHub Actions**.
+Gist is released under the [MIT License](LICENSE). Bundled models and some
+third-party packages have their own terms; review the credits and notices
+before redistributing a build.
