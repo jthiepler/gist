@@ -149,13 +149,14 @@ speaker-diarization-community-1/
 
 ```bash
 bash scripts/build-macos.sh
-npm run tauri build
+npm run tauri:dmg
 ```
 
 The build creates an unsigned Apple Silicon DMG at
 `src-tauri/target/release/bundle/dmg/`. The model checkouts, PyInstaller
 output, Tauri resources, and Rust build artifacts are intentionally ignored
-by Git.
+by Git. The DMG build automatically detaches stale generated Gist images
+before packaging so an interrupted prior build does not block the next one.
 
 Useful checks:
 
