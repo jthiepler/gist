@@ -55,7 +55,7 @@ uv run --group dev pyinstaller \
     --collect-all scipy \
     --collect-all miniaudio \
     --collect-all sentencepiece \
-    --add-data "gist/formats/defaults.json:gist/formats" \
+    --add-data "$PROJECT_DIR/gist/formats/defaults.json:gist/formats" \
     --runtime-hook gist/_runtime_hook.py \
     --exclude torchvision \
     --exclude onnx \
