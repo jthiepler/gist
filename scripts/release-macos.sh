@@ -41,9 +41,35 @@ export APPLE_ID APPLE_TEAM_ID APPLE_SIGNING_IDENTITY APPLE_PASSWORD
 
 cd "$PROJECT_DIR"
 
+sign_resource_macho_files() {
+  local resources_root="$PROJECT_DIR/src-tauri/resources/gist-sidecar"
+  local signed_count=0
+
+  echo "Signing Mach-O files inside bundled resources..."
+  while IFS= read -r -d '' candidate; do
+    if [[ "$(file -b "$candidate")" == *"Mach-O"* ]]; then
+      codesign \
+        --force \
+        --options runtime \
+        --timestamp \
+        --sign "$APPLE_SIGNING_IDENTITY" \
+        "$candidate"
+      signed_count=$((signed_count + 1))
+    fi
+  done < <(find "$resources_root" -type f -print0)
+
+  if (( signed_count == 0 )); then
+    echo "No Mach-O files were found in bundled resources." >&2
+    exit 1
+  fi
+
+  echo "Signed $signed_count bundled Mach-O files."
+}
+
 echo "Using signing identity: $APPLE_SIGNING_IDENTITY"
 echo "Building the macOS sidecar and bundled resources..."
 bash scripts/build-macos.sh
+sign_resource_macho_files
 
 echo "Building, signing, notarizing, and stapling the DMG..."
 npm run tauri:dmg
