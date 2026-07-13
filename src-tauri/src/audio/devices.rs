@@ -3,6 +3,8 @@ use serde::Serialize;
 
 #[cfg(target_os = "macos")]
 use cidre::core_audio as ca;
+#[cfg(target_os = "macos")]
+use std::collections::HashMap;
 
 #[derive(Clone, Serialize, Debug)]
 pub struct AudioDeviceInfo {
@@ -11,14 +13,71 @@ pub struct AudioDeviceInfo {
     pub device_type: String, // "input" or "output"
 }
 
+#[cfg(target_os = "macos")]
+fn core_audio_input_devices() -> anyhow::Result<Vec<(String, String)>> {
+    Ok(ca::System::devices()?
+        .into_iter()
+        .filter_map(|device| {
+            let has_input = device
+                .input_stream_cfg()
+                .map(|config| {
+                    config
+                        .buffers()
+                        .iter()
+                        .take(config.number_buffers())
+                        .any(|buffer| buffer.number_channels > 0)
+                })
+                .unwrap_or(false);
+            if !has_input {
+                return None;
+            }
+            let name = device.name().ok()?.to_string();
+            let uid = device.uid().ok()?.to_string();
+            Some((name, uid))
+        })
+        .collect())
+}
+
 pub fn enumerate_devices() -> anyhow::Result<Vec<AudioDeviceInfo>> {
     let host = cpal::default_host();
     let mut devices = Vec::new();
 
-    for (index, device) in host.input_devices()?.enumerate() {
+    #[cfg(target_os = "macos")]
+    let core_input_devices = core_audio_input_devices()?;
+
+    #[cfg(target_os = "macos")]
+    let mut input_name_occurrences = HashMap::<String, usize>::new();
+
+    #[cfg(not(target_os = "macos"))]
+    let mut input_index = 0;
+
+    for device in host.input_devices()? {
+        #[cfg(not(target_os = "macos"))]
+        let current_input_index = input_index;
+        #[cfg(not(target_os = "macos"))]
+        {
+            input_index += 1;
+        }
+
         if let Ok(name) = device.name() {
+            #[cfg(target_os = "macos")]
+            let id = {
+                let occurrence = input_name_occurrences.entry(name.clone()).or_insert(0);
+                let uid = core_input_devices
+                    .iter()
+                    .filter(|(candidate_name, _)| candidate_name == &name)
+                    .nth(*occurrence)
+                    .map(|(_, uid)| uid.clone());
+                *occurrence += 1;
+                uid.map(|uid| format!("input:uid:{uid}"))
+            };
+
+            #[cfg(not(target_os = "macos"))]
+            let id = Some(format!("input:{current_input_index}"));
+
+            let Some(id) = id else { continue };
             devices.push(AudioDeviceInfo {
-                id: format!("input:{index}"),
+                id,
                 name,
                 device_type: "input".to_string(),
             });
@@ -75,6 +134,31 @@ fn enumerate_output_devices(devices: &mut Vec<AudioDeviceInfo>) -> anyhow::Resul
 pub fn resolve_input_device(id: Option<&str>) -> anyhow::Result<cpal::Device> {
     let host = cpal::default_host();
     if let Some(id) = id {
+        #[cfg(target_os = "macos")]
+        if let Some(uid) = id.strip_prefix("input:uid:") {
+            let core_input_devices = core_audio_input_devices()?;
+            let selected_index = core_input_devices
+                .iter()
+                .position(|(_, candidate_uid)| candidate_uid == uid)
+                .ok_or_else(|| anyhow::anyhow!("Selected input device is no longer available"))?;
+            let selected_name = &core_input_devices[selected_index].0;
+            let selected_occurrence = core_input_devices[..selected_index]
+                .iter()
+                .filter(|(candidate_name, _)| candidate_name == selected_name)
+                .count();
+
+            return host
+                .input_devices()?
+                .filter(|device| {
+                    device
+                        .name()
+                        .map(|name| name == *selected_name)
+                        .unwrap_or(false)
+                })
+                .nth(selected_occurrence)
+                .ok_or_else(|| anyhow::anyhow!("Selected input device is no longer available"));
+        }
+
         if let Some(index) = id
             .strip_prefix("input:")
             .and_then(|value| value.parse::<usize>().ok())
