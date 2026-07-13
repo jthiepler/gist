@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -429,6 +431,7 @@ struct SidecarState {
     request_tx: Option<mpsc::UnboundedSender<String>>,
     response_tx: Option<(String, oneshot::Sender<Result<Value, String>>)>,
     child: Option<Child>,
+    sidecar_log: Option<Arc<Mutex<File>>>,
     started: bool,
     busy: bool,
 }
@@ -451,6 +454,26 @@ fn rpc_timeout(operation_type: &str) -> std::time::Duration {
 
 fn emit_sidecar_state(app: &AppHandle, busy: bool) {
     let _ = app.emit("sidecar-state", serde_json::json!({ "busy": busy }));
+}
+
+/// Append a privacy-safe lifecycle event from the Tauri side of the sidecar
+/// bridge. The sidecar's stderr uses the same file, so this gives us one
+/// chronological log for both processes without ever serializing RPC payloads.
+fn log_sidecar_event(log_file: Option<&Arc<Mutex<File>>>, level: &str, event: impl AsRef<str>) {
+    let Some(log_file) = log_file else {
+        return;
+    };
+    let Ok(mut file) = log_file.lock() else {
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "{} {} [tauri] {}",
+        Local::now().to_rfc3339(),
+        level,
+        event.as_ref()
+    );
+    let _ = file.flush();
 }
 
 // ── Sidecar Commands ──────────────────────────────────────────────────────
@@ -506,14 +529,23 @@ async fn start_sidecar(
     let model_cache_dir = app_dir.join("models");
     std::fs::create_dir_all(&model_cache_dir).map_err(|e| e.to_string())?;
     let log_path = app_dir.join("sidecar.log");
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .map(File::from)
-        .map(Stdio::from)
-        .unwrap_or(Stdio::null());
+    let mut log_options = OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    log_options.mode(0o600);
+    let log_handle = log_options.open(&log_path).map_err(|e| {
+        format!(
+            "Failed to open sidecar log at {}: {}",
+            log_path.display(),
+            e
+        )
+    })?;
+    let log_file = Arc::new(Mutex::new(log_handle));
+    let stderr_file = log_file
+        .lock()
+        .map_err(|e| e.to_string())?
+        .try_clone()
+        .map_err(|e| format!("Failed to prepare sidecar log: {}", e))?;
 
     let mut sidecar_command = Command::new(&sidecar_path);
     sidecar_command
@@ -522,10 +554,19 @@ async fn start_sidecar(
         .env("HF_HUB_CACHE", &model_cache_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(stderr);
+        .stderr(Stdio::from(stderr_file));
     let mut child = sidecar_command
         .spawn()
         .map_err(|e| format!("Failed to start sidecar: {}", e))?;
+
+    log_sidecar_event(
+        Some(&log_file),
+        "INFO",
+        format!(
+            "event=sidecar_started pid={} model_cache_configured=true",
+            child.id()
+        ),
+    );
 
     let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
@@ -533,29 +574,51 @@ async fn start_sidecar(
     let (req_tx, req_rx) = mpsc::unbounded_channel::<String>();
 
     // Writer task: owns stdin, drains request channel
+    let writer_log = log_file.clone();
     std::thread::spawn(move || {
         let mut stdin = stdin;
         let mut rx = req_rx;
         while let Some(line) = rx.blocking_recv() {
             if writeln!(stdin, "{}", line).is_err() {
+                log_sidecar_event(
+                    Some(&writer_log),
+                    "ERROR",
+                    "event=sidecar_stdin_write_failed",
+                );
                 break;
             }
             if stdin.flush().is_err() {
+                log_sidecar_event(
+                    Some(&writer_log),
+                    "ERROR",
+                    "event=sidecar_stdin_flush_failed",
+                );
                 break;
             }
         }
         // stdin dropped here → sidecar gets EOF on its stdin
+        log_sidecar_event(Some(&writer_log), "INFO", "event=sidecar_stdin_closed");
     });
 
     // Reader task: owns stdout, emits progress, routes responses
     let app_clone = app.clone();
     let state_clone: SharedSidecarState = state.inner().clone();
+    let reader_log = log_file.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
+        let mut last_progress_stage = String::new();
+        let mut last_progress_percent = 0_u64;
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(_) => break, // EOF or error → sidecar died
+                Err(_) => {
+                    log_sidecar_event(
+                        Some(&reader_log),
+                        "ERROR",
+                        "event=sidecar_stdout_read_failed",
+                    );
+                    break;
+                } // EOF or error → sidecar died
             };
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -563,15 +626,55 @@ async fn start_sidecar(
             }
             let parsed: Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    log_sidecar_event(
+                        Some(&reader_log),
+                        "WARN",
+                        "event=sidecar_stdout_invalid_json",
+                    );
+                    continue;
+                }
             };
 
             match parsed.get("type").and_then(|v| v.as_str()) {
                 Some("progress") => {
+                    let percent = parsed
+                        .get("percent")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    let stage = parsed
+                        .get("stage")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    if stage != last_progress_stage
+                        || percent == 0
+                        || percent == 100
+                        || percent >= last_progress_percent.saturating_add(10)
+                    {
+                        log_sidecar_event(
+                            Some(&reader_log),
+                            "INFO",
+                            format!("event=sidecar_progress percent={} stage={}", percent, stage),
+                        );
+                        last_progress_stage = stage.to_string();
+                        last_progress_percent = percent;
+                    }
                     let _ = app_clone.emit("sidecar-progress", &parsed);
                 }
                 Some("result") | Some("pong") => {
                     let request_id = parsed.get("request_id").and_then(|value| value.as_str());
+                    log_sidecar_event(
+                        Some(&reader_log),
+                        "INFO",
+                        format!(
+                            "event=sidecar_response_received response_type={} request_id={}",
+                            parsed
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown"),
+                            request_id.unwrap_or("unknown")
+                        ),
+                    );
                     let resp_tx = {
                         if let Ok(mut s) = state_clone.lock() {
                             if s.response_tx.as_ref().map(|(id, _)| Some(id.as_str()))
@@ -603,6 +706,15 @@ async fn start_sidecar(
                         .unwrap_or("Unknown error")
                         .to_string();
                     let request_id = parsed.get("request_id").and_then(|value| value.as_str());
+                    log_sidecar_event(
+                        Some(&reader_log),
+                        "ERROR",
+                        format!(
+                            "event=sidecar_error_response request_id={} message_length={}",
+                            request_id.unwrap_or("unknown"),
+                            msg.len()
+                        ),
+                    );
                     let resp_tx = {
                         if let Ok(mut s) = state_clone.lock() {
                             if s.response_tx.as_ref().map(|(id, _)| Some(id.as_str()))
@@ -631,10 +743,17 @@ async fn start_sidecar(
             }
         }
 
-        // EOF on stdout — sidecar died
+        // EOF on stdout — sidecar died or was intentionally stopped.
+        let unexpected_exit = state_clone.lock().map(|s| s.started).unwrap_or(false);
+        log_sidecar_event(
+            Some(&reader_log),
+            if unexpected_exit { "ERROR" } else { "INFO" },
+            "event=sidecar_stdout_closed",
+        );
         if let Ok(mut s) = state_clone.lock() {
             s.started = false;
             s.busy = false;
+            s.sidecar_log = None;
             if let Some((_, tx)) = s.response_tx.take() {
                 let _ = tx.send(Err("Sidecar closed connection unexpectedly".into()));
             }
@@ -644,6 +763,7 @@ async fn start_sidecar(
 
     s.request_tx = Some(req_tx);
     s.child = Some(child);
+    s.sidecar_log = Some(log_file);
     s.started = true;
     s.busy = false;
 
@@ -656,6 +776,8 @@ async fn stop_sidecar(
     state: State<'_, SharedSidecarState>,
 ) -> Result<String, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
+    let log_file = s.sidecar_log.clone();
+    log_sidecar_event(log_file.as_ref(), "INFO", "event=sidecar_stop_requested");
     s.started = false;
     s.busy = false;
     s.request_tx.take(); // drop → writer task exits, stdin closes
@@ -669,6 +791,8 @@ async fn stop_sidecar(
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    s.sidecar_log = None;
 
     emit_sidecar_state(&app, false);
     Ok("Sidecar stopped".into())
@@ -717,26 +841,67 @@ async fn rpc_call(
             Some(tx) => tx.clone(),
             None => return Err("Sidecar not running".into()),
         };
+        let log_file = s.sidecar_log.clone();
         s.busy = true;
         s.response_tx = Some((request_id.clone(), tx));
 
         if req_tx.send(request).is_err() {
+            log_sidecar_event(
+                log_file.as_ref(),
+                "ERROR",
+                format!(
+                    "event=rpc_request_send_failed operation={} request_id={}",
+                    operation_type, request_id
+                ),
+            );
             s.busy = false;
             s.response_tx.take();
             return Err("Failed to send request to sidecar".into());
         }
+
+        log_sidecar_event(
+            log_file.as_ref(),
+            "INFO",
+            format!(
+                "event=rpc_request_sent operation={} request_id={}",
+                operation_type, request_id
+            ),
+        );
     }
 
     emit_sidecar_state(&app, true);
 
-    match tokio::time::timeout(rpc_timeout(&operation_type), &mut rx).await {
-        Ok(Ok(result)) => result,
+    let result = match tokio::time::timeout(rpc_timeout(&operation_type), &mut rx).await {
+        Ok(Ok(result)) => {
+            let level = if result.is_ok() { "INFO" } else { "ERROR" };
+            let log_file = state.lock().ok().and_then(|s| s.sidecar_log.clone());
+            log_sidecar_event(
+                log_file.as_ref(),
+                level,
+                format!(
+                    "event=rpc_request_completed operation={} request_id={} success={}",
+                    operation_type,
+                    request_id,
+                    result.is_ok()
+                ),
+            );
+            result
+        }
         Ok(Err(_)) => {
             let mut s = state.lock().map_err(|e| e.to_string())?;
+            let log_file = s.sidecar_log.clone();
             if s.response_tx.as_ref().map(|(id, _)| id) == Some(&request_id) {
                 s.response_tx.take();
                 s.busy = false;
             }
+            log_sidecar_event(
+                log_file.as_ref(),
+                "ERROR",
+                format!(
+                    "event=rpc_response_channel_closed operation={} request_id={}",
+                    operation_type, request_id
+                ),
+            );
             emit_sidecar_state(&app, false);
             Err("Sidecar response channel closed".into())
         }
@@ -748,6 +913,15 @@ async fn rpc_call(
             if let Some(tx) = cancel_tx {
                 let _ = tx.send(r#"{"type":"cancel"}"#.to_string());
             }
+            let log_file = state.lock().ok().and_then(|s| s.sidecar_log.clone());
+            log_sidecar_event(
+                log_file.as_ref(),
+                "ERROR",
+                format!(
+                    "event=rpc_request_timed_out operation={} request_id={}",
+                    operation_type, request_id
+                ),
+            );
 
             // Give cooperative MLX cancellation a short chance to unwind. If it
             // remains stuck, stop the process; ensureSidecar will start a fresh
@@ -765,11 +939,14 @@ async fn rpc_call(
                 }
                 s.started = false;
                 s.busy = false;
+                s.sidecar_log = None;
             }
             emit_sidecar_state(&app, false);
             Err("Sidecar operation timed out".into())
         }
-    }
+    };
+
+    result
 }
 
 #[tauri::command]
@@ -785,6 +962,16 @@ async fn cancel_sidecar(
         }
         active_request_id
     };
+
+    let log_file = state.lock().ok().and_then(|s| s.sidecar_log.clone());
+    log_sidecar_event(
+        log_file.as_ref(),
+        "INFO",
+        format!(
+            "event=sidecar_cancel_requested request_id={}",
+            active_request_id.as_deref().unwrap_or("none")
+        ),
+    );
 
     let Some(active_request_id) = active_request_id else {
         return Ok(());
@@ -806,6 +993,15 @@ async fn cancel_sidecar(
         }
         s.started = false;
         s.busy = false;
+        s.sidecar_log = None;
+        log_sidecar_event(
+            log_file.as_ref(),
+            "INFO",
+            format!(
+                "event=sidecar_cancel_forced request_id={}",
+                active_request_id
+            ),
+        );
         emit_sidecar_state(&app, false);
     }
     Ok(())
@@ -1913,6 +2109,7 @@ pub fn run() {
                 request_tx: None,
                 response_tx: None,
                 child: None,
+                sidecar_log: None,
                 started: false,
                 busy: false,
             })));

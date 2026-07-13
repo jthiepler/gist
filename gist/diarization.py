@@ -47,13 +47,16 @@ def resolve_model_path() -> Optional[Path]:
 
 
 def is_available() -> bool:
-    return resolve_model_path() is not None
+    available = resolve_model_path() is not None
+    log.info("event=diarization_model_checked available=%s", available)
+    return available
 
 
 @lru_cache(maxsize=1)
 def _load_pipeline(model_path: str) -> Any:
     from pyannote.audio import Pipeline
 
+    log.info("event=diarization_pipeline_load_started")
     pipeline = Pipeline.from_pretrained(model_path)
 
     # Community-1 uses PyTorch. Prefer Metal on supported Macs, but keep the
@@ -66,6 +69,7 @@ def _load_pipeline(model_path: str) -> Any:
     else:
         log.info("Metal is unavailable; using CPU for speaker diarization")
 
+    log.info("event=diarization_pipeline_loaded")
     return pipeline
 
 
@@ -86,6 +90,7 @@ def diarize_audio(
     """Return speaker turns for an audio file using only local model files."""
     model_path = resolve_model_path()
     if model_path is None:
+        log.error("event=diarization_model_missing")
         raise FileNotFoundError(
             "Local pyannote model not found. Set GIST_DIARIZATION_MODEL_PATH or "
             f"place it in {MODEL_DIR_NAME}."
@@ -97,6 +102,7 @@ def diarize_audio(
         progress_callback(0, "Preparing speaker identification...")
 
     pipeline = _load_pipeline(str(model_path))
+    log.info("event=diarization_started")
 
     stage_ranges = {
         "segmentation": (5, 65, "Analyzing speech..."),
@@ -140,6 +146,7 @@ def diarize_audio(
     turns = list(_iter_turns(annotation))
     if progress_callback:
         progress_callback(100, "Finalizing transcript...")
+    log.info("event=diarization_finished turns=%d", len(turns))
     return turns
 
 

@@ -22,9 +22,10 @@ def _get_cached_llm(model_repo: str, revision: str):
     global _cached_llm, _cached_llm_repo
     cache_key = f"{model_repo}@{revision}"
     if _cached_llm is not None and _cached_llm_repo == cache_key:
-        log.info("Reusing loaded note-generation model")
+        log.info("event=llm_model_cache_hit model_repo=%s revision=%s", model_repo, revision)
         return _cached_llm
 
+    log.info("event=llm_model_cache_miss model_repo=%s revision=%s", model_repo, revision)
     release_cached_llm()
     from .llm.mlx_backend import MLXBackend
 
@@ -32,6 +33,7 @@ def _get_cached_llm(model_repo: str, revision: str):
     llm.load(model_repo, revision=revision)
     _cached_llm = llm
     _cached_llm_repo = cache_key
+    log.info("event=llm_model_cached model_repo=%s revision=%s", model_repo, revision)
     return llm
 
 
@@ -46,9 +48,10 @@ def release_cached_llm(model_name: Optional[str] = None) -> None:
         except (KeyError, ValueError):
             return
     if _cached_llm is not None:
+        log.info("event=llm_model_cache_released")
         _cached_llm.cleanup()
-    _cached_llm = None
-    _cached_llm_repo = None
+        _cached_llm = None
+        _cached_llm_repo = None
 
 
 def _probe_audio_duration(audio_path: str) -> float:
@@ -58,7 +61,7 @@ def _probe_audio_duration(audio_path: str) -> float:
         info = miniaudio.get_file_info(audio_path)
         return float(info.duration)
     except Exception as e:
-        log.warning("Audio duration probe failed: %s", e)
+        log.warning("event=audio_duration_probe_failed error_type=%s", type(e).__name__)
         return 0.0
 
 
@@ -68,20 +71,25 @@ def transcribe_audio(
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> TranscriptResult:
+    log.info("event=transcription_pipeline_started diarize=%s", diarize)
     model_path = resolve_model_path()
     if model_path is None:
+        log.error("event=transcription_model_missing")
         raise FileNotFoundError(
             "Bundled transcription model not found. Rebuild the app with "
             "the required model resources."
         )
     backend = create_transcription_backend()
+    log.info("event=transcription_backend_created backend=%s", type(backend).__name__)
 
     if progress_callback:
         progress_callback(0, "Preparing transcription...")
 
     try:
         backend.load(str(model_path))
+        log.info("event=transcription_model_ready backend=%s", type(backend).__name__)
         audio_duration = _probe_audio_duration(audio_path)
+        log.info("event=audio_duration_ready duration_seconds=%.1f", audio_duration)
 
         # ETA tracking — rate-based with EMA smoothing.
         # The first chunk includes MLX kernel warmup (~10s) and is NOT representative
@@ -136,15 +144,22 @@ def transcribe_audio(
         result = backend.transcribe(
             audio_path, progress_callback=_wrapped, cancel_event=cancel_event
         )
+        log.info(
+            "event=transcription_backend_completed segments=%d duration_seconds=%.1f",
+            len(result.segments),
+            result.duration,
+        )
         if audio_duration > 0:
             result.duration = audio_duration
 
         # Session recordings are diarized locally after transcription. Clinician
         # dictation can opt out because it is a single-speaker source.
         if diarize and result.segments:
+            log.info("event=diarization_started segments=%d", len(result.segments))
             from .diarization import attach_speakers, diarize_audio, is_available, render_speaker_transcript
 
             if not is_available():
+                log.error("event=diarization_model_missing")
                 raise FileNotFoundError(
                     "Speaker diarization model is not bundled. Rebuild the app with "
                     "speaker-diarization-community-1 in src-tauri/resources/pyannote/."
@@ -166,10 +181,12 @@ def transcribe_audio(
             )
             attach_speakers(result.segments, turns)
             result.text = render_speaker_transcript(result.segments)
+            log.info("event=diarization_completed turns=%d", len(turns))
 
         return result
     finally:
         backend.cleanup()
+        log.info("event=transcription_backend_cleaned backend=%s", type(backend).__name__)
 
 
 def generate_note(
@@ -186,6 +203,14 @@ def generate_note(
     from .formats.defaults import build_messages
 
     spec = resolve_model(llm_model, "llm")
+    log.info(
+        "event=note_generation_pipeline_started model=%s format=%s source_chars=%d thinking=%s prompt_provided=%s",
+        llm_model,
+        format_name,
+        len(transcript),
+        thinking,
+        prompt is not None,
+    )
 
     if progress_callback:
         progress_callback(0, "Preparing note generation...")
@@ -202,6 +227,7 @@ def generate_note(
         messages = build_messages({"prompt": prompt}, transcript)
     else:
         messages = get_format(format_name).build_messages(transcript)
+    log.info("event=note_generation_messages_ready message_count=%d", len(messages))
 
     note = llm.generate(
         messages=messages,
@@ -213,4 +239,5 @@ def generate_note(
     if progress_callback:
         progress_callback(100, "Finalizing note...")
 
+    log.info("event=note_generation_pipeline_completed note_chars=%d", len(note))
     return note

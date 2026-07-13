@@ -94,6 +94,12 @@ def download_model(
             file_sizes = {s.rfilename: (s.size or 0) for s in siblings}
             total_size = sum(file_sizes.values()) or 1
             accumulated = 0
+            log.info(
+                "event=model_download_metadata model=%s files=%d total_bytes=%d",
+                spec.name,
+                total_files,
+                total_size,
+            )
 
             for i, sibling in enumerate(siblings):
                 if cancel_event and cancel_event.is_set():
@@ -101,6 +107,14 @@ def download_model(
                 filename = sibling.rfilename
                 file_size = file_sizes[filename]
                 base = accumulated
+                log.info(
+                    "event=model_download_file_started model=%s file_index=%d total_files=%d file_name=%s file_bytes=%d",
+                    spec.name,
+                    i + 1,
+                    total_files,
+                    filename,
+                    file_size,
+                )
 
                 tqdm_cls = _make_progress_tqdm(
                     base, filename, i + 1, total_files, total_size, progress_callback,
@@ -137,7 +151,7 @@ def download_model(
         local_files_only=True,
         cache_dir=cache_dir_str,
     )
-    log.info("Downloaded %s to %s", spec.name, path)
+    log.info("event=model_download_completed model=%s", spec.name)
     return Path(path)
 
 
@@ -158,12 +172,12 @@ def is_model_downloaded(model_name: str, kind: str = "llm") -> bool:
 
 def delete_model(model_name: str, kind: str = "llm", cache_dir: Optional[Path] = None) -> None:
     spec = resolve_model(model_name, kind)
-    log.info("Deleting %s model '%s' from cache...", kind, spec.name)
+    log.info("event=model_delete_started kind=%s model=%s", kind, spec.name)
     model_cache = _model_cache_dir(model_name, kind=kind, cache_dir=cache_dir)
     if not model_cache.exists():
-        log.info("Model '%s' not in cache, nothing to delete", spec.name)
+        log.info("event=model_delete_skipped model=%s reason=not_cached", spec.name)
         return
     shutil.rmtree(model_cache)
     if model_cache.exists():
         raise OSError(f"Model cache still exists after deletion: {model_cache}")
-    log.info("Deleted cache directory: %s", model_cache)
+    log.info("event=model_delete_completed model=%s", spec.name)

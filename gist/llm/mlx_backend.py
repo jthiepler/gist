@@ -30,9 +30,9 @@ class MLXBackend(LLMBackend):
         self.tokenizer = None
 
     def load(self, model_path: str, revision: Optional[str] = None):
-        log.info("Loading MLX model from %s", model_path)
+        log.info("event=mlx_model_load_started revision=%s", revision or "default")
         self.model, self.tokenizer = load(model_path, revision=revision)
-        log.info("Model loaded")
+        log.info("event=mlx_model_loaded revision=%s", revision or "default")
 
     def generate(
         self,
@@ -54,7 +54,12 @@ class MLXBackend(LLMBackend):
         if isinstance(prompt, list):
             prompt = self.tokenizer.decode(prompt)
 
-        log.info("Generating (max_tokens=%d, thinking=%s)...", max_tokens, thinking)
+        log.info(
+            "event=mlx_generation_started max_tokens=%d thinking=%s message_count=%d",
+            max_tokens,
+            thinking,
+            len(messages),
+        )
 
         sampler = _make_sampler(temperature)
 
@@ -83,8 +88,14 @@ class MLXBackend(LLMBackend):
             )
         if finish_reason != "stop":
             raise RuntimeError("The model stopped without completing the note. Please try again.")
+        log.info(
+            "event=mlx_generation_completed finish_reason=%s output_chars=%d",
+            finish_reason,
+            len(text),
+        )
         return text
 
     def cleanup(self):
         self.model = None
         self.tokenizer = None
+        log.info("event=mlx_model_released")

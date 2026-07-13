@@ -48,11 +48,11 @@ class ParakeetBackend(TranscriptionBackend):
         self.model = None
 
     def load(self, model_path: str):
-        log.info("Loading Parakeet model from %s", model_path)
+        log.info("event=parakeet_model_load_started")
         from mlx_audio.stt.utils import load as load_model
 
         self.model = load_model(model_path)
-        log.info("Parakeet model loaded")
+        log.info("event=parakeet_model_loaded")
 
     def transcribe(
         self,
@@ -67,7 +67,7 @@ class ParakeetBackend(TranscriptionBackend):
         if not path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        log.info("Transcribing audio")
+        log.info("event=parakeet_transcription_started")
 
         segments: list[Segment] = []
 
@@ -109,6 +109,11 @@ class ParakeetBackend(TranscriptionBackend):
 
         full_text = " ".join(segment.text for segment in segments).strip()
         duration = segments[-1].end if segments else 0.0
+        log.info(
+            "event=parakeet_transcription_completed segments=%d duration_seconds=%.1f",
+            len(segments),
+            duration,
+        )
 
         return TranscriptResult(
             text=full_text,
@@ -118,3 +123,4 @@ class ParakeetBackend(TranscriptionBackend):
 
     def cleanup(self):
         self.model = None
+        log.info("event=parakeet_model_released")

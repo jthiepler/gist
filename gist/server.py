@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import sys
 import threading
 import time
+import traceback
 from typing import Any, Dict, Optional
 
 from .downloader import delete_model, download_model, is_model_downloaded
@@ -31,8 +33,67 @@ def _log_event(operation: str, event: str, started_at: Optional[float] = None, *
     payload: Dict[str, Any] = {"operation": operation, "event": event}
     if started_at is not None:
         payload["elapsed_ms"] = round((time.monotonic() - started_at) * 1000)
+    if _active_request_id is not None and "request_id" not in fields:
+        fields["request_id"] = _active_request_id
     payload.update(fields)
     log.info("sidecar_event=%s", json.dumps(payload, sort_keys=True))
+
+
+def _log_failure(operation: str, error: Exception, started_at: Optional[float] = None, **fields: Any) -> None:
+    """Log an exception type and stack frames without logging exception text.
+
+    Exception messages can contain an audio path or data supplied by a caller.
+    The user-facing response is intentionally generic, so diagnostics follow
+    the same rule and retain only the type plus code-location context.
+    """
+    _log_event(
+        operation,
+        "failed",
+        started_at,
+        error_type=type(error).__name__,
+        **fields,
+    )
+    frames = " | ".join(line.strip() for line in traceback.format_tb(error.__traceback__))
+    if frames:
+        log.error(
+            "sidecar_traceback operation=%s error_type=%s frames=%s",
+            operation,
+            type(error).__name__,
+            frames,
+        )
+
+
+class _ProgressTracker:
+    """Rate-limit progress diagnostics while keeping every progress update in the UI."""
+
+    def __init__(self, operation: str):
+        self.operation = operation
+        self.last_stage: Optional[str] = None
+        self.last_percent = -1
+
+    def report(
+        self,
+        percent: int,
+        stage: str,
+        *,
+        eta_seconds: Optional[float] = None,
+        audio_duration: Optional[float] = None,
+    ) -> None:
+        percent = int(percent)
+        should_log = (
+            stage != self.last_stage
+            or percent in {0, 100}
+            or percent >= self.last_percent + 10
+        )
+        if should_log:
+            fields: Dict[str, Any] = {"percent": percent, "stage": stage}
+            if eta_seconds is not None:
+                fields["eta_seconds"] = round(eta_seconds, 1)
+            if audio_duration is not None and audio_duration > 0:
+                fields["audio_duration_seconds"] = round(audio_duration, 1)
+            _log_event(self.operation, "progress", **fields)
+            self.last_stage = stage
+            self.last_percent = percent
 
 
 def _params_for(msg: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
@@ -84,6 +145,8 @@ def _user_facing_error(operation: str, error: Exception) -> str:
         return "Gist could not generate this note. Try again, or choose a different downloaded model."
     if operation == "model_download":
         return "Gist could not download this model. Check your internet connection and available storage, then try again."
+    if operation == "model_delete":
+        return "Gist could not remove this model. Try again, or restart Gist and try again."
     return "Gist could not complete that request. Please try again."
 
 
@@ -91,8 +154,21 @@ def _send(obj: Dict[str, Any]):
     if _active_request_id and obj.get("type") in {"progress", "result", "error", "pong"}:
         obj = {**obj, "request_id": _active_request_id}
     line = json.dumps(obj, ensure_ascii=False)
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        log.warning(
+            "sidecar_event=%s",
+            json.dumps(
+                {
+                    "operation": "rpc",
+                    "event": "response_write_failed",
+                    "response_type": obj.get("type", "unknown"),
+                },
+                sort_keys=True,
+            ),
+        )
 
 
 def _send_progress(
@@ -118,18 +194,33 @@ def _stdin_reader():
         try:
             msg = json.loads(line)
         except json.JSONDecodeError as e:
+            _log_event("rpc", "invalid_json", error_type=type(e).__name__, request_id=None)
             _send({"type": "error", "message": f"Invalid JSON: {e}"})
             continue
         if not isinstance(msg, dict):
+            _log_event(
+                "rpc",
+                "invalid_request",
+                request_type=type(msg).__name__,
+                request_id=None,
+            )
             _send({"type": "error", "message": f"Expected JSON object, got {type(msg).__name__}"})
             continue
         msg_type = msg.get("type", "")
         if msg_type == "cancel":
+            _log_event("rpc", "cancel_received", request_id=msg.get("request_id"))
             _cancel_event.set()
             # Don't queue — it's a control message
         else:
             _request_queue.put(msg)
+            _log_event(
+                "rpc",
+                "request_queued",
+                request_type=msg_type if isinstance(msg_type, str) else type(msg_type).__name__,
+                request_id=msg.get("request_id"),
+            )
     # stdin closed — signal main thread to exit
+    _log_event("rpc", "stdin_closed", request_id=None)
     _request_queue.put(None)
 
 
@@ -137,12 +228,19 @@ def _handle_transcribe(params: Dict[str, Any]):
     audio_file = params.get("audio_file", "")
     diarize = params.get("diarize", False)
     started_at = time.monotonic()
-    _log_event("transcription", "started", diarize=diarize)
+    _log_event("transcription", "started", diarize=diarize, audio_file_provided=True)
 
     duration_sent = False
+    progress_log = _ProgressTracker("transcription")
 
     def progress(pct, stage, eta_seconds=None, audio_duration=None, **_kw):
         nonlocal duration_sent
+        progress_log.report(
+            pct,
+            stage,
+            eta_seconds=eta_seconds,
+            audio_duration=audio_duration,
+        )
         include_duration = audio_duration if not duration_sent else None
         _send_progress(pct, stage, eta_seconds=eta_seconds, audio_duration=include_duration)
         if audio_duration is not None:
@@ -169,8 +267,7 @@ def _handle_transcribe(params: Dict[str, Any]):
         _log_event("transcription", "cancelled", started_at, diarize=diarize)
         _send({"type": "error", "message": "Transcription cancelled"})
     except Exception as e:
-        _log_event("transcription", "failed", started_at, error_type=type(e).__name__)
-        log.exception("Transcription failed")
+        _log_failure("transcription", e, started_at, diarize=diarize)
         _send({"type": "error", "message": _user_facing_error("transcription", e)})
 
 
@@ -182,9 +279,19 @@ def _handle_generate_note(params: Dict[str, Any]):
     thinking = params.get("thinking", False)
     prompt = params.get("prompt")
     started_at = time.monotonic()
-    _log_event("note_generation", "started", model=llm_model, format=format_name, thinking=thinking)
+    _log_event(
+        "note_generation",
+        "started",
+        model=llm_model,
+        format=format_name,
+        thinking=thinking,
+        source_chars=len(transcript),
+        prompt_provided=prompt is not None,
+    )
+    progress_log = _ProgressTracker("note_generation")
 
     def progress(pct, stage):
+        progress_log.report(pct, stage)
         _send_progress(pct, stage)
 
     try:
@@ -199,13 +306,19 @@ def _handle_generate_note(params: Dict[str, Any]):
             cancel_event=_cancel_event,
         )
         _send({"type": "result", "note": note, "format": format_name})
-        _log_event("note_generation", "completed", started_at, model=llm_model, format=format_name)
+        _log_event(
+            "note_generation",
+            "completed",
+            started_at,
+            model=llm_model,
+            format=format_name,
+            note_chars=len(note),
+        )
     except InterruptedError:
         _log_event("note_generation", "cancelled", started_at, model=llm_model, format=format_name)
         _send({"type": "error", "message": "Note generation cancelled"})
     except Exception as e:
-        _log_event("note_generation", "failed", started_at, model=llm_model, format=format_name, error_type=type(e).__name__)
-        log.exception("Note generation failed")
+        _log_failure("note_generation", e, started_at, model=llm_model, format=format_name)
         _send({"type": "error", "message": _user_facing_error("note_generation", e)})
 
 
@@ -214,8 +327,10 @@ def _handle_download_model(params: Dict[str, Any]):
     kind = params.get("kind", "llm")
     started_at = time.monotonic()
     _log_event("model_download", "started", model=model_name)
+    progress_log = _ProgressTracker("model_download")
 
     def progress(pct, stage):
+        progress_log.report(pct, stage)
         _send_progress(pct, stage)
 
     try:
@@ -227,22 +342,24 @@ def _handle_download_model(params: Dict[str, Any]):
         _log_event("model_download", "cancelled", started_at, model=model_name)
         _send({"type": "error", "message": "Download cancelled"})
     except Exception as e:
-        _log_event("model_download", "failed", started_at, model=model_name, error_type=type(e).__name__)
-        log.exception("Download failed")
+        _log_failure("model_download", e, started_at, model=model_name)
         _send({"type": "error", "message": _user_facing_error("model_download", e)})
 
 
 def _handle_delete_model(params: Dict[str, Any]):
     model_name = params.get("model", DEFAULT_LLM)
     kind = params.get("kind", "llm")
+    started_at = time.monotonic()
+    _log_event("model_delete", "started", model=model_name)
 
     try:
         release_cached_llm(model_name)
         delete_model(model_name, kind=kind)
         _send({"type": "result", "ok": True, "model": model_name})
+        _log_event("model_delete", "completed", started_at, model=model_name)
     except Exception as e:
-        log.exception("Delete failed")
-        _send({"type": "error", "message": _user_facing_error("model_download", e)})
+        _log_failure("model_delete", e, started_at, model=model_name)
+        _send({"type": "error", "message": _user_facing_error("model_delete", e)})
 
 
 def run_server():
@@ -250,9 +367,11 @@ def run_server():
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+        force=True,
     )
-    log.info("JSON-RPC server started")
+    log.info("event=json_rpc_server_started pid=%s", os.getpid())
 
     reader = threading.Thread(target=_stdin_reader, daemon=True)
     reader.start()
@@ -264,13 +383,25 @@ def run_server():
             break
 
         msg_type = msg.get("type", "")
+        request_type = msg_type if isinstance(msg_type, str) else type(msg_type).__name__
+        request_started_at = time.monotonic()
         _active_request_id = msg.get("request_id")
+        _log_event(
+            "rpc",
+            "request_received",
+            request_type=request_type,
+            parameter_keys=sorted(
+                str(key)
+                for key in (msg.get("params", msg) if isinstance(msg.get("params", msg), dict) else {})
+            ),
+        )
 
         # Clear cancel event before each operation
         _cancel_event.clear()
 
         try:
             params = _params_for(msg, msg_type)
+            _log_event("rpc", "request_validated", request_type=request_type)
             if msg_type == "ping":
                 _send({"type": "pong"})
             elif msg_type == "exit":
@@ -287,9 +418,12 @@ def run_server():
                     }
                     for name, spec in LLM_MODELS.items()
                 }
+                _log_event("model_listing", "completed", model_count=len(llm_info))
                 _send({"type": "result", "llm": llm_info})
             elif msg_type == "list_formats":
-                _send({"type": "result", "formats": list_formats()})
+                formats = list_formats()
+                _log_event("format_listing", "completed", format_count=len(formats))
+                _send({"type": "result", "formats": formats})
             elif msg_type == "transcribe":
                 _handle_transcribe(params)
             elif msg_type == "generate_note":
@@ -299,11 +433,24 @@ def run_server():
             elif msg_type == "delete_model":
                 _handle_delete_model(params)
             else:
-                _send({"type": "error", "message": f"Unknown message type: {msg_type}"})
+                _log_event("rpc", "unknown_request_type", request_type=request_type)
+                _send({"type": "error", "message": f"Unknown message type: {request_type}"})
         except Exception as e:
-            log.warning("Rejected sidecar request: %s", e)
+            _log_event(
+                "rpc",
+                "request_rejected",
+                request_started_at,
+                request_type=request_type,
+                error_type=type(e).__name__,
+            )
+            log.warning(
+                "event=request_rejected request_type=%s error_type=%s",
+                request_type,
+                type(e).__name__,
+            )
             _send({"type": "error", "message": f"Invalid request: {e}"})
+        finally:
+            _log_event("rpc", "request_finished", request_started_at, request_type=request_type)
+            _active_request_id = None
 
-        _active_request_id = None
-
-    log.info("JSON-RPC server exiting (stdin closed)")
+    log.info("event=json_rpc_server_exiting")
