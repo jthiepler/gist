@@ -81,6 +81,7 @@
   let addError = $state("");
   let recoverableRecordingJobs = $state<RecordingJob[]>([]);
   let recordingRecoveryError = $state("");
+  let shortRecordingJob = $state<RecordingJob | null>(null);
   const processingRecordingJobs = new Set<string>();
   let patientSearch = $state("");
   let patientSearchInput = $state<HTMLInputElement | null>(null);
@@ -181,7 +182,8 @@
     try {
       const job = await getRecordingJob(data.job_id);
       if (data.is_short_recording) {
-        recordingRecoveryError = "This recording is shorter than five seconds. It was saved, but may not contain enough audio to transcribe. Process it only if that was intentional, or discard it.";
+        recordingRecoveryError = "";
+        shortRecordingJob = job;
         recoverableRecordingJobs = [job, ...recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id)];
         return;
       }
@@ -216,22 +218,34 @@
 
   async function retryRecordingJob(job: RecordingJob) {
     recordingRecoveryError = "";
+    if (shortRecordingJob?.id === job.id) shortRecordingJob = null;
+    recoverableRecordingJobs = recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id);
     try {
       await processRecordingJob(job);
     } catch (e) {
       const message = `Could not process this recording: ${String(e)}`;
       recordingRecoveryError = message;
-      await setRecordingJobError(job.id, message);
-      recoverableRecordingJobs = await listRecoverableRecordingJobs();
+      try {
+        await setRecordingJobError(job.id, message);
+        recoverableRecordingJobs = await listRecoverableRecordingJobs();
+      } catch {
+        recoverableRecordingJobs = [
+          { ...job, state: "recorded", error: message },
+          ...recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id),
+        ];
+      }
     }
   }
 
   async function discardRecoveredRecording(job: RecordingJob) {
     recordingRecoveryError = "";
+    const wasShortRecording = shortRecordingJob?.id === job.id;
+    if (wasShortRecording) shortRecordingJob = null;
     try {
       await discardRecordingJob(job.id);
       recoverableRecordingJobs = recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id);
     } catch (e) {
+      if (wasShortRecording) shortRecordingJob = job;
       recordingRecoveryError = `Could not discard this recording: ${String(e)}`;
     }
   }
@@ -719,13 +733,27 @@
   </div>
 {/if}
 
-{#if recordingRecoveryError || recoverableRecordingJobs.length > 0}
+{#if shortRecordingJob}
+  <section class="recording-recovery-card" role="alert" aria-live="assertive">
+    <div>
+      <strong>Short recording</strong>
+      <p>This recording is shorter than five seconds. It was saved, but may not contain enough audio to transcribe. Process it only if that was intentional, or discard it.</p>
+    </div>
+    <div class="recording-recovery-actions">
+      <span>Saved recording awaiting your choice</span>
+      <button class="btn btn-sm btn-primary" onclick={() => retryRecordingJob(shortRecordingJob!)}>Process recording</button>
+      <button class="btn btn-sm btn-danger" onclick={() => discardRecoveredRecording(shortRecordingJob!)}>Discard recording</button>
+    </div>
+  </section>
+{/if}
+
+{#if recordingRecoveryError || recoverableRecordingJobs.some((job) => job.id !== shortRecordingJob?.id)}
   <section class="recording-recovery-card" role="alert" aria-live="assertive">
     <div>
       <strong>Recording recovery needed</strong>
       <p>{recordingRecoveryError || "Gist found a recording that was not fully processed. Your audio is kept locally until you choose what to do."}</p>
     </div>
-    {#each recoverableRecordingJobs as job (job.id)}
+    {#each recoverableRecordingJobs.filter((job) => job.id !== shortRecordingJob?.id) as job (job.id)}
       <div class="recording-recovery-actions">
         <span>{job.error || "Saved recording awaiting processing"}</span>
         {#if job.state !== "failed"}
