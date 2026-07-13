@@ -109,8 +109,7 @@ Gist is currently macOS-only and requires macOS 14.2 or later.
 
 ## Install the beta
 
-1. Download `Gist_*.dmg` from the
-   [v0.1.0 beta release](https://github.com/jthiepler/gist/releases/tag/v0.1.0).
+1. Download the latest [`Gist.dmg`](https://github.com/jthiepler/gist/releases/latest/download/Gist.dmg).
 2. Open the DMG and drag **Gist** to **Applications**.
 3. Open **Gist** from Applications. Release builds are signed and notarized by
    Apple; macOS may still ask you to confirm an app downloaded from the internet.

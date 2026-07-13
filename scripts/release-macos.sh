@@ -144,7 +144,9 @@ if [[ -z "$DMG_FILE" || ! -f "$UPDATER_ARCHIVE" || ! -f "$UPDATER_SIGNATURE" ]];
   exit 1
 fi
 
-cp -p "$DMG_FILE" "$RELEASE_DIR/"
+# Keep the public download filename stable so the website can use GitHub's
+# releases/latest/download endpoint across releases.
+cp -p "$DMG_FILE" "$RELEASE_DIR/Gist.dmg"
 cp -p "$UPDATER_ARCHIVE" "$RELEASE_DIR/"
 cp -p "$UPDATER_SIGNATURE" "$RELEASE_DIR/"
 
