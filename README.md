@@ -98,8 +98,6 @@ Gist deliberately presents every output as a draft.
 
 - Apple Silicon Mac (M1 or later)
 - macOS 14.2 or later
-- 8 GB RAM minimum
-- 16 GB RAM recommended for the Qwen 3.5 9B model
 - Roughly 1.6 GB for the app and bundled speech models
 - An additional 2.5 GB for the smallest note-writing model, or 5.5 GB for the
   9B model
