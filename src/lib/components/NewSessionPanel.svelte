@@ -668,7 +668,7 @@
         </div>
         <label class="option-checkbox">
           <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
-          <span>Identify speakers</span>
+          <span>Identify speakers (experimental)</span>
         </label>
       </div>
     </div>
@@ -726,7 +726,7 @@
           {#if sourceKind === "session_transcript"}
             <label class="option-checkbox">
               <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
-              <span>Identify speakers</span>
+              <span>Identify speakers (experimental)</span>
             </label>
           {/if}
           {#if confirmRecordingConsent}

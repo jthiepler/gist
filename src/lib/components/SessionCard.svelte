@@ -1636,7 +1636,7 @@
                         {#if addingInputKind === "session_transcript"}
                           <label class="option-checkbox">
                             <input type="checkbox" bind:checked={diarizeInput} disabled={processingInput} />
-                            <span>Identify speakers</span>
+                            <span>Identify speakers (experimental)</span>
                           </label>
                         {/if}
                         <div class="editor-footer">
@@ -1691,7 +1691,7 @@
                             {#if addingInputKind === "session_transcript"}
                               <label class="option-checkbox">
                                 <input type="checkbox" bind:checked={diarizeInput} />
-                                <span>Identify speakers</span>
+                                <span>Identify speakers (experimental)</span>
                               </label>
                             {/if}
                             {#if confirmRecordingConsent}
