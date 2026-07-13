@@ -17,10 +17,11 @@ _cached_llm = None
 _cached_llm_repo: Optional[str] = None
 
 
-def _get_cached_llm(model_repo: str):
+def _get_cached_llm(model_repo: str, revision: str):
     """Return the loaded MLX model, retaining one model between note requests."""
     global _cached_llm, _cached_llm_repo
-    if _cached_llm is not None and _cached_llm_repo == model_repo:
+    cache_key = f"{model_repo}@{revision}"
+    if _cached_llm is not None and _cached_llm_repo == cache_key:
         log.info("Reusing loaded note-generation model")
         return _cached_llm
 
@@ -28,9 +29,9 @@ def _get_cached_llm(model_repo: str):
     from .llm.mlx_backend import MLXBackend
 
     llm = MLXBackend()
-    llm.load(model_repo)
+    llm.load(model_repo, revision=revision)
     _cached_llm = llm
-    _cached_llm_repo = model_repo
+    _cached_llm_repo = cache_key
     return llm
 
 
@@ -39,7 +40,8 @@ def release_cached_llm(model_name: Optional[str] = None) -> None:
     global _cached_llm, _cached_llm_repo
     if model_name is not None:
         try:
-            if _cached_llm_repo != resolve_model(model_name, "llm").hf_repo:
+            spec = resolve_model(model_name, "llm")
+            if _cached_llm_repo != f"{spec.hf_repo}@{spec.revision}":
                 return
         except (KeyError, ValueError):
             return
@@ -188,7 +190,7 @@ def generate_note(
     if progress_callback:
         progress_callback(0, "Preparing note generation...")
 
-    llm = _get_cached_llm(spec.hf_repo)
+    llm = _get_cached_llm(spec.hf_repo, spec.revision)
 
     if progress_callback:
         progress_callback(30, "Generating note...")

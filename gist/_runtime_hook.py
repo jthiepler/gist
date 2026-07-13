@@ -12,6 +12,11 @@ os.environ.setdefault("MKL_NUM_THREADS", str(_max_threads))
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(_max_threads))
 os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_max_threads))
 
+# Gist promises that clinical processing has no telemetry. pyannote.audio 4
+# enables OpenTelemetry metrics by default unless this variable is already set,
+# so force it off before PyInstaller imports any bundled pyannote module.
+os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
+
 # pyannote pulls in matplotlib through its metrics dependencies. A persistent,
 # writable cache prevents its first use from rebuilding the font cache every
 # time the packaged sidecar launches.

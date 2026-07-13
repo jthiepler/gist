@@ -84,7 +84,11 @@ def download_model(
         if progress_callback:
             # Download files individually so we can report byte-level progress
             api = HfApi()
-            info = api.repo_info(repo_id=spec.hf_repo, files_metadata=True)
+            info = api.repo_info(
+                repo_id=spec.hf_repo,
+                revision=spec.revision,
+                files_metadata=True,
+            )
             siblings = info.siblings
             total_files = len(siblings)
             file_sizes = {s.rfilename: (s.size or 0) for s in siblings}
@@ -105,6 +109,7 @@ def download_model(
 
                 hf_hub_download(
                     repo_id=spec.hf_repo,
+                    revision=spec.revision,
                     filename=filename,
                     cache_dir=cache_dir_str,
                     tqdm_class=tqdm_cls,
@@ -115,6 +120,7 @@ def download_model(
         else:
             snapshot_download(
                 repo_id=spec.hf_repo,
+                revision=spec.revision,
                 local_files_only=False,
                 cache_dir=cache_dir_str,
             )
@@ -127,6 +133,7 @@ def download_model(
     # Return the local snapshot path
     path = snapshot_download(
         repo_id=spec.hf_repo,
+        revision=spec.revision,
         local_files_only=True,
         cache_dir=cache_dir_str,
     )
@@ -137,7 +144,13 @@ def download_model(
 def is_model_downloaded(model_name: str, kind: str = "llm") -> bool:
     spec = resolve_model(model_name, kind)
     try:
-        path = Path(snapshot_download(repo_id=spec.hf_repo, local_files_only=True))
+        path = Path(
+            snapshot_download(
+                repo_id=spec.hf_repo,
+                revision=spec.revision,
+                local_files_only=True,
+            )
+        )
         return _is_usable_mlx_snapshot(path)
     except Exception:
         return False

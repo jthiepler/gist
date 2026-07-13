@@ -72,14 +72,14 @@ impl CoreAudioTapHandle {
 
 #[cfg(target_os = "macos")]
 impl CoreAudioTapHandle {
-    pub fn create(selected_device_name: Option<&str>) -> Result<Self> {
-        let output_device = match selected_device_name {
-            Some(name) => ca::System::devices()?
+    pub fn create(selected_device_id: Option<&str>) -> Result<Self> {
+        let output_device = match selected_device_id {
+            Some(id) => ca::System::devices()?
                 .into_iter()
                 .find(|device| {
                     device
-                        .name()
-                        .map(|device_name| device_name.to_string() == name)
+                        .uid()
+                        .map(|device_uid| device_uid.to_string() == id)
                         .unwrap_or(false)
                 })
                 .ok_or_else(|| {
@@ -104,9 +104,12 @@ impl CoreAudioTapHandle {
             .map(|a| a.sample_rate as u32)
             .unwrap_or(48000);
 
+        let tap_uid = tap
+            .uid()
+            .map_err(|e| anyhow::anyhow!("Failed to get audio tap UID: {:?}", e))?;
         let sub_tap = cf::DictionaryOf::with_keys_values(
             &[ca::sub_device_keys::uid()],
-            &[tap.uid().unwrap().as_type_ref()],
+            &[tap_uid.as_type_ref()],
         );
 
         let agg_desc = cf::DictionaryOf::with_keys_values(

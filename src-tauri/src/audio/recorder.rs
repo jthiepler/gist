@@ -155,24 +155,19 @@ pub fn start_recording(
     let mixer = Mixer::new(TARGET_SAMPLE_RATE);
 
     // Start mic capture
-    let mic = match devices::resolve_input_device(mic_device.as_deref()) {
-        Ok(device) => match MicCapture::create(&device, TARGET_SAMPLE_RATE) {
-            Ok(mic) => Some(mic),
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
-
-    if mic.is_none() {
-        wav_writer.finalize()?;
-        anyhow::bail!("Failed to start microphone capture — cannot record without a mic");
-    }
+    let mic_device = devices::resolve_input_device(mic_device.as_deref())
+        .map_err(|error| anyhow::anyhow!("Failed to select microphone: {error}"))?;
+    let mic = Some(
+        MicCapture::create(&mic_device, TARGET_SAMPLE_RATE)
+            .map_err(|error| anyhow::anyhow!("Failed to start microphone capture: {error}"))?,
+    );
 
     // Start system audio tap (macOS)
-    let tap = match CoreAudioTapHandle::create(system_device.as_deref()) {
-        Ok(tap) => Some(tap),
-        Err(_) => None,
-    };
+    let tap = system_device
+        .as_deref()
+        .map(|device_id| CoreAudioTapHandle::create(Some(device_id)))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("Failed to start computer-audio capture: {error}"))?;
 
     let file_path_str = file_path.to_string_lossy().to_string();
 

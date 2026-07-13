@@ -186,6 +186,7 @@ export async function toggleNoteFormatHidden(id: string): Promise<void> {
 // ── Audio Recording ─────────────────────────────────────────────────────────
 
 export interface AudioDevice {
+  id: string;
   name: string;
   device_type: string; // "input" | "output"
 }

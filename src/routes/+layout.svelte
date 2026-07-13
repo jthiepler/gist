@@ -26,6 +26,7 @@
   import {
     activeOperation,
     appearance,
+    currentOperation,
     darkMode,
     isRecording,
     patients,
@@ -37,6 +38,7 @@
     recordingContext,
     recordingElapsed,
     recordingLevel,
+    recordingJobsProcessing,
     recordingPaused,
     selectedPatientId,
     sessionUpdate,
@@ -150,6 +152,7 @@
   async function processRecordingJob(job: RecordingJob) {
     if (processingRecordingJobs.has(job.id)) return;
     processingRecordingJobs.add(job.id);
+    recordingJobsProcessing.set(true);
     try {
       const session = await invoke<Session | null>("get_session", { id: job.session_id });
       if (!session) throw new Error("The session for this recording is no longer available.");
@@ -164,6 +167,7 @@
       recoverableRecordingJobs = recoverableRecordingJobs.filter((candidate) => candidate.id !== job.id);
     } finally {
       processingRecordingJobs.delete(job.id);
+      recordingJobsProcessing.set(processingRecordingJobs.size > 0);
     }
   }
 
@@ -671,7 +675,11 @@
 {/if}
 
 {#if availableUpdate && onboardingComplete}
-  <UpdatePrompt update={availableUpdate} isRecording={$isRecording} onDismiss={dismissUpdate} />
+  <UpdatePrompt
+    update={availableUpdate}
+    isBusy={$isRecording || $sidecarBusy || $recordingJobsProcessing || $currentOperation !== null}
+    onDismiss={dismissUpdate}
+  />
 {/if}
 
 {#if $sidecarBusy}

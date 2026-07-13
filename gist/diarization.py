@@ -10,6 +10,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .transcription.base import Segment
 
+# Keep development and direct CLI runs as private as the packaged sidecar. This
+# must happen before the lazy pyannote import in _load_pipeline.
+os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
+
 log = logging.getLogger(__name__)
 
 MODEL_DIR_NAME = "speaker-diarization-community-1"

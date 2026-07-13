@@ -70,62 +70,75 @@ export async function processSessionFromAudio(
   progressPercent.set(0);
 
   const isClinicianDictation = ctx.inputKind === "clinician_note";
+  const source = isClinicianDictation
+    ? SESSION_INPUT_SOURCES.dictation
+    : SESSION_INPUT_SOURCES.recording;
+  const existingRecordingInput = ctx.jobId
+    ? session.inputs.find(
+        (input) => input.audio_file === audioPath && input.source === source,
+      )
+    : undefined;
   const transcribingLabel = isClinicianDictation
     ? "Transcribing clinician note..."
     : "Transcribing session recording...";
   progressStage.set(transcribingLabel);
   activeOperation.set({ type: "transcribe", label: transcribingLabel });
 
-  let transcript = "";
-  let duration: number | null = null;
+  let transcript = existingRecordingInput?.text ?? "";
+  let duration: number | null = existingRecordingInput?.duration_seconds ?? null;
 
-  try {
-    const result = await transcribe(
-      audioPath,
-      ctx.inputKind === "session_transcript" && ctx.diarize,
-    );
-    transcript = result.transcript;
-    duration = result.duration;
-  } catch (e) {
-    const msg = String(e);
-    resetProgress();
-    throw new Error(
-      msg === "sidecar_busy"
-        ? "Another operation is in progress. Please wait or cancel it first."
-        : `Transcription failed: ${msg}`,
-    );
+  if (!existingRecordingInput) {
+    try {
+      const result = await transcribe(
+        audioPath,
+        ctx.inputKind === "session_transcript" && ctx.diarize,
+      );
+      transcript = result.transcript;
+      duration = result.duration;
+    } catch (e) {
+      const msg = String(e);
+      resetProgress();
+      throw new Error(
+        msg === "sidecar_busy"
+          ? "Another operation is in progress. Please wait or cancel it first."
+          : `Transcription failed: ${msg}`,
+      );
+    }
   }
-
-  const source = isClinicianDictation
-    ? SESSION_INPUT_SOURCES.dictation
-    : SESSION_INPUT_SOURCES.recording;
 
   let updatedSession: Session;
   try {
     progressStage.set("Saving source material...");
     activeOperation.set({ type: "create_session", label: "Saving source material..." });
 
-    await createSessionInput({
-      session_id: session.id,
-      kind: ctx.inputKind,
-      source,
-      title: SESSION_INPUT_LABELS[ctx.inputKind],
-      text: transcript,
-      audio_file: audioPath,
-      duration_seconds: duration,
-      include_in_notes: true,
-    });
-    updatedSession = (await getSession(session.id)) ?? session;
-    sessionUpdate.set(updatedSession);
-    if (ctx.jobId) {
-      await completeRecordingJob(ctx.jobId);
+    if (!existingRecordingInput) {
+      await createSessionInput({
+        session_id: session.id,
+        kind: ctx.inputKind,
+        source,
+        title: SESSION_INPUT_LABELS[ctx.inputKind],
+        text: transcript,
+        audio_file: audioPath,
+        duration_seconds: duration,
+        include_in_notes: true,
+      });
     }
+    updatedSession = existingRecordingInput
+      ? session
+      : (await getSession(session.id)) ?? session;
+    sessionUpdate.set(updatedSession);
   } catch (e) {
     resetProgress();
     throw new Error(`Failed to save session: ${String(e)}`);
   }
 
   if (!ctx.isNewSession && !ctx.regenerateExisting) {
+    try {
+      if (ctx.jobId) await completeRecordingJob(ctx.jobId);
+    } catch (e) {
+      resetProgress();
+      throw new Error(`Source was saved, but recording recovery could not be completed: ${String(e)}`);
+    }
     progressPercent.set(100);
     resetProgress();
     return updatedSession;
@@ -142,6 +155,7 @@ export async function processSessionFromAudio(
       verb: ctx.isNewSession ? "Generating" : "Updating",
       onSessionUpdate: (nextSession) => sessionUpdate.set(nextSession),
     });
+    if (ctx.jobId) await completeRecordingJob(ctx.jobId);
     progressPercent.set(100);
     resetProgress();
     return processedSession;

@@ -260,10 +260,10 @@
       inputDevices = devices.filter((d) => d.device_type === "input");
       outputDevices = devices.filter((d) => d.device_type === "output");
       if (inputDevices.length > 0 && !selectedInputDevice) {
-        selectedInputDevice = inputDevices[0].name;
+        selectedInputDevice = inputDevices[0].id;
       }
       if (outputDevices.length > 0 && !selectedOutputDevice) {
-        selectedOutputDevice = outputDevices[0].name;
+        selectedOutputDevice = outputDevices[0].id;
       }
       if (inputDevices.length === 0) {
         audioDeviceError = "No microphone is available. Connect a microphone, then allow Gist to use it in macOS Privacy & Security.";
@@ -298,6 +298,10 @@
     }
     if (inputDevices.length === 0) {
       error = "A microphone is required to record. Check macOS Privacy & Security, then try again.";
+      return;
+    }
+    if (inputMethod === "recording" && !selectedOutputDevice) {
+      error = "Select a computer-audio device before starting the session recording.";
       return;
     }
     startingRecording = true;
@@ -703,8 +707,8 @@
           <div class="form-group">
             <label for="input-device">Microphone</label>
             <select id="input-device" bind:value={selectedInputDevice} disabled={phase !== "idle"}>
-              {#each inputDevices as d (d.name)}
-                <option value={d.name}>{d.name}</option>
+              {#each inputDevices as d (d.id)}
+                <option value={d.id}>{d.name}</option>
               {/each}
             </select>
           </div>
@@ -712,12 +716,12 @@
             <div class="form-group">
             <label for="output-device">Computer audio</label>
               <select id="output-device" bind:value={selectedOutputDevice} disabled={phase !== "idle"}>
-                {#each outputDevices as d (d.name)}
-                  <option value={d.name}>{d.name}</option>
+                {#each outputDevices as d (d.id)}
+                  <option value={d.id}>{d.name}</option>
                 {/each}
               </select>
             </div>
-            <p class="record-hint">Computer audio capture requires macOS 14.4+. If it is unavailable, Gist will use the microphone.</p>
+            <p class="record-hint">Computer audio capture requires macOS 14.2+. Gist will stop and show an error if it cannot capture the selected device.</p>
           {/if}
           {#if sourceKind === "session_transcript"}
             <label class="option-checkbox">
@@ -732,7 +736,7 @@
             </label>
           {/if}
           <p class="record-hint">Gist records at about 345 MB per hour (roughly 690 MB for two hours). Keep your Mac awake while recording; Gist also prevents idle sleep during recording and processing.</p>
-          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || !formatsLoaded || selectedFormats.size === 0 || inputDevices.length === 0 || (confirmRecordingConsent && !recordingConsentConfirmed)}>
+          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || !formatsLoaded || selectedFormats.size === 0 || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
             Start recording
           </button>
         </div>

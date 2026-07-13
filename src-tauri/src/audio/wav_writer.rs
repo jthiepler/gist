@@ -37,8 +37,8 @@ impl StreamingWavWriter {
         Ok(())
     }
 
-    pub fn finalize(mut self) -> Result<()> {
-        self.writer.flush()?;
+    pub fn finalize(self) -> Result<()> {
+        self.writer.finalize()?;
         Ok(())
     }
 }

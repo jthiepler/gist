@@ -39,6 +39,10 @@ export const recordingLevel = writable<number>(0);
 // the NewSessionPanel component has been unmounted.
 export const recordingContext = writable<RecordingContext | null>(null);
 
+// Covers the durable-job handoff window before/after the sidecar itself is
+// busy, so destructive actions and updater relaunches cannot race processing.
+export const recordingJobsProcessing = writable<boolean>(false);
+
 // Latest session snapshot produced by background processing. Keeping the latest
 // value ensures Svelte cannot batch away the final update and lets a newly
 // mounted patient page consume it as well.

@@ -438,6 +438,20 @@ struct SidecarState {
 
 type SharedSidecarState = Arc<Mutex<SidecarState>>;
 
+const DEFAULT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const NOTE_GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8 * 60 * 60);
+const MODEL_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn rpc_timeout(operation_type: &str) -> std::time::Duration {
+    match operation_type {
+        "generate_note" => NOTE_GENERATION_TIMEOUT,
+        "transcribe" => TRANSCRIPTION_TIMEOUT,
+        "download_model" => MODEL_DOWNLOAD_TIMEOUT,
+        _ => DEFAULT_RPC_TIMEOUT,
+    }
+}
+
 fn emit_sidecar_state(app: &AppHandle, busy: bool) {
     let _ = app.emit("sidecar-state", serde_json::json!({ "busy": busy }));
 }
@@ -712,7 +726,7 @@ async fn rpc_call(
 
     emit_sidecar_state(&app, true);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(600), &mut rx).await {
+    match tokio::time::timeout(rpc_timeout(&operation_type), &mut rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
             let mut s = state.lock().map_err(|e| e.to_string())?;
@@ -877,7 +891,9 @@ async fn delete_patient(
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     drop(db);
-    remove_managed_audio_files(&app, paths)?;
+    if let Err(error) = remove_managed_audio_files(&app, paths) {
+        log::warn!("Patient was deleted, but managed audio cleanup failed: {error}");
+    }
     Ok(())
 }
 
@@ -991,7 +1007,9 @@ async fn delete_session(
         .execute("DELETE FROM sessions WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     drop(db);
-    remove_managed_audio_files(&app, paths)?;
+    if let Err(error) = remove_managed_audio_files(&app, paths) {
+        log::warn!("Session was deleted, but managed audio cleanup failed: {error}");
+    }
     Ok(())
 }
 
@@ -1084,7 +1102,9 @@ async fn delete_session_input(
     }
     drop(db);
     if let Some(path) = audio_file {
-        remove_managed_audio_files(&app, vec![path])?;
+        if let Err(error) = remove_managed_audio_files(&app, vec![path]) {
+            log::warn!("Source was deleted, but managed audio cleanup failed: {error}");
+        }
     }
     Ok(())
 }
@@ -1130,7 +1150,7 @@ async fn create_session_note(
         .execute(
             "INSERT INTO session_notes (id, session_id, format, note, llm_model, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(session_id, format) DO UPDATE SET note = ?4, llm_model = ?5",
+         ON CONFLICT(session_id, format) DO UPDATE SET note = ?4, llm_model = ?5, created_at = ?6",
             params![id, session_id, format, note, llm_model, now],
         )
         .map_err(|e| e.to_string())?;
@@ -1167,14 +1187,19 @@ async fn get_patient_formats(
         .query_map(params![key], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
     match rows.next() {
-        Some(Ok(v)) => {
-            let formats: Vec<String> = v
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            Ok(formats)
-        }
+        Some(Ok(v)) => serde_json::from_str::<Vec<String>>(&v)
+            .or_else(|_| {
+                // Migrate values written by versions that used comma-delimited
+                // storage. New values are JSON so custom names can contain commas.
+                Ok::<Vec<String>, serde_json::Error>(
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                )
+            })
+            .map_err(|e| e.to_string()),
         _ => Ok(Vec::new()),
     }
 }
@@ -1187,7 +1212,7 @@ async fn set_patient_formats(
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let key = format!("patient_formats_{}", patient_id);
-    let value = formats.join(",");
+    let value = serde_json::to_string(&formats).map_err(|e| e.to_string())?;
     db.conn
         .execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",

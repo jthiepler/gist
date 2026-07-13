@@ -29,9 +29,9 @@ class MLXBackend(LLMBackend):
         self.model = None
         self.tokenizer = None
 
-    def load(self, model_path: str):
+    def load(self, model_path: str, revision: Optional[str] = None):
         log.info("Loading MLX model from %s", model_path)
-        self.model, self.tokenizer = load(model_path)
+        self.model, self.tokenizer = load(model_path, revision=revision)
         log.info("Model loaded")
 
     def generate(
@@ -59,6 +59,7 @@ class MLXBackend(LLMBackend):
         sampler = _make_sampler(temperature)
 
         text_parts: list[str] = []
+        finish_reason: Optional[str] = None
         for response in stream_generate(
             self.model,
             self.tokenizer,
@@ -69,8 +70,20 @@ class MLXBackend(LLMBackend):
             if cancel_event and cancel_event.is_set():
                 raise InterruptedError("Generation cancelled")
             text_parts.append(response.text)
+            if response.finish_reason is not None:
+                finish_reason = response.finish_reason
 
-        return "".join(text_parts).strip()
+        text = "".join(text_parts).strip()
+        if not text:
+            raise RuntimeError("The model returned an empty note. Please try again.")
+        if finish_reason == "length":
+            raise RuntimeError(
+                "The note reached the generation limit and may be incomplete. "
+                "Use shorter source material or a more concise template and try again."
+            )
+        if finish_reason != "stop":
+            raise RuntimeError("The model stopped without completing the note. Please try again.")
+        return text
 
     def cleanup(self):
         self.model = None

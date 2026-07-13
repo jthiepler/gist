@@ -38,9 +38,9 @@ class PipelineTests(unittest.TestCase):
     def test_reuses_matching_cached_llm(self):
         cached = Mock()
         pipeline._cached_llm = cached
-        pipeline._cached_llm_repo = "repo"
+        pipeline._cached_llm_repo = "repo@revision"
 
-        self.assertIs(pipeline._get_cached_llm("repo"), cached)
+        self.assertIs(pipeline._get_cached_llm("repo", "revision"), cached)
 
     def test_custom_prompt_keeps_source_material_non_executable(self):
         llm = Mock()

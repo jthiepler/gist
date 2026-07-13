@@ -101,6 +101,9 @@
   let transcriptSearch = $state("");
   let defaultLlm = $state("");
   let thinking = $state(false);
+  let confirmRecordingConsent = $state(true);
+  let recordingConsentConfirmed = $state(false);
+  let pendingInputRefreshSession = $state<Session | null>(null);
   let openSessionMenu = $state(false);
   let openNoteMenu = $state(false);
   let openAddNoteMenu = $state(false);
@@ -212,6 +215,19 @@
       ? inputDraft !== (session.inputs.find((input) => input.id === editingInputId)?.text ?? "")
       : addingInputKind !== null && inputMethod === "text" && inputDraft.trim().length > 0
   );
+  let notesNeedRefresh = $derived.by(() => {
+    if (session.notes.length === 0) return false;
+    const latestSourceUpdate = Math.max(
+      ...session.inputs
+        .filter((input) => input.include_in_notes)
+        .map((input) => Date.parse(input.updated_at)),
+      0,
+    );
+    const oldestNoteUpdate = Math.min(
+      ...session.notes.map((note) => Date.parse(note.created_at)),
+    );
+    return latestSourceUpdate > oldestNoteUpdate;
+  });
   let renderedNote = $derived(activeNote ? renderMarkdown(noteDraft) : "");
   let recordingForThisSession = $derived($recordingContext?.session?.id === session.id);
   let recordingInputKind = $derived(
@@ -635,6 +651,7 @@
     addingInputKind = null;
     inputMethod = "text";
     inputStatus = "";
+    pendingInputRefreshSession = null;
     openInputMenu = null;
     expandedInputId = input.id;
     focusPane = "source";
@@ -644,6 +661,14 @@
   async function closeInputEditing() {
     if (inputSaveTimer) clearTimeout(inputSaveTimer);
     if (editingInputId && inputDirty && !(await saveInput(false))) return;
+    if (
+      editingInputId &&
+      pendingInputRefreshSession &&
+      !(await offerDocumentationRefresh(pendingInputRefreshSession))
+    ) {
+      // The source remains saved and the persistent out-of-date indicator
+      // stays visible when the user chooses not to replace attached notes.
+    }
     inputDraft = "";
     editingInputId = null;
     addingInputKind = null;
@@ -674,6 +699,7 @@
   async function loadExistingInputSettings() {
     const settings = await loadSettings();
     defaultLlm = settings.defaultLlm;
+    confirmRecordingConsent = settings.confirmRecordingConsent;
   }
 
   async function loadAudioDevices() {
@@ -683,10 +709,10 @@
       inputDevices = devices.filter((d) => d.device_type === "input");
       outputDevices = devices.filter((d) => d.device_type === "output");
       if (inputDevices.length > 0 && !selectedInputDevice) {
-        selectedInputDevice = inputDevices[0].name;
+        selectedInputDevice = inputDevices[0].id;
       }
       if (outputDevices.length > 0 && !selectedOutputDevice) {
-        selectedOutputDevice = outputDevices[0].name;
+        selectedOutputDevice = outputDevices[0].id;
       }
     } catch (e) {
       inputStatus = `Audio devices unavailable: ${String(e)}`;
@@ -841,7 +867,14 @@
   }
 
   async function saveInput(autosave = false): Promise<boolean> {
-    if ((!editingInputId && !addingInputKind) || !inputDraft.trim()) return true;
+    if (!editingInputId && !addingInputKind) return true;
+    if (!editingInputId && !inputDraft.trim()) return true;
+    if (editingInputId && !inputDirty) {
+      if (!autosave && pendingInputRefreshSession) {
+        await offerDocumentationRefresh(pendingInputRefreshSession);
+      }
+      return true;
+    }
     if (savingInput) return false;
     savingInput = true;
     inputStatus = "";
@@ -863,16 +896,24 @@
         : [...session.inputs, saved];
       const updatedSession = { ...session, inputs };
       onChange(updatedSession);
+      if (updatedSession.notes.length > 0) {
+        pendingInputRefreshSession = updatedSession;
+      }
+      const refreshed = !autosave && pendingInputRefreshSession
+        ? await offerDocumentationRefresh(updatedSession)
+        : false;
       if (!autosave || !existing) {
         editingInputId = null;
         addingInputKind = null;
         inputDraft = "";
       }
-      if (!autosave && await confirmDocumentationRefresh(updatedSession)) {
-        inputStatus = "Updating notes...";
-        await onGenerateNote(updatedSession, { regenerateExisting: true });
-      }
-      inputStatus = autosave ? "Saved automatically" : "Saved";
+      inputStatus = refreshed
+        ? "Notes updated"
+        : autosave && updatedSession.notes.length > 0
+          ? "Saved automatically — attached notes need updating"
+          : autosave
+            ? "Saved automatically"
+            : "Saved";
       return true;
     } catch (e) {
       inputStatus = `Save failed: ${String(e)}`;
@@ -883,7 +924,26 @@
     }
   }
 
+  async function offerDocumentationRefresh(sessionToRefresh: Session): Promise<boolean> {
+    if (!(await confirmDocumentationRefresh(sessionToRefresh))) {
+      pendingInputRefreshSession = null;
+      return false;
+    }
+    inputStatus = "Updating notes...";
+    const refreshed = await onGenerateNote(sessionToRefresh, { regenerateExisting: true });
+    if (refreshed) pendingInputRefreshSession = null;
+    return refreshed;
+  }
+
+  async function refreshOutdatedNotes() {
+    await offerDocumentationRefresh(pendingInputRefreshSession ?? session);
+  }
+
   async function deleteInput(input: SessionInput) {
+    if (deletionDisabled || processingThisSession || processingInput) {
+      inputStatus = "Finish the active processing task before deleting source material.";
+      return;
+    }
     const label = getInputLabel(input);
     if (
       !(await confirm(`Delete this ${label.toLowerCase()}? This source will be removed from future notes.`, {
@@ -994,6 +1054,14 @@
       inputStatus = "No microphone is available. Connect one and allow Gist to use it in macOS Privacy & Security.";
       return;
     }
+    if (method === "recording" && !selectedOutputDevice) {
+      inputStatus = "Select a computer-audio device before starting the session recording.";
+      return;
+    }
+    if (confirmRecordingConsent && !recordingConsentConfirmed) {
+      inputStatus = "Confirm recording consent before starting.";
+      return;
+    }
 
     try {
       const ctx: RecordingContext = {
@@ -1025,6 +1093,7 @@
       addingInputKind = kind;
       inputMethod = method;
       inputStatus = "";
+      recordingConsentConfirmed = false;
     } catch (e) {
       inputStatus = `Failed to start ${method === "dictation" ? "dictation" : "recording"}: ${String(e)}`;
       recordingContext.set(null);
@@ -1369,6 +1438,12 @@
                   {#if inputStatus}
                     <span class:error={statusIsError(inputStatus)} class="save-status" aria-live="polite">{inputStatus}</span>
                   {/if}
+                  {#if notesNeedRefresh}
+                    <span class="save-status" aria-live="polite">Sources changed since these notes were generated.</span>
+                    <button class="btn btn-sm" onclick={refreshOutdatedNotes} disabled={isGenerating || processingInput}>
+                      Update notes
+                    </button>
+                  {/if}
                   {#if hasSources && !activeNote}
                     <button class="btn btn-sm btn-primary" onclick={() => onGenerateNote(session)}>
                       Generate notes
@@ -1498,7 +1573,7 @@
                       ></textarea>
                       <div class="editor-footer">
                         <button class="btn btn-sm" onclick={closeInputEditing} disabled={savingInput}>Close</button>
-                        <button class="btn btn-sm btn-primary" onclick={() => saveInput()} disabled={savingInput || !inputDirty || !inputDraft.trim()}>
+                        <button class="btn btn-sm btn-primary" onclick={() => saveInput()} disabled={savingInput || !inputDirty}>
                           {savingInput ? "Saving..." : "Save"}
                         </button>
                       </div>
@@ -1598,8 +1673,8 @@
                             <div class="form-group">
                               <label for={`input-device-${session.id}-${addingInputKind}`}>Microphone</label>
                               <select id={`input-device-${session.id}-${addingInputKind}`} bind:value={selectedInputDevice}>
-                                {#each inputDevices as d (d.name)}
-                                  <option value={d.name}>{d.name}</option>
+                                {#each inputDevices as d (d.id)}
+                                  <option value={d.id}>{d.name}</option>
                                 {/each}
                               </select>
                             </div>
@@ -1607,8 +1682,8 @@
                               <div class="form-group">
                               <label for={`output-device-${session.id}-${addingInputKind}`}>Computer audio</label>
                                 <select id={`output-device-${session.id}-${addingInputKind}`} bind:value={selectedOutputDevice}>
-                                  {#each outputDevices as d (d.name)}
-                                    <option value={d.name}>{d.name}</option>
+                                  {#each outputDevices as d (d.id)}
+                                    <option value={d.id}>{d.name}</option>
                                   {/each}
                                 </select>
                               </div>
@@ -1619,8 +1694,14 @@
                                 <span>Identify speakers</span>
                               </label>
                             {/if}
+                            {#if confirmRecordingConsent}
+                              <label class="recording-consent">
+                                <input type="checkbox" bind:checked={recordingConsentConfirmed} disabled={processingInput} />
+                                <span>I have confirmed consent to record according to my organization’s and jurisdiction’s requirements.</span>
+                              </label>
+                            {/if}
                             <p class="record-hint">About 345 MB per hour (roughly 690 MB for two hours). Gist prevents idle sleep while recording and processing.</p>
-                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")} disabled={processingInput || inputDevices.length === 0}>
+                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")} disabled={processingInput || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
                               Start recording
                             </button>
                           </div>

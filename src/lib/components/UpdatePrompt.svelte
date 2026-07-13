@@ -4,11 +4,11 @@
 
   interface Props {
     update: Update;
-    isRecording: boolean;
+    isBusy: boolean;
     onDismiss: () => void | Promise<void>;
   }
 
-  let { update, isRecording, onDismiss }: Props = $props();
+  let { update, isBusy, onDismiss }: Props = $props();
   let installState = $state<"ready" | "installing" | "error">("ready");
   let downloadedBytes = $state(0);
   let contentLength = $state<number | null>(null);
@@ -30,10 +30,17 @@
   }
 
   async function installUpdate() {
+    if (isBusy) {
+      error = "Finish the current recording or processing task before installing the update.";
+      return;
+    }
     installState = "installing";
     error = "";
     try {
       await update.download(handleDownloadEvent);
+      if (isBusy) {
+        throw new Error("A recording or processing task started while the update was downloading. Try again when it finishes.");
+      }
       await update.install();
       await relaunch();
     } catch (e) {
@@ -70,11 +77,11 @@
     {#if error}
       <p class="update-card-error" role="alert">Could not install the update: {error}</p>
     {/if}
-    {#if isRecording}
-      <p class="update-card-warning">Finish the current recording before installing an update.</p>
+    {#if isBusy}
+      <p class="update-card-warning">Finish the current recording or processing task before installing an update.</p>
     {/if}
     <div class="update-card-actions">
-      <button class="btn btn-primary" type="button" onclick={installUpdate} disabled={isRecording}>
+      <button class="btn btn-primary" type="button" onclick={installUpdate} disabled={isBusy}>
         {installState === "error" ? "Try again" : "Install and restart"}
       </button>
       <button class="btn" type="button" onclick={onDismiss}>Later</button>

@@ -10,6 +10,7 @@
     isRecording,
     patients,
     recordingContext,
+    recordingJobsProcessing,
     sessionUpdate,
     sidecarBusy,
     progressBase,
@@ -39,6 +40,13 @@
   let savingName = $state(false);
   let showPatientMenu = $state(false);
   let recordingNewSession = $state(false);
+  let destructiveActionsBlocked = $derived(
+    $isRecording ||
+      $sidecarBusy ||
+      $recordingJobsProcessing ||
+      $currentOperation !== null ||
+      generatingNoteFor !== null,
+  );
 
   onMount(() => {
     const dismissMenu = (event: PointerEvent) => {
@@ -152,8 +160,8 @@
   });
 
   async function deleteSession(session: Session) {
-    if ($isRecording && $recordingContext?.session?.id === session.id) {
-      error = "Stop the active recording before deleting this session.";
+    if (destructiveActionsBlocked) {
+      error = "Finish the active recording or processing task before deleting a session.";
       return;
     }
     const formattedDate = formatLocalDate(session.date, {
@@ -281,8 +289,8 @@
 
   async function deletePatient() {
     if (!patient) return;
-    if ($isRecording && $recordingContext?.patientId === patient.id) {
-      error = "Stop the active recording before deleting this patient.";
+    if (destructiveActionsBlocked) {
+      error = "Finish the active recording or processing task before deleting this patient.";
       return;
     }
     showPatientMenu = false;
@@ -352,7 +360,7 @@
                   class="patient-menu-item danger"
                   role="menuitem"
                   onclick={deletePatient}
-                  disabled={$isRecording && $recordingContext?.patientId === patient.id}
+                  disabled={destructiveActionsBlocked}
                 >Delete patient</button>
               </div>
             {/if}
@@ -402,7 +410,7 @@
                 {session}
                 initiallyExpanded={groupIndex === 0 && sessionIndex === 0}
                 isGenerating={generatingNoteFor === session.id}
-                deletionDisabled={$isRecording && $recordingContext?.session?.id === session.id}
+                deletionDisabled={destructiveActionsBlocked}
                 onGenerateNote={generateNoteForSession}
                 onDelete={deleteSession}
                 onChange={updateSessionInList}

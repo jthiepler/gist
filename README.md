@@ -67,10 +67,9 @@ In the normal bundled workflow:
 - Note generation runs with a Qwen 3.5 MLX model you download and manage.
 - The app can continue working offline once its model assets are present.
 
-The initial model downloads require an internet connection. The codebase also
-contains an optional OpenAI-compatible backend for development and advanced
-setups; it is not required by the bundled app. If you configure it, you are
-responsible for understanding where that endpoint sends data.
+The initial model downloads and application update checks require an internet
+connection. Transcription, diarization, and note generation do not send
+clinical material to a remote service.
 
 Local processing reduces the number of parties and systems that handle
 clinical data. It does **not**, by itself, make a clinician or practice
@@ -98,23 +97,23 @@ Gist deliberately presents every output as a draft.
 ## Requirements
 
 - Apple Silicon Mac (M1 or later)
-- macOS 14 or later
+- macOS 14.2 or later
 - 8 GB RAM minimum
 - 16 GB RAM recommended for the Qwen 3.5 9B model
-- Roughly 1 GB for the app and bundled speech models
+- Roughly 1.6 GB for the app and bundled speech models
 - An additional 2.5 GB for the smallest note-writing model, or 5.5 GB for the
   9B model
 - Microphone access when recording directly in Gist
 
-Gist is currently macOS-only.
+Gist is currently macOS-only and requires macOS 14.2 or later.
 
 ## Install the beta
 
 1. Download `Gist_*.dmg` from the
    [v0.1.0 beta release](https://github.com/jthiepler/gist/releases/tag/v0.1.0).
 2. Open the DMG and drag **Gist** to **Applications**.
-3. The beta is not yet notarized. On first launch, right-click **Gist**, choose
-   **Open**, and confirm the macOS warning.
+3. Open **Gist** from Applications. Release builds are signed and notarized by
+   Apple; macOS may still ask you to confirm an app downloaded from the internet.
 4. Grant microphone access if you plan to record sessions, then download a
    note-writing model when prompted.
 
@@ -167,14 +166,22 @@ parakeet-tdt-0.6b-v3-mlx-4bit/
 speaker-diarization-community-1/
 ```
 
+Local package commands prepare the sidecar and models automatically:
+
 ```bash
-bash scripts/build-macos.sh
-npm run tauri:dmg
+npm run tauri:app      # local .app bundle
+npm run tauri:dmg      # local DMG
+npm run tauri:bundle   # both
 ```
 
-The unsigned Apple Silicon DMG is written to
-`src-tauri/target/release/bundle/dmg/`. Model checkouts, generated resources,
-PyInstaller output, and Rust build artifacts are ignored by Git.
+These development packages intentionally skip Developer ID signing,
+notarization, and updater artifacts. Sidecar and model inputs are fingerprinted;
+unchanged resources are reused on subsequent builds. Run
+`npm run sidecar:rebuild` to invalidate that cache explicitly.
+
+The local Apple Silicon output is written under
+`src-tauri/target/release/bundle/`. Model checkouts, generated resources,
+fingerprints, PyInstaller output, and Rust build artifacts are ignored by Git.
 
 ### Releases and automatic updates
 
@@ -194,10 +201,11 @@ The public key is stored in `src-tauri/tauri.conf.json`; if you generate a
 different key, replace the configured public key with the new one. Set
 `TAURI_SIGNING_PRIVATE_KEY_PATH` (and
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the key is password-protected), then
-run `npm run tauri:release`. Attach the files listed under “Updater files” by
-the script to the published GitHub Release. The release must be published,
-not left as a draft, for the app’s `releases/latest/download/latest.json`
-endpoint to resolve.
+run `npm run tauri:release`. Release mode always performs a clean sidecar build,
+then signs, notarizes, and verifies the app and DMG. Attach the files listed
+under “Updater files” by the script to the published GitHub Release. The release
+must be published, not left as a draft, for the app’s
+`releases/latest/download/latest.json` endpoint to resolve.
 
 If no key path or environment variable is set, `npm run tauri:release` prompts
 for the private key with terminal input hidden, then prompts separately for the

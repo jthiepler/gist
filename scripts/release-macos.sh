@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Release packaging invokes Perl-backed tools indirectly (notably `shasum` in
+# the resource fingerprinting script). Use a locale available on every macOS
+# installation so an invalid shell locale cannot flood release output.
+export LC_ALL=C
+export LANG=C
+
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_DIR="$PROJECT_DIR/release"
 
@@ -12,6 +18,15 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This release command must run on macOS." >&2
   exit 1
 fi
+
+if [[ "$(uname -m)" != "arm64" ]]; then
+  echo "Release builds must run on an Apple Silicon (arm64) Mac." >&2
+  exit 1
+fi
+
+cd "$PROJECT_DIR"
+echo "Checking synchronized application versions..."
+npm run check-version
 
 if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
   APPLE_SIGNING_IDENTITY="$(
@@ -59,8 +74,6 @@ fi
 trap 'unset APPLE_PASSWORD TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD' EXIT
 export APPLE_ID APPLE_TEAM_ID APPLE_SIGNING_IDENTITY APPLE_PASSWORD
 
-cd "$PROJECT_DIR"
-
 # Keep a clean, easy-to-find upload folder for each release. This directory is
 # ignored by Git and only contains files intended for the GitHub Release.
 rm -rf "$RELEASE_DIR"
@@ -93,13 +106,15 @@ sign_resource_macho_files() {
 
 echo "Using signing identity: $APPLE_SIGNING_IDENTITY"
 echo "Building the macOS sidecar and bundled resources..."
-bash scripts/build-macos.sh
+bash scripts/build-macos.sh --mode release
 sign_resource_macho_files
 
 echo "Building, signing, notarizing, and stapling the app and DMG..."
 # The app target is required for Tauri to create the signed updater archive.
-# Keep the regular tauri:dmg command unchanged for ordinary non-release builds.
-bash scripts/tauri.sh build --bundles app,dmg
+# Local package commands intentionally remove signing credentials, so the
+# release path calls Tauri directly after preparing the DMG output directory.
+bash scripts/prepare-dmg.sh
+tauri build --bundles app,dmg
 
 APP_PATH="$PROJECT_DIR/src-tauri/target/release/bundle/macos/Gist.app"
 if [[ ! -d "$APP_PATH" ]]; then
@@ -119,8 +134,25 @@ find "$PROJECT_DIR/src-tauri/target/release/bundle" -maxdepth 3 -type f \( -name
 
 DMG_DIR="$PROJECT_DIR/src-tauri/target/release/bundle/dmg"
 BUNDLE_DIR="$PROJECT_DIR/src-tauri/target/release/bundle"
-find "$DMG_DIR" -maxdepth 1 -type f -name '*.dmg' -exec cp -p {} "$RELEASE_DIR/" \;
-find "$BUNDLE_DIR" -maxdepth 3 -type f \( -name 'latest.json' -o -name '*.sig' -o -name '*.tar.gz' \) -exec cp -p {} "$RELEASE_DIR/" \;
+DMG_FILE="$(find "$DMG_DIR" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+UPDATER_ARCHIVE="$BUNDLE_DIR/macos/Gist.app.tar.gz"
+UPDATER_SIGNATURE="$UPDATER_ARCHIVE.sig"
+
+if [[ -z "$DMG_FILE" || ! -f "$UPDATER_ARCHIVE" || ! -f "$UPDATER_SIGNATURE" ]]; then
+  echo "Release artifacts are incomplete; cannot populate $RELEASE_DIR." >&2
+  echo "Expected a DMG, $UPDATER_ARCHIVE, and $UPDATER_SIGNATURE." >&2
+  exit 1
+fi
+
+cp -p "$DMG_FILE" "$RELEASE_DIR/"
+cp -p "$UPDATER_ARCHIVE" "$RELEASE_DIR/"
+cp -p "$UPDATER_SIGNATURE" "$RELEASE_DIR/"
+
+APP_VERSION="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$PROJECT_DIR/src-tauri/tauri.conf.json" | head -n 1)"
+SIGNATURE="$(tr -d '\r\n' < "$UPDATER_SIGNATURE")"
+PUB_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+printf '{\n  "version": "%s",\n  "notes": "See the GitHub Release notes for this version.",\n  "pub_date": "%s",\n  "platforms": {\n    "darwin-aarch64": {\n      "signature": "%s",\n      "url": "https://github.com/jthiepler/gist/releases/latest/download/Gist.app.tar.gz"\n    }\n  }\n}\n' \
+  "$APP_VERSION" "$PUB_DATE" "$SIGNATURE" > "$RELEASE_DIR/latest.json"
 
 echo "GitHub Release upload folder: $RELEASE_DIR"
 find "$RELEASE_DIR" -maxdepth 1 -type f -print

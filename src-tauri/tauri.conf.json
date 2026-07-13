@@ -22,7 +22,10 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "acceptFirstMouse": true,
-        "trafficLightPosition": { "x": 16, "y": 16 }
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 16
+        }
       }
     ],
     "security": {
@@ -42,6 +45,7 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "macOS": {
+      "minimumSystemVersion": "14.2",
       "infoPlist": "Info.plist"
     },
     "icon": [
