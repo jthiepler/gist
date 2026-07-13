@@ -65,6 +65,8 @@ class MLXBackend(LLMBackend):
 
         text_parts: list[str] = []
         finish_reason: Optional[str] = None
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation cancelled")
         for response in stream_generate(
             self.model,
             self.tokenizer,

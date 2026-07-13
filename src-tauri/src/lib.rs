@@ -432,6 +432,7 @@ struct SidecarState {
     response_tx: Option<(String, oneshot::Sender<Result<Value, String>>)>,
     child: Option<Child>,
     sidecar_log: Option<Arc<Mutex<File>>>,
+    generation: u64,
     started: bool,
     busy: bool,
 }
@@ -442,6 +443,8 @@ const DEFAULT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const NOTE_GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 const TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8 * 60 * 60);
 const MODEL_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const SIDECAR_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const SIDECAR_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn rpc_timeout(operation_type: &str) -> std::time::Duration {
     match operation_type {
@@ -450,6 +453,10 @@ fn rpc_timeout(operation_type: &str) -> std::time::Duration {
         "download_model" => MODEL_DOWNLOAD_TIMEOUT,
         _ => DEFAULT_RPC_TIMEOUT,
     }
+}
+
+fn cancel_message(request_id: &str) -> String {
+    serde_json::json!({ "type": "cancel", "request_id": request_id }).to_string()
 }
 
 fn emit_sidecar_state(app: &AppHandle, busy: bool) {
@@ -478,11 +485,7 @@ fn log_sidecar_event(log_file: Option<&Arc<Mutex<File>>>, level: &str, event: im
 
 // ── Sidecar Commands ──────────────────────────────────────────────────────
 
-#[tauri::command]
-async fn start_sidecar(
-    app: AppHandle,
-    state: State<'_, SharedSidecarState>,
-) -> Result<String, String> {
+fn start_sidecar_process(app: &AppHandle, state: &SharedSidecarState) -> Result<String, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     if s.started {
         return Err("Sidecar already running".into());
@@ -558,6 +561,8 @@ async fn start_sidecar(
     let mut child = sidecar_command
         .spawn()
         .map_err(|e| format!("Failed to start sidecar: {}", e))?;
+    s.generation = s.generation.wrapping_add(1);
+    let generation = s.generation;
 
     log_sidecar_event(
         Some(&log_file),
@@ -602,13 +607,20 @@ async fn start_sidecar(
 
     // Reader task: owns stdout, emits progress, routes responses
     let app_clone = app.clone();
-    let state_clone: SharedSidecarState = state.inner().clone();
+    let state_clone: SharedSidecarState = state.clone();
     let reader_log = log_file.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut last_progress_stage = String::new();
         let mut last_progress_percent = 0_u64;
         for line in reader.lines() {
+            let current_generation = state_clone
+                .lock()
+                .map(|s| s.generation == generation)
+                .unwrap_or(false);
+            if !current_generation {
+                break;
+            }
             let line = match line {
                 Ok(l) => l,
                 Err(_) => {
@@ -744,6 +756,13 @@ async fn start_sidecar(
         }
 
         // EOF on stdout — sidecar died or was intentionally stopped.
+        let is_current_generation = state_clone
+            .lock()
+            .map(|s| s.generation == generation)
+            .unwrap_or(false);
+        if !is_current_generation {
+            return;
+        }
         let unexpected_exit = state_clone.lock().map(|s| s.started).unwrap_or(false);
         log_sidecar_event(
             Some(&reader_log),
@@ -751,6 +770,9 @@ async fn start_sidecar(
             "event=sidecar_stdout_closed",
         );
         if let Ok(mut s) = state_clone.lock() {
+            if s.generation != generation {
+                return;
+            }
             s.started = false;
             s.busy = false;
             s.sidecar_log = None;
@@ -768,6 +790,14 @@ async fn start_sidecar(
     s.busy = false;
 
     Ok("Sidecar started".into())
+}
+
+#[tauri::command]
+async fn start_sidecar(
+    app: AppHandle,
+    state: State<'_, SharedSidecarState>,
+) -> Result<String, String> {
+    start_sidecar_process(&app, state.inner())
 }
 
 #[tauri::command]
@@ -911,7 +941,7 @@ async fn rpc_call(
                 s.request_tx.clone()
             };
             if let Some(tx) = cancel_tx {
-                let _ = tx.send(r#"{"type":"cancel"}"#.to_string());
+                let _ = tx.send(cancel_message(&request_id));
             }
             let log_file = state.lock().ok().and_then(|s| s.sidecar_log.clone());
             log_sidecar_event(
@@ -958,7 +988,11 @@ async fn cancel_sidecar(
         let s = state.lock().map_err(|e| e.to_string())?;
         let active_request_id = s.response_tx.as_ref().map(|(id, _)| id.clone());
         if let Some(tx) = &s.request_tx {
-            let _ = tx.send(r#"{"type":"cancel"}"#.to_string());
+            let message = active_request_id
+                .as_deref()
+                .map(cancel_message)
+                .unwrap_or_else(|| r#"{"type":"cancel"}"#.to_string());
+            let _ = tx.send(message);
         }
         active_request_id
     };
@@ -977,34 +1011,95 @@ async fn cancel_sidecar(
         return Ok(());
     };
 
-    // MLX normally observes the cancellation between generated tokens. Prompt
-    // prefill can hold control for longer, so force-stop only if this exact
-    // request is still active after a short cooperative grace period.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let mut s = state.lock().map_err(|e| e.to_string())?;
-    if s.response_tx.as_ref().map(|(id, _)| id) == Some(&active_request_id) {
-        s.request_tx.take();
-        if let Some((_, tx)) = s.response_tx.take() {
-            let _ = tx.send(Err("Operation cancelled".into()));
+    // MLX normally observes cancellation between generated tokens. Prompt
+    // prefill can hold control for several seconds, so wait for the exact
+    // request to unwind before considering the sidecar unhealthy. The bounded
+    // fallback protects the app from a genuinely stuck native MLX operation.
+    let deadline = std::time::Instant::now() + SIDECAR_CANCEL_GRACE;
+    loop {
+        let request_still_active = {
+            let s = state.lock().map_err(|e| e.to_string())?;
+            s.response_tx
+                .as_ref()
+                .map(|(id, _)| id == &active_request_id)
+                .unwrap_or(false)
+        };
+
+        if !request_still_active {
+            return Ok(());
         }
-        if let Some(mut child) = s.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+
+        if std::time::Instant::now() < deadline {
+            tokio::time::sleep(SIDECAR_CANCEL_POLL).await;
+            continue;
         }
-        s.started = false;
-        s.busy = false;
-        s.sidecar_log = None;
-        log_sidecar_event(
-            log_file.as_ref(),
-            "INFO",
-            format!(
-                "event=sidecar_cancel_forced request_id={}",
-                active_request_id
-            ),
-        );
-        emit_sidecar_state(&app, false);
+
+        let should_restart = {
+            let mut s = state.lock().map_err(|e| e.to_string())?;
+            if !s
+                .response_tx
+                .as_ref()
+                .map(|(id, _)| id == &active_request_id)
+                .unwrap_or(false)
+            {
+                false
+            } else {
+                s.request_tx.take();
+                if let Some((_, tx)) = s.response_tx.take() {
+                    let _ = tx.send(Err("Operation cancelled".into()));
+                }
+                if let Some(mut child) = s.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                s.started = false;
+                s.busy = false;
+                s.sidecar_log = None;
+                true
+            }
+        };
+
+        if should_restart {
+            log_sidecar_event(
+                log_file.as_ref(),
+                "WARN",
+                format!(
+                    "event=sidecar_cancel_forced request_id={} grace_seconds={}",
+                    active_request_id,
+                    SIDECAR_CANCEL_GRACE.as_secs()
+                ),
+            );
+            emit_sidecar_state(&app, false);
+
+            match start_sidecar_process(&app, state.inner()) {
+                Ok(_) => {
+                    log_sidecar_event(
+                        log_file.as_ref(),
+                        "INFO",
+                        format!(
+                            "event=sidecar_restarted_after_cancel request_id={}",
+                            active_request_id
+                        ),
+                    );
+                }
+                Err(error) => {
+                    log_sidecar_event(
+                        log_file.as_ref(),
+                        "ERROR",
+                        format!(
+                            "event=sidecar_restart_after_cancel_failed request_id={} error_type=start_sidecar",
+                            active_request_id,
+                        ),
+                    );
+                    return Err(format!(
+                        "Operation cancelled, but the processing engine could not restart: {}",
+                        error
+                    ));
+                }
+            }
+        }
+        return Ok(());
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -2110,6 +2205,7 @@ pub fn run() {
                 response_tx: None,
                 child: None,
                 sidecar_log: None,
+                generation: 0,
                 started: false,
                 busy: false,
             })));

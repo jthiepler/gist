@@ -208,7 +208,11 @@ def _stdin_reader():
             continue
         msg_type = msg.get("type", "")
         if msg_type == "cancel":
-            _log_event("rpc", "cancel_received", request_id=msg.get("request_id"))
+            _log_event(
+                "rpc",
+                "cancel_received",
+                request_id=msg.get("request_id") or _active_request_id,
+            )
             _cancel_event.set()
             # Don't queue — it's a control message
         else:

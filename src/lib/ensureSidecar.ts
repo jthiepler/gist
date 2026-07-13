@@ -1,9 +1,7 @@
 import { startSidecar, isRunning } from "./rpc";
 import { sidecarRunning } from "./stores";
-import { get } from "svelte/store";
 
 export async function ensureSidecar(): Promise<boolean> {
-  if (get(sidecarRunning)) return true;
   try {
     const running = await isRunning();
     if (running) {
@@ -15,6 +13,7 @@ export async function ensureSidecar(): Promise<boolean> {
     return true;
   } catch (e) {
     console.error("Failed to start sidecar:", e);
+    sidecarRunning.set(false);
     return false;
   }
 }
