@@ -4,6 +4,7 @@
 # Node / Svelte / Vite
 node_modules/
 /build/
+/release/
 /.svelte-kit/
 /package/
 vite.config.js.timestamp-*

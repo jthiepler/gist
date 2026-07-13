@@ -176,6 +176,39 @@ The unsigned Apple Silicon DMG is written to
 `src-tauri/target/release/bundle/dmg/`. Model checkouts, generated resources,
 PyInstaller output, and Rust build artifacts are ignored by Git.
 
+### Releases and automatic updates
+
+Gist checks the published GitHub Releases feed in the background and can
+download and install a signed update from within the app. Release builds must
+include the DMG for manual installation and the generated updater files
+(`latest.json`, the `.tar.gz` updater artifact, and its `.sig` signature).
+
+Create an updater signing key once and keep the private key outside the
+repository:
+
+```bash
+npx tauri signer generate --write-keys ~/.tauri/gist-updater.key
+```
+
+The public key is stored in `src-tauri/tauri.conf.json`; if you generate a
+different key, replace the configured public key with the new one. Set
+`TAURI_SIGNING_PRIVATE_KEY_PATH` (and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the key is password-protected), then
+run `npm run tauri:release`. Attach the files listed under “Updater files” by
+the script to the published GitHub Release. The release must be published,
+not left as a draft, for the app’s `releases/latest/download/latest.json`
+endpoint to resolve.
+
+If no key path or environment variable is set, `npm run tauri:release` prompts
+for the private key with terminal input hidden, then prompts separately for the
+key’s password. Leave the updater-key password blank only if the key was created
+without one. The Apple app-specific password is a separate prompt.
+
+Each release run clears and recreates the root-level `release/` folder with the
+DMG, `latest.json`, updater archive, and signature files ready to upload to
+GitHub. The folder is ignored by Git and does not affect ordinary development
+build output.
+
 ## Built with
 
 [Tauri 2](https://v2.tauri.app/) · [SvelteKit](https://svelte.dev/) ·

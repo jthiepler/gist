@@ -47,12 +47,21 @@
   import { loadAppearance } from "$lib/settings";
   import { page } from "$app/stores";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { check, type Update } from "@tauri-apps/plugin-updater";
   import type { Patient, RecordingJob, Session } from "$lib/types";
   import { confirmRegenerateAttachedNotes } from "$lib/confirmations";
+  import { deferFeedbackPrompt, dismissFeedbackPrompt, recordAppLaunch } from "$lib/feedback";
+  import FeedbackPrompt from "$lib/components/FeedbackPrompt.svelte";
   import Onboarding from "$lib/components/Onboarding.svelte";
+  import UpdatePrompt from "$lib/components/UpdatePrompt.svelte";
 
   let { children } = $props();
   let onboardingComplete = $state(false);
+  let feedbackPromptPending = $state(false);
+  let showFeedbackPrompt = $state(false);
+  let launchCount = 0;
+  let availableUpdate = $state<Update | null>(null);
+  let dismissedUpdateVersion = $state<string | null>(null);
 
   let unlistenProgress: UnlistenFn | null = null;
   let unlistenState: UnlistenFn | null = null;
@@ -60,6 +69,8 @@
   let unlistenRecStopped: UnlistenFn | null = null;
   let unlistenRecError: UnlistenFn | null = null;
   let recordingPollInterval: ReturnType<typeof setInterval> | null = null;
+  let updateCheckTimeout: ReturnType<typeof setTimeout> | null = null;
+  let updateCheckInterval: ReturnType<typeof setInterval> | null = null;
   let layoutDestroyed = false;
   let themeMediaQuery: MediaQueryList | null = null;
   let handleSystemThemeChange: (() => void) | null = null;
@@ -221,7 +232,67 @@
     }
   }
 
+  async function remindAboutFeedbackLater() {
+    feedbackPromptPending = false;
+    showFeedbackPrompt = false;
+    try {
+      await deferFeedbackPrompt(launchCount);
+    } catch (e) {
+      console.error("Could not save feedback reminder:", e);
+    }
+  }
+
+  async function stopAskingForFeedback() {
+    feedbackPromptPending = false;
+    showFeedbackPrompt = false;
+    try {
+      await dismissFeedbackPrompt();
+    } catch (e) {
+      console.error("Could not save feedback preference:", e);
+    }
+  }
+
+  async function checkForUpdates() {
+    if (layoutDestroyed || availableUpdate) return;
+    try {
+      const update = await check({ timeout: 10_000 });
+      if (!update || layoutDestroyed) {
+        await update?.close();
+        return;
+      }
+      if (update.version === dismissedUpdateVersion) {
+        await update.close();
+        return;
+      }
+      availableUpdate = update;
+    } catch (e) {
+      // Update checks are best-effort. Offline use and GitHub outages should
+      // never affect recording, transcription, or local note storage.
+      console.debug("Application update check unavailable:", e);
+    }
+  }
+
+  async function dismissUpdate() {
+    const update = availableUpdate;
+    if (!update) return;
+    dismissedUpdateVersion = update.version;
+    availableUpdate = null;
+    try {
+      await update.close();
+    } catch (e) {
+      console.debug("Could not close update handle:", e);
+    }
+  }
+
   onMount(async () => {
+    try {
+      const launch = await recordAppLaunch();
+      launchCount = launch.launchCount;
+      feedbackPromptPending = launch.shouldPrompt;
+    } catch (e) {
+      console.error("Could not record app launch:", e);
+    }
+
     // Install this before any awaited startup work so a just-stopped recording
     // is always routed through its durable job.
     unlistenRecStopped = await onRecordingStopped(handleRecordingStopped);
@@ -355,6 +426,17 @@
       clearInterval(recordingPollInterval);
       recordingPollInterval = null;
     }
+
+    // Check in the background after startup, then periodically while the app
+    // is open. This remains silent when offline or when no release is present.
+    updateCheckTimeout = setTimeout(() => void checkForUpdates(), 5_000);
+    updateCheckInterval = setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1_000);
+  });
+
+  $effect(() => {
+    if (feedbackPromptPending && onboardingComplete) {
+      showFeedbackPrompt = true;
+    }
   });
 
   // Apply dark mode class to <html>
@@ -377,6 +459,9 @@
     unlistenRecStopped?.();
     unlistenRecError?.();
     if (recordingPollInterval) clearInterval(recordingPollInterval);
+    if (updateCheckTimeout) clearTimeout(updateCheckTimeout);
+    if (updateCheckInterval) clearInterval(updateCheckInterval);
+    if (availableUpdate) void availableUpdate.close();
     if (themeMediaQuery && handleSystemThemeChange) {
       themeMediaQuery.removeEventListener("change", handleSystemThemeChange);
     }
@@ -575,6 +660,18 @@
 
 {#if !onboardingComplete}
   <Onboarding onComplete={() => (onboardingComplete = true)} />
+{/if}
+
+{#if showFeedbackPrompt}
+  <FeedbackPrompt
+    onFeedbackAction={stopAskingForFeedback}
+    onRemindLater={remindAboutFeedbackLater}
+    onDontAskAgain={stopAskingForFeedback}
+  />
+{/if}
+
+{#if availableUpdate && onboardingComplete}
+  <UpdatePrompt update={availableUpdate} isRecording={$isRecording} onDismiss={dismissUpdate} />
 {/if}
 
 {#if $sidecarBusy}

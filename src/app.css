@@ -102,6 +102,80 @@ button, input, select, textarea, a {
 .onboarding-step-1 { width: min(620px, 100%); text-align: center; }
 .onboarding-step-3 { width: min(720px, 100%); }
 
+.feedback-prompt-shell {
+  position: fixed;
+  z-index: 1500;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(23, 33, 30, 0.28);
+}
+
+.feedback-prompt-card {
+  width: min(430px, 100%);
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-sidebar);
+  box-shadow: var(--shadow-md);
+}
+
+.feedback-prompt-eyebrow {
+  margin-bottom: 7px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.feedback-prompt-card h2 {
+  font-size: 21px;
+  letter-spacing: -0.3px;
+}
+
+.feedback-prompt-card p {
+  margin-top: 9px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.feedback-prompt-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.feedback-prompt-actions .btn {
+  justify-content: center;
+  width: 100%;
+}
+
+.feedback-prompt-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.feedback-prompt-footer button {
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.feedback-prompt-footer button:hover {
+  color: var(--text);
+}
+
 .onboarding-progress {
   display: flex;
   justify-content: center;
@@ -2433,6 +2507,100 @@ textarea {
   margin-top: 6px;
 }
 
+/* ── Application Update Card ────────────────────────────────────────────── */
+
+.update-card {
+  position: fixed;
+  top: 48px;
+  right: 24px;
+  z-index: 1003;
+  width: min(420px, calc(100vw - 48px));
+  padding: 17px 18px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--bg-sidebar);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.16);
+}
+
+.update-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.update-card-eyebrow {
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.update-card h2 {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.update-card-close {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text-muted);
+  background: transparent;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.update-card-close:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.update-card-message {
+  max-height: 96px;
+  margin: 10px 0 14px;
+  overflow: auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-line;
+}
+
+.update-card .progress-bar {
+  margin: 0 0 6px;
+}
+
+.update-card-progress {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.update-card-error {
+  margin: -4px 0 14px;
+  color: var(--error);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.update-card-warning {
+  margin: -4px 0 14px;
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.update-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 /* ── Recording Card (floating bottom-right, above progress card) ─────────── */
 
 .recording-card {
@@ -2622,6 +2790,12 @@ textarea {
   color: var(--accent);
   font-size: 12px;
   font-weight: 600;
+}
+
+.feedback-settings-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 

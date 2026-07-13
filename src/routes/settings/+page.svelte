@@ -22,6 +22,13 @@
     recommendedLlmForMemory,
   } from "$lib/models";
   import { loadSettings, saveSetting } from "$lib/settings";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import {
+    FEEDBACK_EMAIL_URL,
+    FEEDBACK_GITHUB_URL,
+    FEEDBACK_SURVEY_URL,
+    dismissFeedbackPrompt,
+  } from "$lib/feedback";
   import type { ModelsResult } from "$lib/types";
 
   let models = $state<ModelsResult>(createModelState());
@@ -227,6 +234,15 @@
     if (info.downloaded === null) return $sidecarBusy ? "Checking when processing finishes" : "Checking availability";
     return info.downloaded ? "Installed" : "Not installed";
   }
+
+  async function openFeedbackLink(url: string) {
+    try {
+      await openUrl(url);
+      await dismissFeedbackPrompt();
+    } catch (e) {
+      error = `Could not open feedback link: ${String(e)}`;
+    }
+  }
 </script>
 
 <div class="workspace-header">
@@ -358,5 +374,15 @@
     >
       <div class="toggle-knob"></div>
     </button>
+  </div>
+</div>
+
+<div class="settings-section">
+  <h3>Feedback</h3>
+  <p class="settings-help">Help shape Gist with general feedback. Please do not include real patient information.</p>
+  <div class="feedback-settings-links">
+    <button class="btn btn-primary" type="button" onclick={() => openFeedbackLink(FEEDBACK_SURVEY_URL)}>Take the short survey</button>
+    <button class="btn" type="button" onclick={() => openFeedbackLink(FEEDBACK_EMAIL_URL)}>Email feedback</button>
+    <button class="btn" type="button" onclick={() => openFeedbackLink(FEEDBACK_GITHUB_URL)}>Open GitHub Issues</button>
   </div>
 </div>
