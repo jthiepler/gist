@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from .downloader import download_model, is_model_downloaded, delete_model
+from .downloader import delete_model, download_model, is_model_downloaded
 from .formats.registry import list_formats
 from .models import (
     DEFAULT_LLM,

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The Tauri DMG bundler uses the product name as the mounted volume name.
-# A failed or interrupted build can leave an older generated Gist DMG mounted,
-# causing the next hdiutil attach step to fail because /Volumes/Gist is busy.
+# A failed or interrupted build can leave one or more DMG volumes mounted,
+# causing the next hdiutil attach step to fail because its mount point is busy.
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 0
@@ -13,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DMG_DIR="$PROJECT_DIR/src-tauri/target/release/bundle/dmg"
 
-mounted_gist_images() {
+mounted_dmg_images() {
   hdiutil info 2>/dev/null | awk '
     /^image-path[[:space:]]*:/ {
       image = $0
@@ -24,8 +23,8 @@ mounted_gist_images() {
       device = $1
       next
     }
-    /[[:space:]]\/Volumes\/Gist$/ {
-      if (image ~ /(^|\/)Gist_[^\/]+\.dmg$/ && device != "") {
+    /[[:space:]]\/Volumes\// {
+      if (tolower(image) ~ /\.dmg$/ && device != "" && !seen[device]++) {
         print device "\t" image
       }
       device = ""
@@ -36,9 +35,9 @@ mounted_gist_images() {
 
 while IFS=$'\t' read -r device image; do
   [[ -z "$device" ]] && continue
-  echo "Detaching stale generated DMG mount: $image ($device)"
+  echo "Detaching mounted DMG before build: $image ($device)"
   hdiutil detach "$device" >/dev/null || hdiutil detach -force "$device" >/dev/null
-done < <(mounted_gist_images)
+done < <(mounted_dmg_images)
 
 # Tauri normally replaces this file, but remove abandoned partial output from
 # interrupted conversions so a retry always starts with a clean destination.

@@ -505,6 +505,9 @@ async fn start_sidecar(
     };
 
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
+    let model_cache_dir = app_dir.join("models");
+    std::fs::create_dir_all(&model_cache_dir).map_err(|e| e.to_string())?;
     let log_path = app_dir.join("sidecar.log");
     let stderr = std::fs::OpenOptions::new()
         .create(true)
@@ -515,12 +518,15 @@ async fn start_sidecar(
         .map(Stdio::from)
         .unwrap_or(Stdio::null());
 
-    let mut child = Command::new(&sidecar_path)
+    let mut sidecar_command = Command::new(&sidecar_path);
+    sidecar_command
         .arg("serve")
         .env("DYLD_FALLBACK_LIBRARY_PATH", &dyld_path)
+        .env("HF_HUB_CACHE", &model_cache_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(stderr)
+        .stderr(stderr);
+    let mut child = sidecar_command
         .spawn()
         .map_err(|e| format!("Failed to start sidecar: {}", e))?;
 

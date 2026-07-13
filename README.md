@@ -67,6 +67,11 @@ In the normal bundled workflow:
 - Note generation runs with a Qwen 3.5 MLX model you download and manage.
 - The app can continue working offline once its model assets are present.
 
+Downloaded note-generation models are stored in Gist's per-user application
+data directory on macOS (`~/Library/Application Support/com.gist.desktop/models/`),
+separate from the application bundle. They persist across app updates and can
+be removed from Settings.
+
 The initial model downloads and application update checks require an internet
 connection. Transcription, diarization, and note generation do not send
 clinical material to a remote service.
