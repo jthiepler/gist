@@ -197,17 +197,14 @@
     }
   }
 
-  const PLACEHOLDER_PROMPT = `You are a clinical note-taking assistant for licensed therapists. Generate a {format name} note from labeled clinical source materials.
+  const PLACEHOLDER_PROMPT = `Generate a {format name} note from the available source materials. The application's mandatory documentation rules are applied automatically.
 
-Rules:
-- Source materials may include a session transcript and/or clinician note.
-- Base client statements only on the session transcript.
-- Use the clinician note for therapist observations, interventions, corrections, clinical context, and plan details.
-- ...your rules here...
-
-Output format:
+Required output format:
 
 **Section 1:**
+- Describe the format-specific information that belongs here.
+
+**Section 2:**
 - ...`;
 </script>
 
@@ -249,8 +246,8 @@ Output format:
           </div>
           <details class="advanced-prompt" open>
             <summary>Advanced prompt</summary>
-            <p>Changes here can substantially alter the structure and content of generated notes.</p>
-            <label class="template-editor-label" for="edit-format-prompt">Generation instructions</label>
+            <p>The application's mandatory attribution, risk, and evidence rules always apply. Customize only this note type's structure and content.</p>
+            <label class="template-editor-label" for="edit-format-prompt">Format instructions</label>
             <textarea
               id="edit-format-prompt"
               bind:value={editPrompt}
@@ -398,8 +395,8 @@ Output format:
       </div>
       <details class="advanced-prompt" open>
         <summary>Advanced prompt</summary>
-        <p>Define the note structure and generation rules. All processing remains local.</p>
-        <label class="template-editor-label" for="new-format-prompt">Generation instructions</label>
+        <p>The application's mandatory attribution, risk, and evidence rules always apply. Define only this note type's structure and content.</p>
+        <label class="template-editor-label" for="new-format-prompt">Format instructions</label>
         <textarea
           id="new-format-prompt"
           bind:value={newPrompt}

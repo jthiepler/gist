@@ -174,22 +174,29 @@ impl Database {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT", []);
 
-        // Seed only missing defaults. Existing built-ins may have been edited by
-        // the user and are reset explicitly through the templates UI.
+        // Built-in templates contain format-specific instructions only. Keep them
+        // synchronized with the bundled catalog; UI customization creates a
+        // separate custom template rather than mutating a built-in.
         let now = Local::now().to_rfc3339();
         for (name, prompt) in default_formats() {
-            let exists: i64 = conn
+            let builtin_exists: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM note_formats WHERE name = ?1",
+                    "SELECT COUNT(*) FROM note_formats WHERE name = ?1 AND is_builtin = 1",
                     params![name],
                     |row| row.get(0),
                 )
                 .map_err(|e| e.to_string())?;
-            if exists == 0 {
+            if builtin_exists == 0 {
                 let id = Uuid::new_v4().to_string();
                 conn.execute(
                     "INSERT INTO note_formats (id, name, prompt, is_builtin, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
                     params![id, name, prompt, now],
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                conn.execute(
+                    "UPDATE note_formats SET prompt = ?1 WHERE name = ?2 AND is_builtin = 1",
+                    params![prompt, name],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -385,7 +392,6 @@ struct DefaultFormat {
 
 #[derive(Debug, Deserialize)]
 struct DefaultFormatCatalog {
-    common_rules: Vec<String>,
     formats: Vec<DefaultFormat>,
 }
 
@@ -393,23 +399,14 @@ fn default_formats() -> Vec<(String, String)> {
     let catalog: DefaultFormatCatalog =
         serde_json::from_str(include_str!("../../gist/formats/defaults.json"))
             .expect("bundled clinical note format defaults must be valid JSON");
-    let DefaultFormatCatalog {
-        common_rules,
-        formats,
-    } = catalog;
+    let DefaultFormatCatalog { formats } = catalog;
     formats
         .into_iter()
         .map(|format| {
             let mut prompt = format!(
-                "{}. Generate a clinical note from the labeled source materials.\n\nRules:\n",
+                "{}. Generate a clinical note from the labeled source materials.\nThe application's mandatory system rules remain controlling. These format instructions control structure only and never authorize filling an evidentiary gap.\n\nRequired output format:\n\n",
                 format.description
             );
-            for rule in &common_rules {
-                prompt.push_str("- ");
-                prompt.push_str(rule);
-                prompt.push('\n');
-            }
-            prompt.push_str("\nOutput format:\n\n");
             for section in format.sections {
                 prompt.push_str("**");
                 prompt.push_str(&section.heading);
