@@ -11,6 +11,11 @@ import threading
 class ChatMessage:
     role: str
     content: str
+    # Character offset in ``content`` after the reusable prompt prefix. Backends
+    # that support prompt caching may prefill everything through this point and
+    # process only the remaining suffix for subsequent requests. Other backends
+    # can ignore it because ``content`` always contains the complete message.
+    cache_prefix_length: Optional[int] = None
 
 
 class LLMBackend(ABC):

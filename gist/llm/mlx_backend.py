@@ -1,16 +1,28 @@
 """MLX backend for macOS Apple Silicon."""
 from __future__ import annotations
 
+import copy
 import logging
 import threading
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 from mlx_lm import load, stream_generate
+from mlx_lm.generate import generate_step
+from mlx_lm.models.cache import make_prompt_cache
 
 from .base import ChatMessage, LLMBackend
 
 log = logging.getLogger(__name__)
+
+_CACHE_BOUNDARY_MARKER = "\ue000GIST_CACHE_BOUNDARY\ue001"
+
+
+@dataclass
+class _PromptCacheEntry:
+    prefix_tokens: Tuple[int, ...]
+    prompt_cache: List[Any]
 
 
 def _make_sampler(temperature: float):
@@ -28,11 +40,142 @@ class MLXBackend(LLMBackend):
     def __init__(self):
         self.model = None
         self.tokenizer = None
+        self._prompt_cache_entry: Optional[_PromptCacheEntry] = None
 
     def load(self, model_path: str, revision: Optional[str] = None):
+        self._prompt_cache_entry = None
         log.info("event=mlx_model_load_started revision=%s", revision or "default")
         self.model, self.tokenizer = load(model_path, revision=revision)
         log.info("event=mlx_model_loaded revision=%s", revision or "default")
+
+    def _render_cacheable_prompt(
+        self,
+        messages: List[ChatMessage],
+        thinking: bool,
+    ) -> Optional[Tuple[Tuple[int, ...], List[int]]]:
+        """Render one cache-marked message into exact prefix and suffix tokens."""
+        boundaries = [
+            (index, message.cache_prefix_length)
+            for index, message in enumerate(messages)
+            if message.cache_prefix_length is not None
+        ]
+        if not boundaries:
+            return None
+        if len(boundaries) != 1:
+            raise ValueError("Exactly one prompt cache boundary is supported.")
+
+        message_index, boundary = boundaries[0]
+        assert boundary is not None
+        content = messages[message_index].content
+        if not 0 < boundary < len(content):
+            raise ValueError("Prompt cache boundary must fall inside the message content.")
+
+        marker = _CACHE_BOUNDARY_MARKER
+        while any(marker in message.content for message in messages):
+            marker += "_"
+
+        rendered_messages = []
+        for index, message in enumerate(messages):
+            rendered_content = message.content
+            if index == message_index:
+                rendered_content = content[:boundary] + marker + content[boundary:]
+            rendered_messages.append({"role": message.role, "content": rendered_content})
+
+        rendered = self.tokenizer.apply_chat_template(
+            rendered_messages,
+            add_generation_prompt=True,
+            enable_thinking=thinking,
+            tokenize=False,
+        )
+        if not isinstance(rendered, str) or rendered.count(marker) != 1:
+            raise RuntimeError("The model chat template could not preserve the prompt cache boundary.")
+
+        prefix_text, suffix_text = rendered.split(marker, 1)
+        full_text = prefix_text + suffix_text
+        prefix_tokens: Tuple[int, ...]
+        suffix_tokens: List[int]
+
+        # Fast Hugging Face tokenizers expose character offsets. Use them to
+        # split the normally tokenized full prompt without changing tokenization
+        # at the cache boundary. The fallback supports tokenizer implementations
+        # that do not provide offsets.
+        try:
+            raw_tokenizer = getattr(self.tokenizer, "_tokenizer", self.tokenizer)
+            encoding = raw_tokenizer(
+                full_text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            input_ids = encoding["input_ids"]
+            offsets = encoding["offset_mapping"]
+            if len(input_ids) != len(offsets):
+                raise ValueError("Tokenizer returned mismatched token offsets.")
+
+            boundary_char = len(prefix_text)
+            split_index = 0
+            for index, (start, end) in enumerate(offsets):
+                if start >= boundary_char or end > boundary_char:
+                    break
+                split_index = index + 1
+            if split_index == 0 or split_index == len(input_ids):
+                raise ValueError("Tokenizer offsets did not locate the cache boundary.")
+            prefix_tokens = tuple(input_ids[:split_index])
+            suffix_tokens = list(input_ids[split_index:])
+        except (KeyError, TypeError, ValueError, NotImplementedError):
+            prefix_tokens = tuple(
+                self.tokenizer.encode(prefix_text, add_special_tokens=False)
+            )
+            suffix_tokens = list(
+                self.tokenizer.encode(suffix_text, add_special_tokens=False)
+            )
+        if not prefix_tokens or not suffix_tokens:
+            raise RuntimeError("The model chat template produced an empty cache prefix or suffix.")
+        return prefix_tokens, suffix_tokens
+
+    def _prompt_cache_for(
+        self,
+        prefix_tokens: Tuple[int, ...],
+        cancel_event: Optional[threading.Event],
+    ) -> Tuple[List[Any], bool]:
+        """Return an isolated working cache, prefilling and retaining one base cache."""
+        cache_hit = (
+            self._prompt_cache_entry is not None
+            and self._prompt_cache_entry.prefix_tokens == prefix_tokens
+        )
+        if not cache_hit:
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Generation cancelled")
+
+            prompt_cache = make_prompt_cache(self.model)
+
+            def check_cancelled(_processed: int, _total: int) -> None:
+                if cancel_event and cancel_event.is_set():
+                    raise InterruptedError("Generation cancelled")
+
+            for _ in generate_step(
+                mx.array(prefix_tokens),
+                self.model,
+                max_tokens=0,
+                prompt_cache=prompt_cache,
+                prompt_progress_callback=check_cancelled,
+            ):
+                pass
+            self._prompt_cache_entry = _PromptCacheEntry(
+                prefix_tokens=prefix_tokens,
+                prompt_cache=prompt_cache,
+            )
+            log.info(
+                "event=mlx_prompt_cache_miss cached_prefix_tokens=%d",
+                len(prefix_tokens),
+            )
+        else:
+            log.info(
+                "event=mlx_prompt_cache_hit cached_prefix_tokens=%d",
+                len(prefix_tokens),
+            )
+
+        assert self._prompt_cache_entry is not None
+        return copy.deepcopy(self._prompt_cache_entry.prompt_cache), cache_hit
 
     def generate(
         self,
@@ -45,20 +188,28 @@ class MLXBackend(LLMBackend):
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        prompt = self.tokenizer.apply_chat_template(
-            [{"role": m.role, "content": m.content} for m in messages],
-            add_generation_prompt=True,
-            enable_thinking=thinking,
-        )
-
-        if isinstance(prompt, list):
-            prompt = self.tokenizer.decode(prompt)
+        cacheable_prompt = self._render_cacheable_prompt(messages, thinking)
+        prompt_cache = None
+        cache_hit = False
+        cached_prefix_tokens = 0
+        if cacheable_prompt is not None:
+            prefix_tokens, prompt = cacheable_prompt
+            cached_prefix_tokens = len(prefix_tokens)
+            prompt_cache, cache_hit = self._prompt_cache_for(prefix_tokens, cancel_event)
+        else:
+            prompt = self.tokenizer.apply_chat_template(
+                [{"role": m.role, "content": m.content} for m in messages],
+                add_generation_prompt=True,
+                enable_thinking=thinking,
+            )
 
         log.info(
-            "event=mlx_generation_started max_tokens=%d thinking=%s message_count=%d",
+            "event=mlx_generation_started max_tokens=%d thinking=%s message_count=%d prompt_cache=%s cached_prefix_tokens=%d",
             max_tokens,
             thinking,
             len(messages),
+            "hit" if cache_hit else "miss" if cacheable_prompt is not None else "disabled",
+            cached_prefix_tokens,
         )
 
         sampler = _make_sampler(temperature)
@@ -67,12 +218,17 @@ class MLXBackend(LLMBackend):
         finish_reason: Optional[str] = None
         if cancel_event and cancel_event.is_set():
             raise InterruptedError("Generation cancelled")
+        generation_args = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "sampler": sampler,
+        }
+        if prompt_cache is not None:
+            generation_args["prompt_cache"] = prompt_cache
         for response in stream_generate(
             self.model,
             self.tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
+            **generation_args,
         ):
             if cancel_event and cancel_event.is_set():
                 raise InterruptedError("Generation cancelled")
@@ -115,9 +271,6 @@ class MLXBackend(LLMBackend):
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        if isinstance(prompt, list):
-            prompt = self.tokenizer.decode(prompt)
-
         from outlines import Generator, from_mlxlm
         from outlines.types import Choice
 
@@ -163,6 +316,7 @@ class MLXBackend(LLMBackend):
         return text
 
     def cleanup(self):
+        self._prompt_cache_entry = None
         self.model = None
         self.tokenizer = None
         log.info("event=mlx_model_released")
