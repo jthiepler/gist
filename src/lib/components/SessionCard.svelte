@@ -89,7 +89,7 @@
   let noteDraft = $state("");
   let inputDraft = $state("");
   let inputAudioPath = $state("");
-  let diarizeInput = $state(false);
+  let diarizeInput = $state(true);
   let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let noteEditorEl = $state<HTMLTextAreaElement | null>(null);
   let inputEditorEl = $state<HTMLTextAreaElement | null>(null);
@@ -261,7 +261,7 @@
     addingInputKind = null;
     inputDraft = "";
     inputAudioPath = "";
-    diarizeInput = false;
+    diarizeInput = true;
     diarizationSpeakers = DEFAULT_DIARIZATION_SPEAKERS;
   });
 
@@ -1020,6 +1020,7 @@
         text: result.transcript,
         audio_file: inputAudioPath,
         duration_seconds: result.duration,
+        metadata_json: JSON.stringify({ segments: result.segments }),
         include_in_notes: true,
       });
       const updated = await getSession(session.id);
@@ -1646,7 +1647,7 @@
                         {#if addingInputKind === "session_transcript"}
                           <label class="option-checkbox">
                             <input type="checkbox" bind:checked={diarizeInput} disabled={processingInput} />
-                            <span>Identify speakers (experimental)</span>
+                            <span>Identify speakers</span>
                           </label>
                           {#if diarizeInput}
                             <label class="diarization-speaker-select" for={`input-file-speaker-count-${session.id}`}>
@@ -1711,7 +1712,7 @@
                             {#if addingInputKind === "session_transcript"}
                               <label class="option-checkbox">
                                 <input type="checkbox" bind:checked={diarizeInput} />
-                                <span>Identify speakers (experimental)</span>
+                                <span>Identify speakers</span>
                               </label>
                               {#if diarizeInput}
                                 <label class="diarization-speaker-select" for={`input-recording-speaker-count-${session.id}`}>

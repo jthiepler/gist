@@ -43,7 +43,7 @@ fn map_session(row: &Row) -> rusqlite::Result<Session> {
 
 fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Result<Vec<SessionInput>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, transcription_model, include_in_notes, created_at, updated_at
+        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, transcription_model, include_in_notes, created_at, updated_at, metadata_json
          FROM session_inputs
          WHERE session_id = ?1
          ORDER BY created_at ASC",
@@ -63,6 +63,7 @@ fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Result<Vec<Sessi
                 include_in_notes: row.get::<_, i64>(9)? != 0,
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
+                metadata_json: row.get(12)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -130,7 +131,8 @@ impl Database {
                 transcription_model TEXT,
                 include_in_notes INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT
             );
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -180,6 +182,10 @@ impl Database {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE session_inputs ADD COLUMN metadata_json TEXT",
+            [],
+        );
         let _ = conn.execute(
             "ALTER TABLE recording_jobs ADD COLUMN num_speakers INTEGER NOT NULL DEFAULT 2",
             [],
@@ -256,6 +262,7 @@ struct SessionInput {
     include_in_notes: bool,
     created_at: String,
     updated_at: String,
+    metadata_json: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -373,6 +380,8 @@ struct CreateSessionInput {
     transcription_model: Option<String>,
     #[serde(default = "default_include_in_notes")]
     include_in_notes: bool,
+    #[serde(default)]
+    metadata_json: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,7 +483,7 @@ const SIDECAR_CANCEL_POLL: std::time::Duration = std::time::Duration::from_milli
 
 fn rpc_timeout(operation_type: &str) -> std::time::Duration {
     match operation_type {
-        "generate_note" => NOTE_GENERATION_TIMEOUT,
+        "generate_note" | "generate_notes" => NOTE_GENERATION_TIMEOUT,
         "transcribe" => TRANSCRIPTION_TIMEOUT,
         "download_model" => MODEL_DOWNLOAD_TIMEOUT,
         _ => DEFAULT_RPC_TIMEOUT,
@@ -882,7 +891,7 @@ async fn rpc_call(
     // return path, including cancellation and timeout.
     let _sleep_assertion = matches!(
         operation_type.as_str(),
-        "transcribe" | "generate_note" | "download_model"
+        "transcribe" | "generate_note" | "generate_notes" | "download_model"
     )
     .then(|| audio::recorder::SleepAssertion::acquire("Gist is processing session data"));
     {
@@ -1345,8 +1354,8 @@ async fn create_session_input(
         .execute(
             "INSERT INTO session_inputs (
                 id, session_id, kind, source, title, text, audio_file, duration_seconds,
-                transcription_model, include_in_notes, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                transcription_model, include_in_notes, created_at, updated_at, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
             params![
                 id,
                 data.session_id,
@@ -1358,7 +1367,8 @@ async fn create_session_input(
                 data.duration_seconds,
                 data.transcription_model,
                 if data.include_in_notes { 1 } else { 0 },
-                now
+                now,
+                data.metadata_json
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1373,21 +1383,28 @@ async fn update_session_input(
 ) -> Result<SessionInput, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let existing = get_session_input_by_id(&db.conn, &data.id)?;
+    let text_changed = data.text.is_some();
     let title = data.title.unwrap_or(existing.title);
     let text = data.text.unwrap_or(existing.text);
     let include_in_notes = data.include_in_notes.unwrap_or(existing.include_in_notes);
+    let metadata_json = if text_changed {
+        None
+    } else {
+        existing.metadata_json
+    };
     let updated_at = Local::now().to_rfc3339();
     let affected = db
         .conn
         .execute(
             "UPDATE session_inputs
-             SET title = ?1, text = ?2, include_in_notes = ?3, updated_at = ?4
-             WHERE id = ?5",
+             SET title = ?1, text = ?2, include_in_notes = ?3, updated_at = ?4, metadata_json = ?5
+             WHERE id = ?6",
             params![
                 title,
                 text,
                 if include_in_notes { 1 } else { 0 },
                 updated_at,
+                metadata_json,
                 data.id
             ],
         )
@@ -1431,7 +1448,7 @@ async fn delete_session_input(
 
 fn get_session_input_by_id(conn: &Connection, id: &str) -> Result<SessionInput, String> {
     conn.query_row(
-        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, transcription_model, include_in_notes, created_at, updated_at
+        "SELECT id, session_id, kind, source, title, text, audio_file, duration_seconds, transcription_model, include_in_notes, created_at, updated_at, metadata_json
          FROM session_inputs
          WHERE id = ?1",
         params![id],
@@ -1449,6 +1466,7 @@ fn get_session_input_by_id(conn: &Connection, id: &str) -> Result<SessionInput, 
                 include_in_notes: row.get::<_, i64>(9)? != 0,
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
+                metadata_json: row.get(12)?,
             })
         },
     )

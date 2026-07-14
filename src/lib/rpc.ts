@@ -79,6 +79,29 @@ export async function generateNote(
   });
 }
 
+export interface NoteGenerationSource {
+  id: string;
+  kind: string;
+  title: string;
+  text: string;
+  segments?: TranscriptionSegment[];
+}
+
+export async function generateNotes(
+  sources: NoteGenerationSource[],
+  formats: { name: string; prompt?: string }[],
+  model?: string,
+  thinking?: boolean,
+): Promise<{ notes: Record<string, string> }> {
+  return rpcCall({
+    type: "generate_notes",
+    sources,
+    formats,
+    model: model || undefined,
+    thinking: thinking ?? false,
+  });
+}
+
 export async function downloadModel(model: string): Promise<void> {
   await rpcCall({ type: "download_model", model, kind: "llm" });
 }
@@ -130,6 +153,7 @@ export async function createSessionInput(data: {
   duration_seconds?: number | null;
   transcription_model?: string | null;
   include_in_notes?: boolean;
+  metadata_json?: string | null;
 }): Promise<SessionInput> {
   return invoke<SessionInput>("create_session_input", { data });
 }

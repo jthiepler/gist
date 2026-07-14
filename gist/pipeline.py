@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from .audio import cleanup_normalized_audio, normalize_audio_for_pipeline
 from .diarization import DEFAULT_NUM_SPEAKERS
@@ -346,3 +346,153 @@ def generate_note(
 
     log.info("event=note_generation_pipeline_completed note_chars=%d", len(note))
     return note
+
+
+def generate_notes(
+    sources: list[dict[str, Any]],
+    formats: list[dict[str, Optional[str]]],
+    llm_model: str = "qwen-3.5-4b",
+    max_tokens: int = 4096,
+    thinking: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> dict[str, str]:
+    """Generate notes directly for short sources or through evidence for long sessions."""
+    from .evidence import (
+        consolidate_evidence_ledger,
+        extract_evidence_ledger,
+        render_ledger,
+        requires_evidence_pipeline,
+    )
+    from .formats.defaults import build_evidence_messages, build_messages, load_templates
+    from .llm.base import GenerationLimitError
+
+    transcript_sources = [source for source in sources if source.get("kind") == "session_transcript"]
+    clinician_notes = [
+        {"title": str(source.get("title") or "Clinician note"), "text": str(source.get("text") or "")}
+        for source in sources
+        if source.get("kind") == "clinician_note" and str(source.get("text") or "").strip()
+    ]
+    if not transcript_sources and not clinician_notes:
+        raise ValueError("No supported note source material was provided.")
+    if not formats:
+        return {}
+
+    spec = resolve_model(llm_model, "llm")
+    log.info(
+        "event=batch_note_generation_started model=%s formats=%d transcript_sources=%d clinician_notes=%d thinking=%s",
+        llm_model,
+        len(formats),
+        len(transcript_sources),
+        len(clinician_notes),
+        thinking,
+    )
+    use_evidence = bool(transcript_sources) and requires_evidence_pipeline(transcript_sources)
+    if progress_callback:
+        progress_callback(
+            0,
+            "Preparing evidence extraction..." if use_evidence else "Preparing note generation...",
+        )
+    llm = _get_cached_llm(spec.hf_repo, spec.revision)
+    ledger: dict[str, Any] = {"evidence_lines": 0}
+    evidence_digest = ""
+    direct_source_material = ""
+    if use_evidence:
+        ledger = extract_evidence_ledger(
+            transcript_sources,
+            llm,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+        evidence_digest = consolidate_evidence_ledger(
+            render_ledger(ledger),
+            llm,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+    else:
+        direct_source_material = "\n\n---\n\n".join(
+            f"## {str(source.get('title') or source.get('kind') or 'Source')}\n\n{str(source.get('text') or '').strip()}"
+            for source in sources
+            if str(source.get("text") or "").strip()
+        )
+    if progress_callback:
+        progress_callback(72 if use_evidence else 8, "Preparing clinical notes...")
+
+    builtin_templates = load_templates()
+    notes: dict[str, str] = {}
+    for index, requested in enumerate(formats):
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Note generation cancelled")
+        format_name = str(requested.get("name") or "").strip()
+        if not format_name:
+            raise ValueError("Every requested format must have a name.")
+        custom_prompt = requested.get("prompt")
+        if custom_prompt:
+            template = {"prompt": custom_prompt}
+        elif format_name in builtin_templates:
+            template = builtin_templates[format_name]
+        else:
+            raise KeyError(f"Unknown note format '{format_name}'.")
+        note_progress_start = 75 if use_evidence else 10
+        note_progress_range = 24 if use_evidence else 89
+        start_percent = note_progress_start + round((index / len(formats)) * note_progress_range)
+        if progress_callback:
+            progress_callback(start_percent, f"Generating {format_name.upper()} note ({index + 1}/{len(formats)})...")
+        try:
+            messages = (
+                build_evidence_messages(template, evidence_digest, clinician_notes)
+                if use_evidence
+                else build_messages(
+                    template,
+                    direct_source_material,
+                    max_bullets_per_section=5,
+                )
+            )
+            notes[format_name] = llm.generate(
+                messages=messages,
+                max_tokens=min(max_tokens, 2048),
+                temperature=0.2,
+                thinking=thinking,
+                cancel_event=cancel_event,
+            )
+        except GenerationLimitError:
+            log.warning(
+                "event=note_generation_concise_retry model=%s format=%s",
+                llm_model,
+                format_name,
+            )
+            if progress_callback:
+                progress_callback(start_percent, f"Retrying {format_name.upper()} note more concisely...")
+            retry_messages = (
+                build_evidence_messages(
+                    template,
+                    evidence_digest,
+                    clinician_notes,
+                    max_bullets_per_section=3,
+                )
+                if use_evidence
+                else build_messages(
+                    template,
+                    direct_source_material,
+                    max_bullets_per_section=3,
+                )
+            )
+            notes[format_name] = llm.generate(
+                messages=retry_messages,
+                max_tokens=min(max_tokens, 1536),
+                temperature=0.0,
+                thinking=thinking,
+                cancel_event=cancel_event,
+            )
+
+    if progress_callback:
+        progress_callback(100, "Finalizing notes...")
+    log.info(
+        "event=batch_note_generation_completed model=%s formats=%d mode=%s evidence_lines=%d",
+        llm_model,
+        len(notes),
+        "evidence" if use_evidence else "direct",
+        ledger.get("evidence_lines", 0),
+    )
+    return notes

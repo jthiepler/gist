@@ -10,8 +10,15 @@ from unittest.mock import Mock, patch
 
 from gist import pipeline
 from gist.diarization import attach_speakers, clean_speaker_turns, render_speaker_transcript
+from gist.evidence import (
+    chunk_turns,
+    consolidate_evidence_ledger,
+    extract_evidence_ledger,
+    requires_evidence_pipeline,
+    turns_from_segments,
+)
 from gist.formats.defaults import build_messages, load_system_prompt, load_templates
-from gist.llm.base import ChatMessage
+from gist.llm.base import ChatMessage, GenerationLimitError
 from gist.llm.mlx_backend import MLXBackend
 from gist.server import _params_for
 from gist.speaker_roles import (
@@ -60,6 +67,26 @@ class RequestValidationTests(unittest.TestCase):
                 "transcribe",
             )
 
+    def test_accepts_batch_note_generation_sources(self):
+        params = _params_for(
+            {
+                "type": "generate_notes",
+                "sources": [
+                    {
+                        "id": "source-1",
+                        "kind": "session_transcript",
+                        "title": "Session transcript",
+                        "text": "Practitioner: Hello",
+                        "segments": [],
+                    }
+                ],
+                "formats": [{"name": "soap", "prompt": "SOAP"}],
+            },
+            "generate_notes",
+        )
+
+        self.assertEqual(params["formats"][0]["name"], "soap")
+
 
 class PipelineTests(unittest.TestCase):
     def tearDown(self):
@@ -87,9 +114,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result, "note")
         messages = llm.generate.call_args.kwargs["messages"]
         self.assertIn("mandatory documentation rules", messages[0].content.lower())
-        self.assertIn("may be undiarized", messages[0].content)
-        self.assertIn("speaker label as fallible evidence, not ground truth", messages[0].content)
-        self.assertIn("override an apparent diarization error", messages[0].content)
+        self.assertIn("Transcripts may contain missing speaker boundaries", messages[0].content)
+        self.assertIn("speaker labels as uncertain evidence rather than ground truth", messages[0].content)
+        self.assertIn("Override a speaker label only when", messages[0].content)
         self.assertNotIn("Use the requested headings.", messages[0].content)
         self.assertIn("Use the requested headings.", messages[1].content)
         self.assertIn("<format_instructions>", messages[1].content)
@@ -112,7 +139,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIn("Required output format", soap_prompt)
         self.assertIn("**Subjective:**", soap_prompt)
-        self.assertNotIn("may be undiarized", soap_prompt)
+        self.assertNotIn("Transcripts may contain missing speaker boundaries", soap_prompt)
         self.assertNotIn("Current suicide risk cannot be determined", soap_prompt)
 
     def test_shared_system_prompt_is_applied_to_builtin_messages(self):
@@ -123,9 +150,9 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(len(messages), 2)
         self.assertIn(load_system_prompt(), messages[0].content)
-        self.assertIn("may be undiarized", messages[0].content)
+        self.assertIn("Transcripts may contain missing speaker boundaries", messages[0].content)
         self.assertIn("surrounding turns", messages[0].content)
-        self.assertIn("do not globally relabel a speaker", messages[0].content)
+        self.assertIn("Do not globally relabel a speaker", messages[0].content)
         self.assertIn("Current suicide risk cannot be determined", messages[0].content)
         self.assertNotIn("**Encounter Context and Scope:**", messages[0].content)
         self.assertIn("**Encounter Context and Scope:**", messages[1].content)
@@ -241,6 +268,183 @@ class PipelineTests(unittest.TestCase):
             [segment.speaker for segment in result.segments],
             ["S1", "S2"],
         )
+
+    def test_short_transcript_generation_stays_direct(self):
+        llm = Mock()
+        llm.generate.side_effect = ["soap note", "dap note"]
+        sources = [
+            {
+                "id": "transcript",
+                "kind": "session_transcript",
+                "title": "Session transcript",
+                "text": "rendered",
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "speaker": "Practitioner", "text": "Hello"},
+                ],
+            },
+            {
+                "id": "clinician",
+                "kind": "clinician_note",
+                "title": "Clinician note",
+                "text": "Direct observation.",
+            },
+        ]
+
+        with patch.object(pipeline, "_get_cached_llm", return_value=llm):
+            notes = pipeline.generate_notes(
+                sources,
+                [
+                    {"name": "soap", "prompt": "SOAP FORMAT"},
+                    {"name": "dap", "prompt": "DAP FORMAT"},
+                ],
+            )
+
+        self.assertEqual(notes, {"soap": "soap note", "dap": "dap note"})
+        self.assertEqual(llm.generate.call_count, 2)
+        llm.generate_batch.assert_not_called()
+        for call in llm.generate.call_args_list:
+            prompt = call.kwargs["messages"][1].content
+            self.assertIn("Direct observation.", prompt)
+            self.assertIn("rendered", prompt)
+            self.assertNotIn("<evidence_ledger>", prompt)
+
+    def test_long_transcript_extracts_batches_once_and_keeps_clinician_notes_direct(self):
+        llm = Mock()
+        llm.generate_batch.return_value = [
+            "- [T00001] CLINICIAN_INTERVENTION | ASSESSMENT | EXPLICIT | Clinician assessed mood.",
+            "- [T00002] CLIENT_REPORT | SYMPTOM | EXPLICIT | Client reported low mood.",
+        ]
+        llm.generate.side_effect = ["SESSION DIGEST", "soap note"]
+        sources = [
+            {
+                "id": "transcript",
+                "kind": "session_transcript",
+                "title": "Session transcript",
+                "text": "rendered",
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "speaker": "Practitioner", "text": "How is your mood?"},
+                    {"start": 1200.0, "end": 1201.0, "speaker": "Patient 1", "text": "Low."},
+                ],
+            },
+            {
+                "id": "clinician",
+                "kind": "clinician_note",
+                "title": "Clinician note",
+                "text": "Direct observation.",
+            },
+        ]
+
+        with patch.object(pipeline, "_get_cached_llm", return_value=llm):
+            notes = pipeline.generate_notes(
+                sources,
+                [{"name": "soap", "prompt": "SOAP FORMAT"}],
+            )
+
+        self.assertEqual(notes, {"soap": "soap note"})
+        llm.generate_batch.assert_called_once()
+        self.assertEqual(len(llm.generate_batch.call_args.args[0]), 2)
+        self.assertEqual(llm.generate.call_count, 2)
+        final_prompt = llm.generate.call_args_list[1].kwargs["messages"][1].content
+        self.assertIn("SESSION DIGEST", final_prompt)
+        self.assertIn("Direct observation.", final_prompt)
+
+    def test_batch_generation_retries_a_runaway_final_note_concisely(self):
+        llm = Mock()
+        llm.generate.side_effect = [GenerationLimitError("too long"), "short soap note"]
+
+        with patch.object(pipeline, "_get_cached_llm", return_value=llm):
+            notes = pipeline.generate_notes(
+                [
+                    {
+                        "id": "clinician",
+                        "kind": "clinician_note",
+                        "title": "Clinician note",
+                        "text": "Direct observation.",
+                    }
+                ],
+                [{"name": "soap", "prompt": "SOAP FORMAT"}],
+            )
+
+        self.assertEqual(notes, {"soap": "short soap note"})
+        self.assertEqual(llm.generate.call_count, 2)
+        self.assertEqual(llm.generate.call_args_list[0].kwargs["max_tokens"], 2048)
+        self.assertEqual(llm.generate.call_args_list[1].kwargs["max_tokens"], 1536)
+        retry_prompt = llm.generate.call_args_list[1].kwargs["messages"][1].content
+        self.assertIn("no more than 3 concise bullets", retry_prompt)
+
+
+class EvidenceExtractionTests(unittest.TestCase):
+    def test_creates_five_minute_chunks_without_exposing_times_to_model(self):
+        turns = turns_from_segments(
+            [
+                {"start": 0.0, "end": 10.0, "speaker": "Practitioner", "text": "Question"},
+                {"start": 10.0, "end": 20.0, "speaker": "Patient 1", "text": "Answer"},
+                {"start": 301.0, "end": 310.0, "speaker": "Practitioner", "text": "Later question"},
+            ]
+        )
+
+        chunks = chunk_turns("source", turns)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[1].turns[-1].text, "Later question")
+
+    def test_legacy_transcripts_fall_back_to_bounded_complete_turns(self):
+        turns = turns_from_segments(
+            [
+                {"speaker": "Patient 1", "text": "a" * 5_000},
+                {"speaker": "Practitioner", "text": "b" * 5_000},
+            ]
+        )
+
+        chunks = chunk_turns("legacy", turns)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0].turns[0].turn_id, "T00001")
+        self.assertEqual(chunks[1].turns[-1].turn_id, "T00002")
+
+    def test_routes_only_long_transcripts_through_evidence(self):
+        short = [{"text": "short", "segments": [{"start": 0.0, "end": 1199.0}]}]
+        long = [{"text": "long", "segments": [{"start": 0.0, "end": 1200.0}]}]
+
+        self.assertFalse(requires_evidence_pipeline(short))
+        self.assertTrue(requires_evidence_pipeline(long))
+
+    def test_preserves_tagged_chunk_evidence_without_exposing_timestamps(self):
+        llm = Mock()
+        llm.generate_batch.return_value = [
+            "- [T00002] CLIENT_REPORT | SYMPTOM | EXPLICIT | Client reported anxiety.",
+            "NONE",
+        ]
+        sources = [
+            {
+                "id": "source",
+                "text": "rendered",
+                "segments": [
+                    {"start": 0.0, "end": 290.0, "speaker": "Practitioner", "text": "Question"},
+                    {"start": 290.0, "end": 305.0, "speaker": "Patient 1", "text": "Anxiety"},
+                    {"start": 305.0, "end": 310.0, "speaker": "Practitioner", "text": "Response"},
+                ],
+            }
+        ]
+
+        ledger = extract_evidence_ledger(sources, llm)
+
+        self.assertEqual(len(ledger["chunks"]), 1)
+        self.assertIn("Client reported anxiety.", ledger["chunks"][0]["evidence"])
+        model_prompt = llm.generate_batch.call_args.args[0][0][1].content
+        self.assertIn("[T00002] Patient 1: Anxiety", model_prompt)
+        self.assertNotIn("290.0", model_prompt)
+
+    def test_consolidates_chunk_ledger_with_balanced_digest_prompt(self):
+        llm = Mock()
+        llm.generate.return_value = "CLIENT REPORTS AND FUNCTIONING\n- [T1] Low mood."
+
+        digest = consolidate_evidence_ledger("chunk evidence", llm)
+
+        self.assertIn("Low mood", digest)
+        prompt = llm.generate.call_args.kwargs["messages"][0].content
+        self.assertIn("CLINICIAN OBSERVATIONS AND INTERVENTIONS", prompt)
+        self.assertIn("Do not turn functional examples", prompt)
 
 
 class SpeakerRoleTests(unittest.TestCase):
@@ -365,6 +569,40 @@ class MLXBackendTests(unittest.TestCase):
         backend.cleanup()
         self.assertIsNone(backend._prompt_cache_entry)
 
+    def test_extraction_can_keep_output_that_reaches_its_token_cap(self):
+        backend = MLXBackend()
+        backend.model = object()
+        backend.tokenizer = Mock()
+        backend.tokenizer.apply_chat_template.return_value = "rendered prompt"
+        response = [SimpleNamespace(text="- [T00001] CLIENT_REPORT | SYMPTOM | EXPLICIT | Anxiety", finish_reason="length")]
+
+        with patch("gist.llm.mlx_backend.stream_generate", return_value=response):
+            result = backend.generate(
+                [ChatMessage(role="user", content="Extract")],
+                allow_truncated=True,
+            )
+
+        self.assertIn("CLIENT_REPORT", result)
+
+    def test_plain_text_batch_generation_returns_each_extraction(self):
+        backend = MLXBackend()
+        backend.model = object()
+        backend.tokenizer = Mock()
+        backend.tokenizer.apply_chat_template.side_effect = [[1, 2], [3, 4]]
+        response = SimpleNamespace(texts=["first evidence", "second evidence"])
+
+        with patch("gist.llm.mlx_backend.batch_generate", return_value=response) as batch:
+            result = backend.generate_batch(
+                [
+                    [ChatMessage(role="user", content="first")],
+                    [ChatMessage(role="user", content="second")],
+                ]
+            )
+
+        self.assertEqual(result, ["first evidence", "second evidence"])
+        self.assertEqual(batch.call_args.args[2], [[1, 2], [3, 4]])
+        self.assertIsNone(batch.call_args.kwargs["prompt_caches"])
+
     def test_choice_generation_reuses_loaded_model_with_outlines_constraint(self):
         backend = MLXBackend()
         backend.model = object()
@@ -399,7 +637,6 @@ class MLXBackendTests(unittest.TestCase):
             add_generation_prompt=True,
             enable_thinking=False,
         )
-
 
 class DiarizationTests(unittest.TestCase):
     def test_streams_mp3_to_temporary_pcm_wav(self):

@@ -1,4 +1,5 @@
 import type { Session, SessionInput, SessionInputKind } from "./types";
+import type { NoteGenerationSource, TranscriptionSegment } from "./rpc";
 
 export const SESSION_INPUT_LABELS: Record<SessionInputKind, string> = {
   session_transcript: "Session transcript",
@@ -38,6 +39,27 @@ export function formatInputsForNoteGeneration(session: Session): string {
   return inputs
     .map((input) => `## ${getInputLabel(input)}\n\n${input.text.trim()}`)
     .join("\n\n---\n\n");
+}
+
+export function getSourcesForNoteGeneration(session: Session): NoteGenerationSource[] {
+  return getInputsForNotes(session).map((input) => {
+    let segments: TranscriptionSegment[] | undefined;
+    if (input.kind === "session_transcript" && input.metadata_json) {
+      try {
+        const metadata = JSON.parse(input.metadata_json) as { segments?: TranscriptionSegment[] };
+        if (Array.isArray(metadata.segments)) segments = metadata.segments;
+      } catch {
+        // Legacy or malformed metadata falls back to parsing the rendered transcript.
+      }
+    }
+    return {
+      id: input.id,
+      kind: input.kind,
+      title: getInputLabel(input),
+      text: input.text.trim(),
+      ...(segments ? { segments } : {}),
+    };
+  });
 }
 
 export function hasNoteSourceMaterial(session: Session): boolean {

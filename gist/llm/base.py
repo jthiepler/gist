@@ -7,6 +7,10 @@ from typing import List, Optional
 import threading
 
 
+class GenerationLimitError(RuntimeError):
+    """Raised when a generation consumes its token budget before completion."""
+
+
 @dataclass
 class ChatMessage:
     role: str
@@ -30,6 +34,7 @@ class LLMBackend(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         thinking: bool = False,
+        allow_truncated: bool = False,
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
         ...
@@ -42,6 +47,17 @@ class LLMBackend(ABC):
         max_tokens: int = 16,
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
+        ...
+
+    @abstractmethod
+    def generate_batch(
+        self,
+        message_batches: List[List[ChatMessage]],
+        max_tokens: int = 768,
+        temperature: float = 0.0,
+        thinking: bool = False,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[str]:
         ...
 
     @abstractmethod

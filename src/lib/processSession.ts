@@ -4,6 +4,7 @@ import {
   getSession,
   completeRecordingJob,
 } from "./rpc";
+import type { TranscriptionSegment } from "./rpc";
 import {
   SESSION_INPUT_LABELS,
   SESSION_INPUT_SOURCES,
@@ -88,6 +89,7 @@ export async function processSessionFromAudio(
 
   let transcript = existingRecordingInput?.text ?? "";
   let duration: number | null = existingRecordingInput?.duration_seconds ?? null;
+  let segments: TranscriptionSegment[] | undefined;
 
   if (!existingRecordingInput) {
     try {
@@ -99,6 +101,7 @@ export async function processSessionFromAudio(
       );
       transcript = result.transcript;
       duration = result.duration;
+      segments = result.segments;
     } catch (e) {
       const msg = String(e);
       resetProgress();
@@ -124,6 +127,7 @@ export async function processSessionFromAudio(
         text: transcript,
         audio_file: audioPath,
         duration_seconds: duration,
+        metadata_json: segments ? JSON.stringify({ segments }) : null,
         include_in_notes: true,
       });
     }

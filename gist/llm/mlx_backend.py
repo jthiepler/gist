@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
-from mlx_lm import load, stream_generate
+from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import make_prompt_cache
 
-from .base import ChatMessage, LLMBackend
+from .base import ChatMessage, GenerationLimitError, LLMBackend
 
 log = logging.getLogger(__name__)
 
@@ -183,6 +183,7 @@ class MLXBackend(LLMBackend):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         thinking: bool = False,
+        allow_truncated: bool = False,
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
         if self.model is None or self.tokenizer is None:
@@ -239,12 +240,22 @@ class MLXBackend(LLMBackend):
         text = "".join(text_parts).strip()
         if not text:
             raise RuntimeError("The model returned an empty note. Please try again.")
-        if finish_reason == "length":
-            raise RuntimeError(
+        if finish_reason == "length" and not allow_truncated:
+            log.warning(
+                "event=mlx_generation_limit_reached max_tokens=%d output_chars=%d",
+                max_tokens,
+                len(text),
+            )
+            raise GenerationLimitError(
                 "The note reached the generation limit and may be incomplete. "
                 "Use shorter source material or a more concise template and try again."
             )
-        if finish_reason != "stop":
+        if finish_reason == "length":
+            log.warning(
+                "event=mlx_generation_truncated output_chars=%d",
+                len(text),
+            )
+        if finish_reason != "stop" and not (allow_truncated and finish_reason == "length"):
             raise RuntimeError("The model stopped without completing the note. Please try again.")
         log.info(
             "event=mlx_generation_completed finish_reason=%s output_chars=%d",
@@ -314,6 +325,71 @@ class MLXBackend(LLMBackend):
             finish_reason,
         )
         return text
+
+    def generate_batch(
+        self,
+        message_batches: List[List[ChatMessage]],
+        max_tokens: int = 768,
+        temperature: float = 0.0,
+        thinking: bool = False,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[str]:
+        """Generate a small batch, reusing an identical cacheable prompt prefix."""
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        if not message_batches:
+            return []
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation cancelled")
+
+        rendered = [self._render_cacheable_prompt(messages, thinking) for messages in message_batches]
+        prompts: list[list[int]] = []
+        prompt_caches: Optional[list[list[Any]]] = None
+        if all(item is not None for item in rendered):
+            cacheable = [item for item in rendered if item is not None]
+            prefixes = {item[0] for item in cacheable}
+            if len(prefixes) == 1:
+                prefix_tokens = cacheable[0][0]
+                working_cache, _ = self._prompt_cache_for(prefix_tokens, cancel_event)
+                prompts = [item[1] for item in cacheable]
+                prompt_caches = [copy.deepcopy(working_cache) for _ in prompts]
+        if not prompts:
+            prompts = [
+                list(
+                    self.tokenizer.apply_chat_template(
+                        [{"role": message.role, "content": message.content} for message in messages],
+                        add_generation_prompt=True,
+                        enable_thinking=thinking,
+                    )
+                )
+                for messages in message_batches
+            ]
+
+        log.info(
+            "event=mlx_batch_generation_started batch_size=%d max_tokens=%d prompt_cache=%s",
+            len(prompts),
+            max_tokens,
+            "enabled" if prompt_caches is not None else "disabled",
+        )
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            prompt_caches=prompt_caches,
+            max_tokens=max_tokens,
+            sampler=_make_sampler(temperature),
+        )
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation cancelled")
+        texts = [text.strip() for text in response.texts]
+        if len(texts) != len(message_batches) or any(not text for text in texts):
+            raise RuntimeError("The model returned an empty batched extraction.")
+        log.info(
+            "event=mlx_batch_generation_completed batch_size=%d output_chars=%d",
+            len(texts),
+            sum(len(text) for text in texts),
+        )
+        return texts
 
     def cleanup(self):
         self._prompt_cache_entry = None

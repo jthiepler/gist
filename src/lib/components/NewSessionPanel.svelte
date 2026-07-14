@@ -66,7 +66,7 @@
 
   let sourceKind = $state<SessionInputKind>("session_transcript");
   let inputMethod = $state<InputMethod>("audio_file");
-  let diarizeSession = $state(false);
+  let diarizeSession = $state(true);
   let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let audioPath = $state("");
   let textDraft = $state("");
@@ -213,7 +213,7 @@
       sourceKind = "clinician_note";
       inputMethod = "text";
     }
-    if (sourceKind !== "session_transcript") diarizeSession = false;
+    diarizeSession = sourceKind === "session_transcript" && inputMethod !== "text";
     error = "";
     if ((inputMethod === "recording" || inputMethod === "dictation") && audioDevices.length === 0) {
       loadAudioDevices();
@@ -460,6 +460,7 @@
 
     let sourceText = "";
     let duration: number | null = null;
+    let transcriptMetadata: string | null = null;
 
     if (startsFromAudioFile) {
       try {
@@ -471,6 +472,7 @@
         );
         sourceText = result.transcript;
         duration = result.duration;
+        transcriptMetadata = JSON.stringify({ segments: result.segments });
       } catch (e) {
         const msg = String(e);
         error =
@@ -512,6 +514,7 @@
         text: sourceText,
         audio_file: startsFromAudioFile ? audioPath : null,
         duration_seconds: startsFromAudioFile ? duration : null,
+        metadata_json: startsFromAudioFile ? transcriptMetadata : null,
         include_in_notes: true,
       });
       session = {
@@ -678,7 +681,7 @@
         </div>
         <label class="option-checkbox">
           <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
-          <span>Identify speakers (experimental)</span>
+          <span>Identify speakers</span>
         </label>
         {#if diarizeSession}
           <label class="diarization-speaker-select" for="new-session-speaker-count">
@@ -746,7 +749,7 @@
           {#if sourceKind === "session_transcript"}
             <label class="option-checkbox">
               <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
-              <span>Identify speakers (experimental)</span>
+              <span>Identify speakers</span>
             </label>
             {#if diarizeSession}
               <label class="diarization-speaker-select" for="new-session-recording-speaker-count">

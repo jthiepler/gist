@@ -22,7 +22,7 @@ from .models import (
     DEFAULT_LLM,
     LLM_MODELS,
 )
-from .pipeline import generate_note, release_cached_llm, transcribe_audio
+from .pipeline import generate_note, generate_notes, release_cached_llm, transcribe_audio
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +131,35 @@ def _params_for(msg: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
             raise ValueError("'transcript' must be a non-empty string")
         for name in ("format", "model", "prompt"):
             optional_string(name)
+        max_tokens = params.get("max_tokens", 4096)
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 4096:
+            raise ValueError("'max_tokens' must be an integer between 1 and 4096")
+        if not isinstance(params.get("thinking", False), bool):
+            raise ValueError("'thinking' must be true or false")
+    elif msg_type == "generate_notes":
+        sources = params.get("sources")
+        formats = params.get("formats")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("'sources' must be a non-empty array")
+        for source in sources:
+            if not isinstance(source, dict):
+                raise ValueError("Every source must be an object")
+            for name in ("id", "kind", "title", "text"):
+                if not isinstance(source.get(name), str):
+                    raise ValueError(f"Every source '{name}' must be a string")
+            if source["kind"] not in {"session_transcript", "clinician_note"}:
+                raise ValueError("Source 'kind' must be session_transcript or clinician_note")
+            segments = source.get("segments")
+            if segments is not None and not isinstance(segments, list):
+                raise ValueError("Source 'segments' must be an array when provided")
+        if not isinstance(formats, list) or not formats:
+            raise ValueError("'formats' must be a non-empty array")
+        for note_format in formats:
+            if not isinstance(note_format, dict) or not isinstance(note_format.get("name"), str):
+                raise ValueError("Every format must be an object with a string name")
+            if note_format.get("prompt") is not None and not isinstance(note_format["prompt"], str):
+                raise ValueError("Format 'prompt' must be a string when provided")
+        optional_string("model")
         max_tokens = params.get("max_tokens", 4096)
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 4096:
             raise ValueError("'max_tokens' must be an integer between 1 and 4096")
@@ -374,6 +403,53 @@ def _handle_generate_note(params: Dict[str, Any]):
         _send({"type": "error", "message": _user_facing_error("note_generation", e)})
 
 
+def _handle_generate_notes(params: Dict[str, Any]):
+    sources = params["sources"]
+    formats = params["formats"]
+    llm_model = params.get("model", DEFAULT_LLM)
+    max_tokens = params.get("max_tokens", 4096)
+    thinking = params.get("thinking", False)
+    started_at = time.monotonic()
+    _log_event(
+        "note_generation",
+        "batch_started",
+        model=llm_model,
+        formats=len(formats),
+        sources=len(sources),
+        thinking=thinking,
+    )
+    progress_log = _ProgressTracker("note_generation")
+
+    def progress(pct, stage):
+        progress_log.report(pct, stage)
+        _send_progress(pct, stage)
+
+    try:
+        notes = generate_notes(
+            sources=sources,
+            formats=formats,
+            llm_model=llm_model,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            progress_callback=progress,
+            cancel_event=_cancel_event,
+        )
+        _send({"type": "result", "notes": notes})
+        _log_event(
+            "note_generation",
+            "batch_completed",
+            started_at,
+            model=llm_model,
+            formats=len(notes),
+        )
+    except InterruptedError:
+        _log_event("note_generation", "cancelled", started_at, model=llm_model)
+        _send({"type": "error", "message": "Note generation cancelled"})
+    except Exception as e:
+        _log_failure("note_generation", e, started_at, model=llm_model)
+        _send({"type": "error", "message": _user_facing_error("note_generation", e)})
+
+
 def _handle_download_model(params: Dict[str, Any]):
     model_name = params.get("model", DEFAULT_LLM)
     kind = params.get("kind", "llm")
@@ -480,6 +556,8 @@ def run_server():
                 _handle_transcribe(params)
             elif msg_type == "generate_note":
                 _handle_generate_note(params)
+            elif msg_type == "generate_notes":
+                _handle_generate_notes(params)
             elif msg_type == "download_model":
                 _handle_download_model(params)
             elif msg_type == "delete_model":

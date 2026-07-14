@@ -32,6 +32,7 @@ export interface SessionInput {
   include_in_notes: boolean;
   created_at: string;
   updated_at: string;
+  metadata_json: string | null;
 }
 
 export interface SessionNote {
