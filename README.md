@@ -5,9 +5,11 @@ conversation to the cloud.**
 
 Gist is a free, open-source macOS app for solo therapists and private
 practitioners. It records or imports session material, transcribes it, and
-creates a structured first draft in the note format you use. In the bundled
-workflow, the recording, transcript, client record, and generated note remain
-on your Mac.
+creates a structured first draft in the note format you use. For recorded or
+imported session audio, it also separates speaker turns locally and makes a
+best-effort attempt to identify the practitioner and patient(s). In the
+bundled workflow, the recording, transcript, client record, and generated note
+remain on your Mac.
 
 > Gist is an early beta. It has not yet been validated in clinical practice.
 > Treat every generated note as a draft: review it against the source before
@@ -39,9 +41,14 @@ then shape it through honest feedback from working therapists.
 1. Add a client and start a session.
 2. Record with the microphone, import audio, paste a transcript, or add your
    own written observations.
-3. Let Gist transcribe the audio and separate speakers locally.
+3. Let Gist transcribe audio, separate speaker turns locally, and make a
+   best-effort attempt to identify the practitioner and patient(s).
 4. Generate one or more structured drafts.
 5. Review the draft beside its source, edit it, and export it as plain text.
+
+Speaker identification is enabled by default when recording a session or
+uploading a session recording. You can turn it off in the source controls and
+choose whether Gist should expect two, three, or four speakers.
 
 <table>
   <tr>
@@ -63,7 +70,8 @@ In the normal bundled workflow:
 - Gist has no account, cloud sync, telemetry, or subscription.
 - Client records are stored in a local SQLite database.
 - Audio transcription runs with Parakeet TDT through `mlx-audio`.
-- Speaker diarization runs with `pyannote` Community-1.
+- Speaker diarization runs with `pyannote` Community-1; a local language model
+  then makes a best-effort practitioner/patient role assignment.
 - Note generation runs with a Qwen 3.5 MLX model you download and manage.
 - The app can continue working offline once its model assets are present.
 
@@ -73,8 +81,8 @@ separate from the application bundle. They persist across app updates and can
 be removed from Settings.
 
 The initial model downloads and application update checks require an internet
-connection. Transcription, diarization, and note generation do not send
-clinical material to a remote service.
+connection. Transcription, diarization, speaker-role identification, and note
+generation do not send clinical material to a remote service.
 
 Local processing reduces the number of parties and systems that handle
 clinical data. It does **not**, by itself, make a clinician or practice
@@ -86,7 +94,8 @@ practitioner's responsibility.
 
 - Local recording with pause and resume
 - Audio import, pasted transcripts, and clinician-written source material
-- On-device transcription and speaker diarization
+- On-device transcription, speaker diarization, and best-effort speaker-role
+  labeling
 - Editable notes shown beside their supporting transcript
 - SOAP, DAP, BIRP, GIRP, PIRP, SIRP, DART, CBT, and intake formats
 - Custom note templates and prompts
@@ -94,10 +103,25 @@ practitioner's responsibility.
 - Plain-text export
 - Downloadable 4B and 9B local note-writing models
 
-Transcription is already useful on clear audio. Speaker diarization is less
-consistent and remains one of the rougher parts of the beta. Generated note
-quality depends on the recording, transcript, selected model, and template;
-Gist deliberately presents every output as a draft.
+### Speaker identification
+
+For recorded and imported session audio, Gist first uses local speaker
+diarization to assign transcript turns to individual speakers. It then uses
+the selected local language model to make a best-effort role assignment,
+usually labeling speakers as `Practitioner` and `Patient 1`, `Patient 2`, and
+so on. If role identification cannot complete, the transcript keeps generic
+speaker labels instead of failing the transcription.
+
+This remains experimental, but diarization is generally useful on clear
+recordings and is good enough for routine use. It can still make mistakes with
+noisy audio, overlapping speech, or sessions with more participants than
+expected. Role identification is a best-effort second step and may be less
+reliable than the speaker separation itself. Review speaker labels and the
+generated note against the source before using it in a clinical record.
+
+Transcription is already useful on clear audio. Generated note quality depends
+on the recording, transcript, selected model, and template; Gist deliberately
+presents every output as a draft.
 
 ## Requirements
 
