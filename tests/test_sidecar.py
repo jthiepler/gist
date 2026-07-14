@@ -88,6 +88,8 @@ class PipelineTests(unittest.TestCase):
         messages = llm.generate.call_args.kwargs["messages"]
         self.assertIn("mandatory documentation rules", messages[0].content.lower())
         self.assertIn("may be undiarized", messages[0].content)
+        self.assertIn("speaker label as fallible evidence, not ground truth", messages[0].content)
+        self.assertIn("override an apparent diarization error", messages[0].content)
         self.assertNotIn("Use the requested headings.", messages[0].content)
         self.assertIn("Use the requested headings.", messages[1].content)
         self.assertIn("<format_instructions>", messages[1].content)
@@ -122,6 +124,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertIn(load_system_prompt(), messages[0].content)
         self.assertIn("may be undiarized", messages[0].content)
+        self.assertIn("surrounding turns", messages[0].content)
+        self.assertIn("do not globally relabel a speaker", messages[0].content)
         self.assertIn("Current suicide risk cannot be determined", messages[0].content)
         self.assertNotIn("**Encounter Context and Scope:**", messages[0].content)
         self.assertIn("**Encounter Context and Scope:**", messages[1].content)
