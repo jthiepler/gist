@@ -6,14 +6,60 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from .base import ProgressCallback, Segment, TranscriptionBackend, TranscriptResult
+from .base import (
+    ProgressCallback,
+    Segment,
+    TranscriptResult,
+    TranscriptionBackend,
+    Word,
+)
 
 log = logging.getLogger(__name__)
 
 _CHUNK_SECONDS = 120.0
 _OVERLAP_SECONDS = 2.0
+
+
+def _token_end(token: Any) -> float:
+    end = getattr(token, "end", None)
+    if end is not None:
+        return float(end)
+    return float(token.start) + float(token.duration)
+
+
+def _tokens_to_words(sentence: Any) -> list[Word]:
+    """Group Parakeet's aligned subword tokens into word spans."""
+    words: list[Word] = []
+    current_tokens: list[Any] = []
+
+    def append_word(tokens: list[Any]) -> None:
+        if not tokens:
+            return
+        text = "".join(str(getattr(token, "text", "")) for token in tokens)
+        if text.strip():
+            words.append(
+                Word(
+                    start=float(tokens[0].start),
+                    end=max(_token_end(token) for token in tokens),
+                    text=text,
+                )
+            )
+
+    for token in getattr(sentence, "tokens", []) or []:
+        text = str(getattr(token, "text", ""))
+        if not text.strip():
+            continue
+        if current_tokens and text.startswith(" "):
+            append_word(current_tokens)
+            current_tokens = []
+        current_tokens.append(token)
+
+    append_word(current_tokens)
+    return words
+
+
 MODEL_DIR_NAME = "parakeet-tdt-0.6b-v3-mlx-4bit"
 
 
@@ -101,6 +147,7 @@ class ParakeetBackend(TranscriptionBackend):
                     start=float(sentence.start),
                     end=float(sentence.end),
                     text=text,
+                    words=_tokens_to_words(sentence),
                 )
             )
 

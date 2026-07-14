@@ -8,11 +8,19 @@ import threading
 
 
 @dataclass
+class Word:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
 class Segment:
     start: float
     end: float
     text: str
     speaker: Optional[str] = None
+    words: List[Word] = field(default_factory=list)
 
 
 @dataclass
