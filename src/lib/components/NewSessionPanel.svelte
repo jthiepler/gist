@@ -15,6 +15,10 @@
     type AudioDevice,
   } from "$lib/rpc";
   import { ensureSidecar } from "$lib/ensureSidecar";
+  import {
+    DEFAULT_DIARIZATION_SPEAKERS,
+    DIARIZATION_SPEAKER_COUNTS,
+  } from "$lib/diarization";
   import type { RecordingContext } from "$lib/processSession";
   import {
     SESSION_INPUT_LABELS,
@@ -63,6 +67,7 @@
   let sourceKind = $state<SessionInputKind>("session_transcript");
   let inputMethod = $state<InputMethod>("audio_file");
   let diarizeSession = $state(false);
+  let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let audioPath = $state("");
   let textDraft = $state("");
   const now = new Date();
@@ -249,6 +254,7 @@
       sourceKind = ctx.inputKind;
       inputMethod = ctx.inputKind === "clinician_note" ? "dictation" : "recording";
       diarizeSession = ctx.diarize ?? false;
+      diarizationSpeakers = ctx.numSpeakers ?? DEFAULT_DIARIZATION_SPEAKERS;
     }
   });
 
@@ -328,6 +334,7 @@
         thinking,
         inputKind: sourceKind,
         diarize: sourceKind === "session_transcript" && diarizeSession,
+        numSpeakers: diarizationSpeakers,
         session: createdSession,
         isNewSession: true,
       };
@@ -338,6 +345,7 @@
         llm_model: defaultLlm,
         thinking,
         diarize: ctx.diarize,
+        num_speakers: ctx.numSpeakers,
         created_session: true,
       },
         selectedInputDevice || undefined,
@@ -458,6 +466,7 @@
         const result = await transcribe(
           audioPath,
           sourceKind === "session_transcript" && diarizeSession,
+          diarizationSpeakers,
         );
         sourceText = result.transcript;
         duration = result.duration;
@@ -670,6 +679,16 @@
           <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
           <span>Identify speakers (experimental)</span>
         </label>
+        {#if diarizeSession}
+          <label class="diarization-speaker-select" for="new-session-speaker-count">
+            <span>Number of speakers</span>
+            <select id="new-session-speaker-count" bind:value={diarizationSpeakers} disabled={phase !== "idle"}>
+              {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+                <option value={speakerCount}>{speakerCount}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
       </div>
     </div>
   {:else if inputMethod === "recording" || inputMethod === "dictation"}
@@ -728,6 +747,16 @@
               <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
               <span>Identify speakers (experimental)</span>
             </label>
+            {#if diarizeSession}
+              <label class="diarization-speaker-select" for="new-session-recording-speaker-count">
+                <span>Number of speakers</span>
+                <select id="new-session-recording-speaker-count" bind:value={diarizationSpeakers} disabled={phase !== "idle"}>
+                  {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+                    <option value={speakerCount}>{speakerCount}</option>
+                  {/each}
+                </select>
+              </label>
+            {/if}
           {/if}
           {#if confirmRecordingConsent}
             <label class="recording-consent">

@@ -19,6 +19,7 @@ import {
   sessionUpdate,
 } from "./stores";
 import { ensureSidecar } from "./ensureSidecar";
+import { DEFAULT_DIARIZATION_SPEAKERS } from "./diarization";
 import type { Session, SessionInputKind } from "./types";
 
 export interface RecordingContext {
@@ -32,6 +33,7 @@ export interface RecordingContext {
   thinking: boolean;
   inputKind: SessionInputKind;
   diarize: boolean;
+  numSpeakers: number;
   session?: Session;
   isNewSession?: boolean;
   regenerateExisting?: boolean;
@@ -92,6 +94,7 @@ export async function processSessionFromAudio(
       const result = await transcribe(
         audioPath,
         ctx.inputKind === "session_transcript" && ctx.diarize,
+        ctx.numSpeakers ?? DEFAULT_DIARIZATION_SPEAKERS,
       );
       transcript = result.transcript;
       duration = result.duration;

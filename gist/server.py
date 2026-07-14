@@ -12,6 +12,11 @@ import traceback
 from typing import Any, Dict, Optional
 
 from .downloader import delete_model, download_model, is_model_downloaded
+from .diarization import (
+    DEFAULT_NUM_SPEAKERS,
+    MAX_NUM_SPEAKERS,
+    MIN_NUM_SPEAKERS,
+)
 from .formats.registry import list_formats
 from .models import (
     DEFAULT_LLM,
@@ -111,6 +116,15 @@ def _params_for(msg: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
             raise ValueError("'audio_file' must be a non-empty string")
         if not isinstance(params.get("diarize", False), bool):
             raise ValueError("'diarize' must be true or false")
+        num_speakers = params.get("num_speakers", DEFAULT_NUM_SPEAKERS)
+        if (
+            isinstance(num_speakers, bool)
+            or not isinstance(num_speakers, int)
+            or not MIN_NUM_SPEAKERS <= num_speakers <= MAX_NUM_SPEAKERS
+        ):
+            raise ValueError(
+                f"'num_speakers' must be an integer between {MIN_NUM_SPEAKERS} and {MAX_NUM_SPEAKERS}"
+            )
     elif msg_type == "generate_note":
         if not isinstance(params.get("transcript"), str) or not params["transcript"].strip():
             raise ValueError("'transcript' must be a non-empty string")
@@ -231,8 +245,15 @@ def _stdin_reader():
 def _handle_transcribe(params: Dict[str, Any]):
     audio_file = params.get("audio_file", "")
     diarize = params.get("diarize", False)
+    num_speakers = params.get("num_speakers", DEFAULT_NUM_SPEAKERS)
     started_at = time.monotonic()
-    _log_event("transcription", "started", diarize=diarize, audio_file_provided=True)
+    _log_event(
+        "transcription",
+        "started",
+        diarize=diarize,
+        num_speakers=num_speakers,
+        audio_file_provided=True,
+    )
 
     duration_sent = False
     progress_log = _ProgressTracker("transcription")
@@ -254,6 +275,7 @@ def _handle_transcribe(params: Dict[str, Any]):
         result = transcribe_audio(
             audio_file,
             diarize=diarize,
+            num_speakers=num_speakers,
             progress_callback=progress,
             cancel_event=_cancel_event,
         )
@@ -266,12 +288,31 @@ def _handle_transcribe(params: Dict[str, Any]):
             ],
             "duration": result.duration,
         })
-        _log_event("transcription", "completed", started_at, diarize=diarize, segments=len(result.segments))
+        _log_event(
+            "transcription",
+            "completed",
+            started_at,
+            diarize=diarize,
+            num_speakers=num_speakers,
+            segments=len(result.segments),
+        )
     except InterruptedError:
-        _log_event("transcription", "cancelled", started_at, diarize=diarize)
+        _log_event(
+            "transcription",
+            "cancelled",
+            started_at,
+            diarize=diarize,
+            num_speakers=num_speakers,
+        )
         _send({"type": "error", "message": "Transcription cancelled"})
     except Exception as e:
-        _log_failure("transcription", e, started_at, diarize=diarize)
+        _log_failure(
+            "transcription",
+            e,
+            started_at,
+            diarize=diarize,
+            num_speakers=num_speakers,
+        )
         _send({"type": "error", "message": _user_facing_error("transcription", e)})
 
 

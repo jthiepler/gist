@@ -23,6 +23,10 @@
     type AudioDevice,
   } from "$lib/rpc";
   import { ensureSidecar } from "$lib/ensureSidecar";
+  import {
+    DEFAULT_DIARIZATION_SPEAKERS,
+    DIARIZATION_SPEAKER_COUNTS,
+  } from "$lib/diarization";
   import type { RecordingContext } from "$lib/processSession";
   import {
     getSessionDurationSeconds,
@@ -86,6 +90,7 @@
   let inputDraft = $state("");
   let inputAudioPath = $state("");
   let diarizeInput = $state(false);
+  let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let noteEditorEl = $state<HTMLTextAreaElement | null>(null);
   let inputEditorEl = $state<HTMLTextAreaElement | null>(null);
   let savingNote = $state(false);
@@ -257,6 +262,7 @@
     inputDraft = "";
     inputAudioPath = "";
     diarizeInput = false;
+    diarizationSpeakers = DEFAULT_DIARIZATION_SPEAKERS;
   });
 
   $effect(() => {
@@ -1001,6 +1007,7 @@
       const result = await transcribe(
         inputAudioPath,
         kind === "session_transcript" && diarizeInput,
+        diarizationSpeakers,
       );
       progressStage.set("Saving source material...");
       activeOperation.set({ type: "create_session", label: "Saving source material..." });
@@ -1071,6 +1078,7 @@
         thinking,
         inputKind: kind,
         diarize: kind === "session_transcript" && diarizeInput,
+        numSpeakers: diarizationSpeakers,
         session,
       };
       const job = await startRecording({
@@ -1080,6 +1088,7 @@
         llm_model: defaultLlm,
         thinking,
         diarize: ctx.diarize,
+        num_speakers: ctx.numSpeakers,
         created_session: false,
       },
         selectedInputDevice || undefined,
@@ -1638,6 +1647,16 @@
                             <input type="checkbox" bind:checked={diarizeInput} disabled={processingInput} />
                             <span>Identify speakers (experimental)</span>
                           </label>
+                          {#if diarizeInput}
+                            <label class="diarization-speaker-select" for={`input-file-speaker-count-${session.id}`}>
+                              <span>Number of speakers</span>
+                              <select id={`input-file-speaker-count-${session.id}`} bind:value={diarizationSpeakers} disabled={processingInput}>
+                                {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+                                  <option value={speakerCount}>{speakerCount}</option>
+                                {/each}
+                              </select>
+                            </label>
+                          {/if}
                         {/if}
                         <div class="editor-footer">
                           <button class="btn btn-sm btn-primary" onclick={() => saveAudioInput(addingInputKind!)} disabled={processingInput || !inputAudioPath}>
@@ -1693,6 +1712,16 @@
                                 <input type="checkbox" bind:checked={diarizeInput} />
                                 <span>Identify speakers (experimental)</span>
                               </label>
+                              {#if diarizeInput}
+                                <label class="diarization-speaker-select" for={`input-recording-speaker-count-${session.id}`}>
+                                  <span>Number of speakers</span>
+                                  <select id={`input-recording-speaker-count-${session.id}`} bind:value={diarizationSpeakers}>
+                                    {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+                                      <option value={speakerCount}>{speakerCount}</option>
+                                    {/each}
+                                  </select>
+                                </label>
+                              {/if}
                             {/if}
                             {#if confirmRecordingConsent}
                               <label class="recording-consent">

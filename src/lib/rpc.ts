@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { DEFAULT_DIARIZATION_SPEAKERS } from "./diarization";
 import type { SidecarProgress, ModelsResult, NoteFormatTemplate, RecordingJob, Session, SessionInput, SessionNote } from "./types";
 
 export async function startSidecar(): Promise<string> {
@@ -49,11 +50,13 @@ export interface TranscriptionResult {
 export async function transcribe(
   audioFile: string,
   diarize = false,
+  numSpeakers: number = DEFAULT_DIARIZATION_SPEAKERS,
 ): Promise<TranscriptionResult> {
   return rpcCall({
     type: "transcribe",
     audio_file: audioFile,
     diarize,
+    num_speakers: numSpeakers,
   });
 }
 
@@ -235,6 +238,7 @@ export interface StartRecordingData {
   llm_model: string;
   thinking: boolean;
   diarize: boolean;
+  num_speakers: number;
   created_session: boolean;
 }
 

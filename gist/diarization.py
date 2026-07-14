@@ -17,7 +17,9 @@ os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
 log = logging.getLogger(__name__)
 
 MODEL_DIR_NAME = "speaker-diarization-community-1"
-NUM_SPEAKERS = 2
+DEFAULT_NUM_SPEAKERS = 2
+MIN_NUM_SPEAKERS = 2
+MAX_NUM_SPEAKERS = 4
 MIN_TURN_DURATION = 0.3
 MAX_SAME_SPEAKER_GAP = 0.25
 MAX_ALIGNMENT_GAP = 0.35
@@ -155,8 +157,18 @@ def diarize_audio(
     audio_path: str,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Any = None,
+    num_speakers: int = DEFAULT_NUM_SPEAKERS,
 ) -> List[Dict[str, Any]]:
     """Return speaker turns for an audio file using only local model files."""
+    if (
+        isinstance(num_speakers, bool)
+        or not isinstance(num_speakers, int)
+        or not MIN_NUM_SPEAKERS <= num_speakers <= MAX_NUM_SPEAKERS
+    ):
+        raise ValueError(
+            f"Number of speakers must be between {MIN_NUM_SPEAKERS} and {MAX_NUM_SPEAKERS}."
+        )
+
     model_path = resolve_model_path()
     if model_path is None:
         log.error("event=diarization_model_missing")
@@ -175,7 +187,7 @@ def diarize_audio(
 
     stage_ranges = {
         "segmentation": (5, 65, "Analyzing speech..."),
-        "speaker_counting": (70, 70, "Separating two speakers..."),
+        "speaker_counting": (70, 70, f"Separating {num_speakers} speakers..."),
         "embeddings": (72, 92, "Identifying speakers..."),
         "discrete_diarization": (96, 96, "Finalizing transcript..."),
     }
@@ -207,7 +219,7 @@ def diarize_audio(
     output = pipeline(
         audio_path,
         hook=report_pipeline_progress,
-        num_speakers=NUM_SPEAKERS,
+        num_speakers=num_speakers,
     )
 
     if cancel_event and cancel_event.is_set():

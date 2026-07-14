@@ -2235,6 +2235,22 @@ button, input, select, textarea, a {
   accent-color: var(--accent);
 }
 
+.diarization-speaker-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 4px 24px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.diarization-speaker-select select {
+  width: auto;
+  min-width: 58px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
 .record-start-btn {
   align-self: flex-start;
 }

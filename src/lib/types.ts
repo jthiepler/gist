@@ -52,6 +52,7 @@ export interface RecordingJob {
   llm_model: string;
   thinking: boolean;
   diarize: boolean;
+  num_speakers: number;
   created_session: boolean;
   state: "recording" | "recorded" | "failed" | "completed" | string;
   error: string | null;

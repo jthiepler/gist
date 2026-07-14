@@ -47,6 +47,7 @@
   } from "$lib/stores";
   import { get } from "svelte/store";
   import { loadAppearance } from "$lib/settings";
+  import { DEFAULT_DIARIZATION_SPEAKERS } from "$lib/diarization";
   import { page } from "$app/stores";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -144,6 +145,7 @@
       thinking: job.thinking,
       inputKind: job.input_kind as import("$lib/types").SessionInputKind,
       diarize: job.diarize,
+      numSpeakers: job.num_speakers ?? DEFAULT_DIARIZATION_SPEAKERS,
       session,
       isNewSession: job.created_session,
       jobId: job.id,

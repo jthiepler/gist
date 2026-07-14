@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Optional
 
+from .diarization import DEFAULT_NUM_SPEAKERS
 from .models import resolve_model
 from .transcription.base import ProgressCallback, TranscriptResult
 from .transcription.factory import create_transcription_backend
@@ -70,8 +71,13 @@ def transcribe_audio(
     diarize: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
+    num_speakers: int = DEFAULT_NUM_SPEAKERS,
 ) -> TranscriptResult:
-    log.info("event=transcription_pipeline_started diarize=%s", diarize)
+    log.info(
+        "event=transcription_pipeline_started diarize=%s num_speakers=%s",
+        diarize,
+        num_speakers,
+    )
     model_path = resolve_model_path()
     if model_path is None:
         log.error("event=transcription_model_missing")
@@ -178,6 +184,7 @@ def transcribe_audio(
                 audio_path,
                 progress_callback=_diarization_progress if progress_callback else None,
                 cancel_event=cancel_event,
+                num_speakers=num_speakers,
             )
             attach_speakers(result.segments, turns)
             result.text = render_speaker_transcript(result.segments)

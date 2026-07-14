@@ -19,6 +19,10 @@ mod audio;
 
 // ── Database ──────────────────────────────────────────────────────────────
 
+const DEFAULT_DIARIZATION_SPEAKERS: i64 = 2;
+const MIN_DIARIZATION_SPEAKERS: i64 = 2;
+const MAX_DIARIZATION_SPEAKERS: i64 = 4;
+
 const SESSION_COLUMNS: &str =
     "id, patient_id, date, start_time, title, session_type, updated_at, created_at";
 
@@ -158,6 +162,7 @@ impl Database {
                 llm_model TEXT NOT NULL,
                 thinking INTEGER NOT NULL,
                 diarize INTEGER NOT NULL,
+                num_speakers INTEGER NOT NULL DEFAULT 2,
                 created_session INTEGER NOT NULL,
                 state TEXT NOT NULL,
                 error TEXT,
@@ -175,6 +180,10 @@ impl Database {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE recording_jobs ADD COLUMN num_speakers INTEGER NOT NULL DEFAULT 2",
+            [],
+        );
 
         // Built-in templates contain format-specific instructions only. Keep them
         // synchronized with the bundled catalog; UI customization creates a
@@ -279,6 +288,7 @@ struct RecordingJob {
     llm_model: String,
     thinking: bool,
     diarize: bool,
+    num_speakers: i64,
     created_session: bool,
     state: String,
     error: Option<String>,
@@ -294,7 +304,23 @@ struct StartRecordingData {
     llm_model: String,
     thinking: bool,
     diarize: bool,
+    #[serde(default = "default_num_speakers")]
+    num_speakers: i64,
     created_session: bool,
+}
+
+fn default_num_speakers() -> i64 {
+    DEFAULT_DIARIZATION_SPEAKERS
+}
+
+fn validate_num_speakers(num_speakers: i64) -> Result<i64, String> {
+    if (MIN_DIARIZATION_SPEAKERS..=MAX_DIARIZATION_SPEAKERS).contains(&num_speakers) {
+        Ok(num_speakers)
+    } else {
+        Err(format!(
+            "Number of speakers must be between {MIN_DIARIZATION_SPEAKERS} and {MAX_DIARIZATION_SPEAKERS}."
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1858,15 +1884,16 @@ fn map_recording_job(row: &Row) -> rusqlite::Result<RecordingJob> {
         llm_model: row.get(5)?,
         thinking: row.get::<_, i64>(6)? != 0,
         diarize: row.get::<_, i64>(7)? != 0,
-        created_session: row.get::<_, i64>(8)? != 0,
-        state: row.get(9)?,
-        error: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        num_speakers: row.get(8)?,
+        created_session: row.get::<_, i64>(9)? != 0,
+        state: row.get(10)?,
+        error: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
-const RECORDING_JOB_COLUMNS: &str = "id, session_id, audio_file, input_kind, formats_json, llm_model, thinking, diarize, created_session, state, error, created_at, updated_at";
+const RECORDING_JOB_COLUMNS: &str = "id, session_id, audio_file, input_kind, formats_json, llm_model, thinking, diarize, num_speakers, created_session, state, error, created_at, updated_at";
 
 fn get_recording_job_by_id(conn: &Connection, id: &str) -> Result<RecordingJob, String> {
     let sql = format!(
@@ -2105,6 +2132,7 @@ async fn start_recording(
     system_device: Option<String>,
 ) -> Result<RecordingJob, String> {
     ensure_recording_space(&app)?;
+    let num_speakers = validate_num_speakers(data.num_speakers)?;
     let id = Uuid::new_v4().to_string();
     let partial_path = recordings_dir(&app)?.join(format!("recording_{}.partial.wav", id));
     let now = Local::now().to_rfc3339();
@@ -2112,12 +2140,12 @@ async fn start_recording(
     {
         let db = db.lock().map_err(|e| e.to_string())?;
         db.conn.execute(
-            "INSERT INTO recording_jobs (id, session_id, audio_file, input_kind, formats_json, llm_model, thinking, diarize, created_session, state, error, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'recording', NULL, ?10, ?10)",
+            "INSERT INTO recording_jobs (id, session_id, audio_file, input_kind, formats_json, llm_model, thinking, diarize, num_speakers, created_session, state, error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'recording', NULL, ?11, ?11)",
             params![
                 id, data.session_id, partial_path.to_string_lossy(), data.input_kind, formats_json,
                 data.llm_model, if data.thinking { 1 } else { 0 }, if data.diarize { 1 } else { 0 },
-                if data.created_session { 1 } else { 0 }, now
+                num_speakers, if data.created_session { 1 } else { 0 }, now
             ],
         ).map_err(|e| e.to_string())?;
     }

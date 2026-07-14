@@ -32,6 +32,13 @@ class RequestValidationTests(unittest.TestCase):
                 "generate_note",
             )
 
+    def test_rejects_invalid_diarization_speaker_count(self):
+        with self.assertRaisesRegex(ValueError, "between 2 and 4"):
+            _params_for(
+                {"type": "transcribe", "audio_file": "audio.m4a", "num_speakers": 5},
+                "transcribe",
+            )
+
 
 class PipelineTests(unittest.TestCase):
     def tearDown(self):
@@ -112,7 +119,7 @@ class PipelineTests(unittest.TestCase):
 
 
 class DiarizationTests(unittest.TestCase):
-    def test_diarization_uses_two_speakers(self):
+    def test_diarization_defaults_to_two_speakers(self):
         from gist import diarization
 
         pipeline_instance = Mock()
@@ -129,6 +136,30 @@ class DiarizationTests(unittest.TestCase):
             pipeline_instance.call_args.kwargs["num_speakers"],
             2,
         )
+
+    def test_diarization_uses_selected_speaker_count(self):
+        from gist import diarization
+
+        pipeline_instance = Mock()
+        annotation = pipeline_instance.return_value.exclusive_speaker_diarization
+        annotation.itertracks.return_value = []
+
+        with (
+            patch.object(diarization, "resolve_model_path", return_value=Path("model")),
+            patch.object(diarization, "_load_pipeline", return_value=pipeline_instance),
+        ):
+            diarization.diarize_audio("audio.m4a", num_speakers=4)
+
+        self.assertEqual(
+            pipeline_instance.call_args.kwargs["num_speakers"],
+            4,
+        )
+
+    def test_diarization_rejects_counts_outside_supported_range(self):
+        from gist import diarization
+
+        with self.assertRaisesRegex(ValueError, "between 2 and 4"):
+            diarization.diarize_audio("audio.m4a", num_speakers=1)
 
     def test_assigns_best_overlap_in_chronological_scan(self):
         segments = [
