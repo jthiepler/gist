@@ -97,6 +97,71 @@ class MLXBackend(LLMBackend):
         )
         return text
 
+    def generate_choice(
+        self,
+        messages: List[ChatMessage],
+        choices: List[str],
+        max_tokens: int = 16,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> str:
+        """Generate exactly one allowed value using Outlines constraints."""
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        if not choices or len(set(choices)) != len(choices):
+            raise ValueError("Constrained choices must be non-empty and unique.")
+
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": m.role, "content": m.content} for m in messages],
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        if isinstance(prompt, list):
+            prompt = self.tokenizer.decode(prompt)
+
+        from outlines import Generator, from_mlxlm
+        from outlines.types import Choice
+
+        generator = Generator(from_mlxlm(self.model, self.tokenizer), Choice(choices))
+        logits_processor = generator.logits_processor
+        if logits_processor is None:
+            raise RuntimeError("Could not create the constrained speaker-label generator.")
+        logits_processor.reset()
+
+        log.info(
+            "event=mlx_choice_generation_started max_tokens=%d choice_count=%d",
+            max_tokens,
+            len(choices),
+        )
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation cancelled")
+
+        text_parts: list[str] = []
+        finish_reason: Optional[str] = None
+        for response in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            sampler=_make_sampler(0.0),
+            logits_processors=[logits_processor],
+        ):
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Generation cancelled")
+            text_parts.append(response.text)
+            if response.finish_reason is not None:
+                finish_reason = response.finish_reason
+
+        text = "".join(text_parts).strip()
+        if finish_reason == "length":
+            raise RuntimeError("Constrained generation reached its token limit.")
+        if text not in choices:
+            raise RuntimeError("Constrained generation returned an unexpected value.")
+        log.info(
+            "event=mlx_choice_generation_completed finish_reason=%s",
+            finish_reason,
+        )
+        return text
+
     def cleanup(self):
         self.model = None
         self.tokenizer = None

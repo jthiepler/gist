@@ -22,6 +22,8 @@ hiddenimports.extend(collect_submodules("torchcodec"))
 
 for package in (
     "mlx_lm",
+    "outlines",
+    "outlines_core",
     "transformers",
     "huggingface_hub",
     "tokenizers",

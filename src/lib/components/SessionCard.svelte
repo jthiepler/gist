@@ -1008,6 +1008,7 @@
         inputAudioPath,
         kind === "session_transcript" && diarizeInput,
         diarizationSpeakers,
+        defaultLlm,
       );
       progressStage.set("Saving source material...");
       activeOperation.set({ type: "create_session", label: "Saving source material..." });

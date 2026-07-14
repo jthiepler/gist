@@ -467,6 +467,7 @@
           audioPath,
           sourceKind === "session_transcript" && diarizeSession,
           diarizationSpeakers,
+          defaultLlm,
         );
         sourceText = result.transcript;
         duration = result.duration;

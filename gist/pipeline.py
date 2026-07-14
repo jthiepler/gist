@@ -6,8 +6,9 @@ import threading
 import time
 from typing import Optional
 
+from .audio import cleanup_normalized_audio, normalize_audio_for_pipeline
 from .diarization import DEFAULT_NUM_SPEAKERS
-from .models import resolve_model
+from .models import DEFAULT_LLM, resolve_model
 from .transcription.base import ProgressCallback, TranscriptResult
 from .transcription.factory import create_transcription_backend
 from .transcription.parakeet_backend import resolve_model_path
@@ -66,17 +67,120 @@ def _probe_audio_duration(audio_path: str) -> float:
         return 0.0
 
 
+def _postprocess_diarization(
+    result: TranscriptResult,
+    audio_path: str,
+    diarize: bool,
+    progress_callback: Optional[ProgressCallback],
+    cancel_event: Optional[threading.Event],
+    num_speakers: int,
+    llm_model: str,
+    audio_duration: float,
+    transcription_end: int,
+) -> TranscriptResult:
+    """Diarize and optionally infer roles using the shared source WAV."""
+    if not diarize or not result.segments:
+        return result
+
+    log.info("event=diarization_started segments=%d", len(result.segments))
+    from .diarization import attach_speakers, diarize_audio, is_available, render_speaker_transcript
+    from .speaker_roles import canonicalize_speaker_labels, infer_practitioner_speaker, relabel_speaker_roles
+
+    if not is_available():
+        log.error("event=diarization_model_missing")
+        raise FileNotFoundError(
+            "Speaker diarization model is not bundled. Rebuild the app with "
+            "speaker-diarization-community-1 in src-tauri/resources/pyannote/."
+        )
+
+    diarization_end = 25
+
+    def _diarization_progress(pct: int, stage: str) -> None:
+        if progress_callback:
+            progress_callback(
+                transcription_end
+                + round((pct / 100) * (diarization_end - transcription_end)),
+                stage,
+                eta_seconds=None,
+                audio_duration=audio_duration,
+            )
+
+    turns = diarize_audio(
+        audio_path,
+        progress_callback=_diarization_progress if progress_callback else None,
+        cancel_event=cancel_event,
+        num_speakers=num_speakers,
+    )
+    attach_speakers(result.segments, turns)
+    # Keep the diarization output useful even if the optional role model
+    # cannot be loaded or does not produce a valid answer.
+    canonicalize_speaker_labels(result.segments)
+    log.info("event=diarization_completed turns=%d", len(turns))
+
+    if progress_callback:
+        progress_callback(
+            26,
+            "Preparing speaker role identification...",
+            eta_seconds=None,
+            audio_duration=audio_duration,
+        )
+    role_identified = False
+    try:
+        spec = resolve_model(llm_model, "llm")
+        llm = _get_cached_llm(spec.hf_repo, spec.revision)
+        if progress_callback:
+            progress_callback(
+                28,
+                "Identifying practitioner...",
+                eta_seconds=None,
+                audio_duration=audio_duration,
+            )
+        practitioner_speaker = infer_practitioner_speaker(
+            result.segments,
+            llm,
+            num_speakers,
+            cancel_event=cancel_event,
+        )
+        relabel_speaker_roles(result.segments, practitioner_speaker)
+        role_identified = True
+    except InterruptedError:
+        raise
+    except Exception as error:
+        # Role identification is best-effort. Diarization has already
+        # produced stable generic labels, so return those rather than
+        # failing an otherwise usable transcript.
+        log.warning(
+            "event=speaker_role_identification_skipped error_type=%s",
+            type(error).__name__,
+        )
+    result.text = render_speaker_transcript(result.segments)
+    if progress_callback:
+        progress_callback(
+            30,
+            "Finalizing transcript...",
+            eta_seconds=None,
+            audio_duration=audio_duration,
+        )
+    log.info(
+        "event=speaker_role_identification_completed identified=%s",
+        role_identified,
+    )
+    return result
+
+
 def transcribe_audio(
     audio_path: str,
     diarize: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     num_speakers: int = DEFAULT_NUM_SPEAKERS,
+    llm_model: str = DEFAULT_LLM,
 ) -> TranscriptResult:
     log.info(
-        "event=transcription_pipeline_started diarize=%s num_speakers=%s",
+        "event=transcription_pipeline_started diarize=%s num_speakers=%s llm_model=%s",
         diarize,
         num_speakers,
+        llm_model if diarize else "unused",
     )
     model_path = resolve_model_path()
     if model_path is None:
@@ -85,16 +189,26 @@ def transcribe_audio(
             "Bundled transcription model not found. Rebuild the app with "
             "the required model resources."
         )
-    backend = create_transcription_backend()
-    log.info("event=transcription_backend_created backend=%s", type(backend).__name__)
-
+    # A cached note model from an earlier session would otherwise overlap the
+    # transcription model in memory. It is loaded again only after ASR cleanup.
+    release_cached_llm()
     if progress_callback:
         progress_callback(0, "Preparing transcription...")
 
+    pipeline_audio_path = audio_path
+    normalized_audio_path = None
+    backend = None
+    audio_duration = 0.0
     try:
+        pipeline_audio_path, normalized_audio_path = normalize_audio_for_pipeline(
+            audio_path,
+            cancel_event=cancel_event,
+        )
+        backend = create_transcription_backend()
+        log.info("event=transcription_backend_created backend=%s", type(backend).__name__)
         backend.load(str(model_path))
         log.info("event=transcription_model_ready backend=%s", type(backend).__name__)
-        audio_duration = _probe_audio_duration(audio_path)
+        audio_duration = _probe_audio_duration(pipeline_audio_path)
         log.info("event=audio_duration_ready duration_seconds=%.1f", audio_duration)
 
         # ETA tracking — rate-based with EMA smoothing.
@@ -110,7 +224,7 @@ def transcribe_audio(
         # including the optional diarization pass, and the final 70% for note
         # generation. Keeping this mapping here prevents the bar from jumping
         # backwards when it changes phase.
-        transcription_end = 18 if diarize else 30
+        transcription_end = 16 if diarize else 30
 
         def _wrapped(pct: int, stage: str):
             if not progress_callback:
@@ -148,7 +262,9 @@ def transcribe_audio(
             progress_callback(1, "Transcribing...", eta_seconds=None, audio_duration=audio_duration)
 
         result = backend.transcribe(
-            audio_path, progress_callback=_wrapped, cancel_event=cancel_event
+            pipeline_audio_path,
+            progress_callback=_wrapped,
+            cancel_event=cancel_event,
         )
         log.info(
             "event=transcription_backend_completed segments=%d duration_seconds=%.1f",
@@ -157,43 +273,25 @@ def transcribe_audio(
         )
         if audio_duration > 0:
             result.duration = audio_duration
-
-        # Session recordings are diarized locally after transcription. Clinician
-        # dictation can opt out because it is a single-speaker source.
-        if diarize and result.segments:
-            log.info("event=diarization_started segments=%d", len(result.segments))
-            from .diarization import attach_speakers, diarize_audio, is_available, render_speaker_transcript
-
-            if not is_available():
-                log.error("event=diarization_model_missing")
-                raise FileNotFoundError(
-                    "Speaker diarization model is not bundled. Rebuild the app with "
-                    "speaker-diarization-community-1 in src-tauri/resources/pyannote/."
-                )
-
-            def _diarization_progress(pct: int, stage: str) -> None:
-                if progress_callback:
-                    progress_callback(
-                        transcription_end + round((pct / 100) * (30 - transcription_end)),
-                        stage,
-                        eta_seconds=None,
-                        audio_duration=audio_duration,
-                    )
-
-            turns = diarize_audio(
-                audio_path,
-                progress_callback=_diarization_progress if progress_callback else None,
-                cancel_event=cancel_event,
-                num_speakers=num_speakers,
-            )
-            attach_speakers(result.segments, turns)
-            result.text = render_speaker_transcript(result.segments)
-            log.info("event=diarization_completed turns=%d", len(turns))
-
-        return result
     finally:
-        backend.cleanup()
-        log.info("event=transcription_backend_cleaned backend=%s", type(backend).__name__)
+        if backend is not None:
+            backend.cleanup()
+            log.info("event=transcription_backend_cleaned backend=%s", type(backend).__name__)
+
+    try:
+        return _postprocess_diarization(
+            result,
+            pipeline_audio_path,
+            diarize,
+            progress_callback,
+            cancel_event,
+            num_speakers,
+            llm_model,
+            audio_duration,
+            transcription_end,
+        )
+    finally:
+        cleanup_normalized_audio(normalized_audio_path)
 
 
 def generate_note(

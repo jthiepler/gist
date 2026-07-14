@@ -30,5 +30,15 @@ class LLMBackend(ABC):
         ...
 
     @abstractmethod
+    def generate_choice(
+        self,
+        messages: List[ChatMessage],
+        choices: List[str],
+        max_tokens: int = 16,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> str:
+        ...
+
+    @abstractmethod
     def cleanup(self):
         ...

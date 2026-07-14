@@ -51,12 +51,14 @@ export async function transcribe(
   audioFile: string,
   diarize = false,
   numSpeakers: number = DEFAULT_DIARIZATION_SPEAKERS,
+  model?: string,
 ): Promise<TranscriptionResult> {
   return rpcCall({
     type: "transcribe",
     audio_file: audioFile,
     diarize,
     num_speakers: numSpeakers,
+    model: diarize ? model || undefined : undefined,
   });
 }
 

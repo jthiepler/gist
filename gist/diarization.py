@@ -639,12 +639,12 @@ def attach_speakers(segments: List[Segment], turns: List[Dict[str, Any]]) -> Non
 
 
 def render_speaker_transcript(segments: List[Segment]) -> str:
-    """Render timestamped transcription segments with speaker labels."""
+    """Render transcription segments with compact speaker labels."""
     lines = []
     for segment in segments:
         text = segment.text.strip()
         if not text:
             continue
         label = segment.speaker or "Unknown speaker"
-        lines.append(f"[{label}] {text}")
+        lines.append(f"**{label}:** {text}")
     return "\n\n".join(lines)

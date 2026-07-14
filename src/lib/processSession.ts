@@ -95,6 +95,7 @@ export async function processSessionFromAudio(
         audioPath,
         ctx.inputKind === "session_transcript" && ctx.diarize,
         ctx.numSpeakers ?? DEFAULT_DIARIZATION_SPEAKERS,
+        ctx.defaultLlm,
       );
       transcript = result.transcript;
       duration = result.duration;

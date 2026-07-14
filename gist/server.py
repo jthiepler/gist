@@ -116,6 +116,7 @@ def _params_for(msg: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
             raise ValueError("'audio_file' must be a non-empty string")
         if not isinstance(params.get("diarize", False), bool):
             raise ValueError("'diarize' must be true or false")
+        optional_string("model")
         num_speakers = params.get("num_speakers", DEFAULT_NUM_SPEAKERS)
         if (
             isinstance(num_speakers, bool)
@@ -246,12 +247,14 @@ def _handle_transcribe(params: Dict[str, Any]):
     audio_file = params.get("audio_file", "")
     diarize = params.get("diarize", False)
     num_speakers = params.get("num_speakers", DEFAULT_NUM_SPEAKERS)
+    llm_model = params.get("model", DEFAULT_LLM)
     started_at = time.monotonic()
     _log_event(
         "transcription",
         "started",
         diarize=diarize,
         num_speakers=num_speakers,
+        model=llm_model if diarize else "unused",
         audio_file_provided=True,
     )
 
@@ -276,6 +279,7 @@ def _handle_transcribe(params: Dict[str, Any]):
             audio_file,
             diarize=diarize,
             num_speakers=num_speakers,
+            llm_model=llm_model,
             progress_callback=progress,
             cancel_event=_cancel_event,
         )
@@ -294,6 +298,7 @@ def _handle_transcribe(params: Dict[str, Any]):
             started_at,
             diarize=diarize,
             num_speakers=num_speakers,
+            model=llm_model if diarize else "unused",
             segments=len(result.segments),
         )
     except InterruptedError:
@@ -303,6 +308,7 @@ def _handle_transcribe(params: Dict[str, Any]):
             started_at,
             diarize=diarize,
             num_speakers=num_speakers,
+            model=llm_model if diarize else "unused",
         )
         _send({"type": "error", "message": "Transcription cancelled"})
     except Exception as e:
@@ -312,6 +318,7 @@ def _handle_transcribe(params: Dict[str, Any]):
             started_at,
             diarize=diarize,
             num_speakers=num_speakers,
+            model=llm_model if diarize else "unused",
         )
         _send({"type": "error", "message": _user_facing_error("transcription", e)})
 
