@@ -16,6 +16,7 @@
   } from "$lib/rpc";
   import { ensureSidecar } from "$lib/ensureSidecar";
   import {
+    DEFAULT_DIARIZATION_ENABLED,
     DEFAULT_DIARIZATION_SPEAKERS,
     DIARIZATION_SPEAKER_COUNTS,
   } from "$lib/diarization";
@@ -66,7 +67,7 @@
 
   let sourceKind = $state<SessionInputKind>("session_transcript");
   let inputMethod = $state<InputMethod>("audio_file");
-  let diarizeSession = $state(false);
+  let diarizeSession = $state(DEFAULT_DIARIZATION_ENABLED);
   let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let audioPath = $state("");
   let textDraft = $state("");
@@ -213,7 +214,7 @@
       sourceKind = "clinician_note";
       inputMethod = "text";
     }
-    if (sourceKind !== "session_transcript") diarizeSession = false;
+    diarizeSession = sourceKind === "session_transcript" && DEFAULT_DIARIZATION_ENABLED;
     error = "";
     if ((inputMethod === "recording" || inputMethod === "dictation") && audioDevices.length === 0) {
       loadAudioDevices();

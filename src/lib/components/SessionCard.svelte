@@ -24,6 +24,7 @@
   } from "$lib/rpc";
   import { ensureSidecar } from "$lib/ensureSidecar";
   import {
+    DEFAULT_DIARIZATION_ENABLED,
     DEFAULT_DIARIZATION_SPEAKERS,
     DIARIZATION_SPEAKER_COUNTS,
   } from "$lib/diarization";
@@ -89,7 +90,7 @@
   let noteDraft = $state("");
   let inputDraft = $state("");
   let inputAudioPath = $state("");
-  let diarizeInput = $state(false);
+  let diarizeInput = $state(DEFAULT_DIARIZATION_ENABLED);
   let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let noteEditorEl = $state<HTMLTextAreaElement | null>(null);
   let inputEditorEl = $state<HTMLTextAreaElement | null>(null);
@@ -261,7 +262,7 @@
     addingInputKind = null;
     inputDraft = "";
     inputAudioPath = "";
-    diarizeInput = false;
+    diarizeInput = DEFAULT_DIARIZATION_ENABLED;
     diarizationSpeakers = DEFAULT_DIARIZATION_SPEAKERS;
   });
 
@@ -689,6 +690,8 @@
     editingInputId = null;
     addingInputKind = kind;
     inputMethod = method;
+    diarizeInput = kind === "session_transcript" && DEFAULT_DIARIZATION_ENABLED;
+    diarizationSpeakers = DEFAULT_DIARIZATION_SPEAKERS;
     inputStatus = "";
     openInputMenu = null;
     openAddSourceMenu = false;
