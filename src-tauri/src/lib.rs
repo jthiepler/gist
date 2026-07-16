@@ -2120,6 +2120,12 @@ async fn discard_recording_job(
 
 #[tauri::command]
 async fn list_audio_devices() -> Result<Vec<audio::AudioDeviceInfo>, String> {
+    // CoreAudio/CPAL may enumerate no inputs (or later deliver only silence)
+    // when TCC access is still undetermined. Ask explicitly before presenting
+    // the device list so first use reliably triggers the macOS permission UI.
+    audio::permissions::ensure_microphone_access()
+        .await
+        .map_err(|e| e.to_string())?;
     audio::list_audio_devices().map_err(|e| e.to_string())
 }
 
@@ -2131,6 +2137,12 @@ async fn start_recording(
     mic_device: Option<String>,
     system_device: Option<String>,
 ) -> Result<RecordingJob, String> {
+    // Keep this check at the capture boundary as well as device enumeration:
+    // callers can retain a previously selected device or invoke this command
+    // without listing devices first.
+    audio::permissions::ensure_microphone_access()
+        .await
+        .map_err(|e| e.to_string())?;
     ensure_recording_space(&app)?;
     let num_speakers = validate_num_speakers(data.num_speakers)?;
     let id = Uuid::new_v4().to_string();

@@ -2,6 +2,7 @@ pub mod core_audio_tap;
 pub mod devices;
 pub mod mic_capture;
 pub mod mixer;
+pub mod permissions;
 pub mod recorder;
 pub mod resampler;
 pub mod wav_writer;
