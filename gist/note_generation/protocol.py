@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 
 from .types import EvidenceType, ParsedEvidence, TranscriptBlock
 
 
-_UNIT_ID = re.compile(r"^(D[1-9][0-9]*U[0-9]{4})(?:-(D[1-9][0-9]*U[0-9]{4}))?$")
 _MAX_CLAIM_CHARS = 600
 _CONTEXT_FREE_ACKNOWLEDGEMENT = re.compile(
     r"^(?:the\s+)?(?:patient|client)\s+"
@@ -22,22 +20,6 @@ _CONTEXT_FREE_ACKNOWLEDGEMENT = re.compile(
 
 class EvidenceProtocolError(ValueError):
     pass
-
-
-def _expand_range(reference: str, block: TranscriptBlock) -> tuple[str, ...]:
-    match = _UNIT_ID.fullmatch(reference.strip())
-    if not match:
-        raise EvidenceProtocolError(f"Invalid source-unit reference: {reference!r}")
-    start_id, end_id = match.group(1), match.group(2) or match.group(1)
-    block_ids = [unit.unit_id for unit in block.units]
-    try:
-        start = block_ids.index(start_id)
-        end = block_ids.index(end_id)
-    except ValueError as error:
-        raise EvidenceProtocolError("Evidence referenced a unit outside the supplied block.") from error
-    if end < start:
-        raise EvidenceProtocolError("Evidence source-unit ranges must be chronological.")
-    return tuple(block_ids[start : end + 1])
 
 
 def parse_evidence_output(output: str, block: TranscriptBlock) -> tuple[ParsedEvidence, ...]:
@@ -56,10 +38,10 @@ def parse_evidence_output(output: str, block: TranscriptBlock) -> tuple[ParsedEv
             continue
         if line == "NONE":
             raise EvidenceProtocolError("NONE cannot be combined with evidence records.")
-        parts = [part.strip() for part in line.split("|", 2)]
-        if len(parts) != 3:
-            raise EvidenceProtocolError(f"Evidence line {line_number} did not have three fields.")
-        reference, label, claim = parts
+        parts = [part.strip() for part in line.split("|", 1)]
+        if len(parts) != 2:
+            raise EvidenceProtocolError(f"Evidence line {line_number} did not have two fields.")
+        label, claim = parts
         try:
             evidence_type = EvidenceType(label)
         except ValueError as error:
@@ -73,7 +55,7 @@ def parse_evidence_output(output: str, block: TranscriptBlock) -> tuple[ParsedEv
             continue
         parsed.append(
             ParsedEvidence(
-                unit_ids=_expand_range(reference, block),
+                unit_ids=tuple(unit.unit_id for unit in block.units),
                 evidence_type=evidence_type,
                 claim=claim,
             )
@@ -81,12 +63,3 @@ def parse_evidence_output(output: str, block: TranscriptBlock) -> tuple[ParsedEv
     if not parsed:
         raise EvidenceProtocolError("The evidence extractor returned no usable records.")
     return tuple(parsed)
-
-
-def render_unit_reference(unit_ids: Iterable[str]) -> str:
-    values = tuple(unit_ids)
-    if not values:
-        raise ValueError("An evidence record must reference at least one unit.")
-    if len(values) == 1:
-        return values[0]
-    return f"{values[0]}-{values[-1]}"

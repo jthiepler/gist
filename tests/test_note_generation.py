@@ -35,6 +35,7 @@ class FakeLLM:
         self.generations = list(generations or [])
         self.choices = list(choices or [])
         self.generate_calls = []
+        self.batch_calls = []
         self.choice_calls = []
 
     def count_tokens(self, text: str) -> int:
@@ -48,6 +49,18 @@ class FakeLLM:
         if isinstance(result, BaseException):
             raise result
         return result
+
+    def generate_batch(self, *, messages_batch, **kwargs):
+        self.batch_calls.append(
+            {
+                "messages_batch": messages_batch,
+                **kwargs,
+            }
+        )
+        return [
+            self.generate(messages=messages, **kwargs)
+            for messages in messages_batch
+        ]
 
     def generate_choice(self, **kwargs):
         self.choice_calls.append(kwargs)
@@ -98,7 +111,7 @@ class SourceAndProtocolTests(unittest.TestCase):
         self.assertGreaterEqual(len(blocks), 2)
         self.assertEqual(blocks[0].units[-1].unit_id, blocks[1].units[0].unit_id)
 
-    def test_protocol_rejects_references_outside_block(self):
+    def test_protocol_rejects_legacy_unit_reference_field(self):
         documents = normalize_sources([source("Patient 1: I feel anxious.")])
         block = build_blocks(documents, lambda text: len(text.split()))[0]
         with self.assertRaises(EvidenceProtocolError):
@@ -111,7 +124,7 @@ class SourceAndProtocolTests(unittest.TestCase):
         documents = normalize_sources([source("Patient 1: I feel anxious.")])
         block = build_blocks(documents, lambda text: len(text.split()))[0]
         records = parse_evidence_output(
-            "D1U0001 | CLIENT_REPORT | Patient described work | home conflict.",
+            "CLIENT_REPORT | Patient described work | home conflict.",
             block,
         )
         self.assertEqual(records[0].claim, "Patient described work | home conflict.")
@@ -128,7 +141,7 @@ class SourceAndProtocolTests(unittest.TestCase):
         block = build_blocks(documents, lambda text: len(text.split()))[0]
         with self.assertRaises(EvidenceProtocolError):
             parse_evidence_output(
-                "D1U0002 | CLIENT_RESPONSE | Patient agreed with the practitioner's formulation.",
+                "CLIENT_RESPONSE | Patient agreed with the practitioner's formulation.",
                 block,
             )
 
@@ -143,7 +156,7 @@ class SourceAndProtocolTests(unittest.TestCase):
         )
         block = build_blocks(documents, lambda text: len(text.split()))[0]
         records = parse_evidence_output(
-            "D1U0001-D1U0002 | CLINICIAN_FORMULATION | "
+            "CLINICIAN_FORMULATION | "
             "Practitioner tentatively contrasted safe home life with unsafe school life; "
             "the patient said this felt more accurate.",
             block,
@@ -158,7 +171,7 @@ class PipelineTests(unittest.TestCase):
     def test_extraction_runs_once_for_multiple_formats(self):
         llm = FakeLLM(
             generations=[
-                "D1U0001 | CLIENT_REPORT | Patient reported feeling anxious.",
+                "CLIENT_REPORT | Patient reported feeling anxious.",
                 "First custom note.",
                 "Second custom note.",
             ]
@@ -175,15 +188,72 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([note.note for note in result.notes], ["First custom note.", "Second custom note."])
         self.assertEqual(result.ledger_stats["evidence_records"], 1)
         self.assertEqual(len(llm.generate_calls), 3)
-        extraction_prompt = llm.generate_calls[0]["messages"][-1].content
-        self.assertIn("coherent exchange across several connected turns", extraction_prompt)
-        self.assertIn("Usually return 1-3 records", extraction_prompt)
+        extraction_message = llm.generate_calls[0]["messages"][-1]
+        extraction_prompt = extraction_message.content
+        self.assertIn("Return one record by default", extraction_prompt)
+        self.assertIn("Return a second only", extraction_prompt)
+        self.assertIn("Patient: I feel anxious.", extraction_prompt)
+        self.assertNotIn("D1U0001", extraction_prompt)
+        self.assertNotIn("<source_metadata>", extraction_prompt)
+        self.assertNotIn("Examples:", extraction_prompt)
+        self.assertNotIn("taking on too many commitments", extraction_prompt)
+        self.assertIn("not patient-reported history", extraction_prompt)
+        self.assertIn("not ordinary emotional, social, or creative risk", extraction_prompt)
+        self.assertIn("only proposed or actually agreed", extraction_prompt)
+        self.assertLess(extraction_message.cache_prefix_length, 1800)
+        self.assertEqual(llm.generate_calls[0]["temperature"], 0.2)
+
+    def test_extraction_does_not_run_a_keyword_triggered_critical_review(self):
+        llm = FakeLLM(
+            generations=[
+                "CLIENT_REPORT | Patient discussed possibly missing an appointment.",
+                "A supported custom note.",
+            ]
+        )
+        result = generate_notes_with_backend(
+            llm,
+            [source("Patient 1: I might miss an appointment next week.")],
+            [NoteFormatRequest(name="custom", prompt="Write a clinical note.")],
+            verification_mode="off",
+        )
+
+        self.assertEqual(result.notes[0].note, "A supported custom note.")
+        self.assertEqual(result.ledger_stats["retry_count"], 0)
+        self.assertEqual(len(llm.generate_calls), 2)
+
+    def test_evidence_extraction_batches_four_blocks_at_a_time(self):
+        long_turns = "\n".join(
+            f"Patient 1: detail-{index} " + "word " * 500
+            for index in range(6)
+        )
+        llm = FakeLLM(
+            generations=[
+                *[
+                    f"CLIENT_REPORT | Patient described detail {index}."
+                    for index in range(6)
+                ],
+                "A supported custom note.",
+            ]
+        )
+        result = generate_notes_with_backend(
+            llm,
+            [source(long_turns)],
+            [NoteFormatRequest(name="custom", prompt="Write a clinical note.")],
+            verification_mode="off",
+        )
+
+        self.assertEqual(result.ledger_stats["blocks"], 6)
+        self.assertEqual(result.ledger_stats["evidence_records"], 6)
+        self.assertEqual(
+            [len(call["messages_batch"]) for call in llm.batch_calls],
+            [4, 2],
+        )
 
     def test_invalid_extraction_retries_once(self):
         llm = FakeLLM(
             generations=[
                 "This is not valid.",
-                "D1U0001 | CLIENT_REPORT | Patient reported feeling anxious.",
+                "CLIENT_REPORT | Patient reported feeling anxious.",
                 "A supported custom note.",
             ]
         )
@@ -199,7 +269,7 @@ class PipelineTests(unittest.TestCase):
     def test_incomplete_render_retries_with_tighter_concision(self):
         llm = FakeLLM(
             generations=[
-                "D1U0001 | CLIENT_REPORT | Patient reported feeling anxious.",
+                "CLIENT_REPORT | Patient reported feeling anxious.",
                 GenerationIncompleteError("generation limit"),
                 "A concise completed note.",
             ]
@@ -217,7 +287,7 @@ class PipelineTests(unittest.TestCase):
     def test_developer_diagnostics_capture_and_save_every_pipeline_stage(self):
         llm = FakeLLM(
             generations=[
-                "D1U0001 | CLIENT_REPORT | Patient reported feeling anxious.",
+                "CLIENT_REPORT | Patient reported feeling anxious.",
                 "A concise completed note.",
             ]
         )
@@ -251,13 +321,13 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(saved["session_id"], capture.session_id)
         self.assertEqual(
             saved["extraction_attempts"][0]["output"]["raw_model_output"],
-            "D1U0001 | CLIENT_REPORT | Patient reported feeling anxious.",
+            "CLIENT_REPORT | Patient reported feeling anxious.",
         )
 
     def test_reuses_cached_ledger_for_a_later_format_request(self):
         llm = FakeLLM(
             generations=[
-                "D1U0001 | CLIENT_REPORT | Patient reported feeling anxious.",
+                "CLIENT_REPORT | Patient reported feeling anxious.",
                 "First note.",
                 "Second note.",
             ]
@@ -308,6 +378,7 @@ class PipelineTests(unittest.TestCase):
             lambda text: len(text.split()),
         )
         self.assertIn("Evidence: verbatim verbatim", bundle)
+        self.assertNotIn("D1U0001", bundle)
         self.assertGreater(tokens, 8000)
 
     def test_shadow_verification_reports_without_removing(self):

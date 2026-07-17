@@ -9,7 +9,7 @@ from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 from mlx_lm import load, stream_generate
-from mlx_lm.generate import generate_step
+from mlx_lm.generate import BatchGenerator, generate_step
 from mlx_lm.models.cache import make_prompt_cache
 
 from .base import ChatMessage, GenerationIncompleteError, LLMBackend
@@ -256,6 +256,107 @@ class MLXBackend(LLMBackend):
             len(text),
         )
         return text
+
+    def generate_batch(
+        self,
+        messages_batch: List[List[ChatMessage]],
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        thinking: bool = False,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[str]:
+        """Generate a native MLX batch while preserving per-prompt completion."""
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        if not messages_batch:
+            return []
+
+        prompts: list[list[int]] = []
+        prompt_caches: list[Optional[List[Any]]] = []
+        cache_hits = 0
+        cached_prefix_tokens = 0
+        for messages in messages_batch:
+            cacheable_prompt = self._render_cacheable_prompt(messages, thinking)
+            if cacheable_prompt is not None:
+                prefix_tokens, prompt = cacheable_prompt
+                prompt_cache, cache_hit = self._prompt_cache_for(prefix_tokens, cancel_event)
+                cache_hits += int(cache_hit)
+                cached_prefix_tokens = len(prefix_tokens)
+                prompts.append(prompt)
+                prompt_caches.append(prompt_cache)
+            else:
+                prompt = self.tokenizer.apply_chat_template(
+                    [{"role": message.role, "content": message.content} for message in messages],
+                    add_generation_prompt=True,
+                    enable_thinking=thinking,
+                )
+                prompts.append(list(prompt))
+                prompt_caches.append(None)
+
+        log.info(
+            "event=mlx_batch_generation_started batch_size=%d max_tokens=%d thinking=%s prompt_cache_hits=%d cached_prefix_tokens=%d",
+            len(prompts),
+            max_tokens,
+            thinking,
+            cache_hits,
+            cached_prefix_tokens,
+        )
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation cancelled")
+
+        generator = BatchGenerator(
+            self.model,
+            stop_tokens=[[token] for token in self.tokenizer.eos_token_ids],
+            sampler=_make_sampler(temperature),
+            completion_batch_size=len(prompts),
+            prefill_batch_size=len(prompts),
+        )
+        uids = generator.insert(
+            prompts,
+            [max_tokens] * len(prompts),
+            caches=prompt_caches,
+        )
+        tokens_by_uid: dict[int, list[int]] = {uid: [] for uid in uids}
+        finish_reasons: dict[int, str] = {}
+        try:
+            with generator.stats() as stats:
+                while len(finish_reasons) < len(uids):
+                    if cancel_event and cancel_event.is_set():
+                        raise InterruptedError("Generation cancelled")
+                    responses = generator.next_generated()
+                    if not responses:
+                        break
+                    for response in responses:
+                        if response.finish_reason != "stop":
+                            tokens_by_uid[response.uid].append(response.token)
+                        if response.finish_reason is not None:
+                            finish_reasons[response.uid] = response.finish_reason
+        finally:
+            generator.close()
+
+        texts = [self.tokenizer.decode(tokens_by_uid[uid]).strip() for uid in uids]
+        for uid, text in zip(uids, texts):
+            finish_reason = finish_reasons.get(uid)
+            if not text:
+                raise RuntimeError("The model returned an empty evidence response. Please try again.")
+            if finish_reason == "length":
+                raise GenerationIncompleteError(
+                    "An evidence response reached the generation limit and may be incomplete.",
+                    partial_output=text,
+                )
+            if finish_reason != "stop":
+                raise GenerationIncompleteError(
+                    "An evidence response stopped without completing.",
+                    partial_output=text,
+                )
+        log.info(
+            "event=mlx_batch_generation_completed batch_size=%d prompt_tokens=%d generation_tokens=%d peak_memory_gb=%.3f",
+            len(texts),
+            stats.prompt_tokens,
+            stats.generation_tokens,
+            stats.peak_memory,
+        )
+        return texts
 
     def generate_choice(
         self,

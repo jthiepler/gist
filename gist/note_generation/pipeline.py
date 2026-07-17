@@ -27,7 +27,7 @@ from .verification import verify_note
 
 log = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, str], None]
-_EVIDENCE_CACHE_VERSION = "evidence-episodes-v2"
+_EVIDENCE_CACHE_VERSION = "evidence-episodes-v8"
 _cached_evidence_key: str | None = None
 _cached_evidence_ledger: EvidenceLedger | None = None
 _cached_evidence_trace: dict[str, Any] | None = None
@@ -56,25 +56,13 @@ def clear_evidence_cache() -> None:
     _cached_evidence_trace = None
 
 
-def generate_notes_with_backend(
-    llm: Any,
-    sources: Iterable[NoteGenerationSource],
-    formats: Iterable[NoteFormatRequest],
+def get_cached_evidence_ledger(
+    evidence_cache_key: str | None,
     *,
-    max_tokens: int = 4096,
-    thinking: bool = False,
-    verification_mode: str = "off",
-    evidence_cache_key: str | None = None,
     progress_callback: Optional[ProgressCallback] = None,
-    cancel_event: Optional[threading.Event] = None,
     diagnostic_capture: DiagnosticCapture | None = None,
-) -> GenerateNotesResult:
-    source_list = tuple(sources)
-    format_list = tuple(formats)
-    if not format_list:
-        raise ValueError("At least one note format is required.")
-
-    global _cached_evidence_key, _cached_evidence_ledger, _cached_evidence_trace
+) -> EvidenceLedger | None:
+    """Return a reusable ledger without requiring an evidence model to load."""
     diagnostic_trace_available = (
         diagnostic_capture is None or _cached_evidence_trace is not None
     )
@@ -84,100 +72,142 @@ def generate_notes_with_backend(
         and _cached_evidence_ledger is not None
         and diagnostic_trace_available
     )
-    if cache_hit:
-        ledger = _cached_evidence_ledger
-        if diagnostic_capture and _cached_evidence_trace:
-            diagnostic_capture.reuse_evidence_trace(_cached_evidence_trace)
-        if diagnostic_capture:
-            diagnostic_capture.set_stage(
-                "evidence_cache",
-                {
-                    "hit": True,
-                    "cache_key": evidence_cache_key,
-                    "evidence_trace_reused": _cached_evidence_trace is not None,
-                },
-            )
-        if progress_callback:
-            progress_callback(57, "Reusing extracted encounter evidence...")
-        log.info(
-            "event=evidence_ledger_cache_hit records=%d",
-            len(ledger.records),
-        )
-    else:
-        if progress_callback:
-            progress_callback(0, "Preparing source material...")
-        documents = normalize_sources(source_list)
-        if diagnostic_capture:
-            diagnostic_capture.set_stage(
-                "normalized_sources",
-                {"input": source_list, "output": documents},
-            )
-        blocks = build_blocks(documents, llm.count_tokens)
-        if diagnostic_capture:
-            diagnostic_capture.set_stage(
-                "chunking",
-                {
-                    "input": {
-                        "documents": documents,
-                        "target_tokens": 450,
-                        "overlap_units": 1,
-                    },
-                    "output": blocks,
-                },
-            )
-        log.info(
-            "event=evidence_sources_prepared documents=%d units=%d blocks=%d",
-            len(documents),
-            sum(len(document.units) for document in documents),
-            len(blocks),
-        )
+    if not cache_hit:
+        return None
 
-        def extraction_progress(completed: int, total: int) -> None:
-            if progress_callback:
-                progress_callback(5 + round((completed / max(total, 1)) * 50), "Extracting clinical evidence...")
+    ledger = _cached_evidence_ledger
+    if diagnostic_capture and _cached_evidence_trace:
+        diagnostic_capture.reuse_evidence_trace(_cached_evidence_trace)
+    if diagnostic_capture:
+        diagnostic_capture.set_stage(
+            "evidence_cache",
+            {
+                "hit": True,
+                "cache_key": evidence_cache_key,
+                "evidence_trace_reused": _cached_evidence_trace is not None,
+            },
+        )
+    if progress_callback:
+        progress_callback(57, "Reusing extracted encounter evidence...")
+    log.info("event=evidence_ledger_cache_hit records=%d", len(ledger.records))
+    return ledger
 
-        extracted, retry_count = extract_evidence(
-            llm,
-            blocks,
-            cancel_event=cancel_event,
-            progress_callback=extraction_progress,
-            diagnostic_capture=diagnostic_capture,
+
+def prepare_evidence_with_backend(
+    llm: Any,
+    sources: Iterable[NoteGenerationSource],
+    *,
+    evidence_cache_key: str | None = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    diagnostic_capture: DiagnosticCapture | None = None,
+) -> EvidenceLedger:
+    source_list = tuple(sources)
+    global _cached_evidence_key, _cached_evidence_ledger, _cached_evidence_trace
+    cached = get_cached_evidence_ledger(
+        evidence_cache_key,
+        progress_callback=progress_callback,
+        diagnostic_capture=diagnostic_capture,
+    )
+    if cached is not None:
+        return cached
+
+    if progress_callback:
+        progress_callback(0, "Preparing source material...")
+    documents = normalize_sources(source_list)
+    if diagnostic_capture:
+        diagnostic_capture.set_stage(
+            "normalized_sources",
+            {"input": source_list, "output": documents},
         )
+    blocks = build_blocks(documents, llm.count_tokens)
+    if diagnostic_capture:
+        diagnostic_capture.set_stage(
+            "chunking",
+            {
+                "input": {
+                    "documents": documents,
+                    "target_tokens": 450,
+                    "overlap_units": 1,
+                },
+                "output": blocks,
+            },
+        )
+    log.info(
+        "event=evidence_sources_prepared documents=%d units=%d blocks=%d",
+        len(documents),
+        sum(len(document.units) for document in documents),
+        len(blocks),
+    )
+
+    def extraction_progress(completed: int, total: int) -> None:
         if progress_callback:
-            progress_callback(57, "Organizing encounter evidence...")
-        ledger = build_ledger(documents, extracted, retry_count)
-        if diagnostic_capture:
-            diagnostic_capture.set_stage(
-                "ledger",
-                {
-                    "input": {
-                        "documents": documents,
-                        "parsed_evidence_by_block": extracted,
-                        "retry_count": retry_count,
-                    },
-                    "output": ledger,
+            progress_callback(
+                5 + round((completed / max(total, 1)) * 50),
+                "Extracting clinical evidence...",
+            )
+
+    extracted, retry_count = extract_evidence(
+        llm,
+        blocks,
+        cancel_event=cancel_event,
+        progress_callback=extraction_progress,
+        diagnostic_capture=diagnostic_capture,
+    )
+    if progress_callback:
+        progress_callback(57, "Organizing encounter evidence...")
+    ledger = build_ledger(documents, extracted, retry_count)
+    if diagnostic_capture:
+        diagnostic_capture.set_stage(
+            "ledger",
+            {
+                "input": {
+                    "documents": documents,
+                    "parsed_evidence_by_block": extracted,
+                    "retry_count": retry_count,
                 },
-            )
-        if evidence_cache_key is not None:
-            _cached_evidence_key = evidence_cache_key
-            _cached_evidence_ledger = ledger
-            _cached_evidence_trace = (
-                diagnostic_capture.evidence_trace() if diagnostic_capture else None
-            )
-        if diagnostic_capture:
-            diagnostic_capture.set_stage(
-                "evidence_cache",
-                {
-                    "hit": False,
-                    "cache_key": evidence_cache_key,
-                    "cached": evidence_cache_key is not None,
-                },
-            )
-        log.info(
-            "event=evidence_ledger_cache_miss records=%d cached=%s",
-            len(ledger.records),
-            evidence_cache_key is not None,
+                "output": ledger,
+            },
         )
+    if evidence_cache_key is not None:
+        _cached_evidence_key = evidence_cache_key
+        _cached_evidence_ledger = ledger
+        _cached_evidence_trace = (
+            diagnostic_capture.evidence_trace() if diagnostic_capture else None
+        )
+    if diagnostic_capture:
+        diagnostic_capture.set_stage(
+            "evidence_cache",
+            {
+                "hit": False,
+                "cache_key": evidence_cache_key,
+                "cached": evidence_cache_key is not None,
+            },
+        )
+    log.info(
+        "event=evidence_ledger_cache_miss records=%d cached=%s",
+        len(ledger.records),
+        evidence_cache_key is not None,
+    )
+    return ledger
+
+
+def generate_notes_from_ledger_with_backend(
+    llm: Any,
+    ledger: EvidenceLedger,
+    formats: Iterable[NoteFormatRequest],
+    *,
+    max_tokens: int = 4096,
+    thinking: bool = False,
+    verification_mode: str = "off",
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    diagnostic_capture: DiagnosticCapture | None = None,
+) -> GenerateNotesResult:
+    format_list = tuple(formats)
+    if not format_list:
+        raise ValueError("At least one note format is required.")
+
     evidence_bundle, evidence_tokens = build_evidence_bundle(
         ledger,
         llm.count_tokens,
@@ -303,3 +333,38 @@ def generate_notes_with_backend(
             },
         )
     return result
+
+
+def generate_notes_with_backend(
+    llm: Any,
+    sources: Iterable[NoteGenerationSource],
+    formats: Iterable[NoteFormatRequest],
+    *,
+    max_tokens: int = 4096,
+    thinking: bool = False,
+    verification_mode: str = "off",
+    evidence_cache_key: str | None = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    diagnostic_capture: DiagnosticCapture | None = None,
+) -> GenerateNotesResult:
+    """Compatibility wrapper for callers that use one model for every stage."""
+    ledger = prepare_evidence_with_backend(
+        llm,
+        sources,
+        evidence_cache_key=evidence_cache_key,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+        diagnostic_capture=diagnostic_capture,
+    )
+    return generate_notes_from_ledger_with_backend(
+        llm,
+        ledger,
+        formats,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        verification_mode=verification_mode,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+        diagnostic_capture=diagnostic_capture,
+    )

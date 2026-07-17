@@ -8,7 +8,8 @@ from typing import Optional
 
 from .audio import cleanup_normalized_audio, normalize_audio_for_pipeline
 from .diarization import DEFAULT_NUM_SPEAKERS
-from .models import DEFAULT_LLM, resolve_model
+from .downloader import is_model_downloaded
+from .models import DEFAULT_LLM, EVIDENCE_LLM, resolve_model
 from .transcription.base import ProgressCallback, TranscriptResult
 from .transcription.factory import create_transcription_backend
 from .transcription.parakeet_backend import resolve_model_path
@@ -305,19 +306,29 @@ def generate_notes(
     cancel_event: Optional[threading.Event] = None,
     diagnostic_capture=None,
 ):
-    from .note_generation.pipeline import generate_notes_with_backend
     from .note_generation.pipeline import build_evidence_cache_key
+    from .note_generation.pipeline import generate_notes_from_ledger_with_backend
+    from .note_generation.pipeline import get_cached_evidence_ledger
+    from .note_generation.pipeline import prepare_evidence_with_backend
 
     sources = tuple(sources)
     formats = tuple(formats)
     spec = resolve_model(llm_model, "llm")
+    evidence_spec = resolve_model(EVIDENCE_LLM, "llm")
     if diagnostic_capture:
         diagnostic_capture.set_stage(
             "model",
             {
-                "requested_model": llm_model,
-                "repository": spec.hf_repo,
-                "revision": spec.revision,
+                "note_model": {
+                    "requested_model": llm_model,
+                    "repository": spec.hf_repo,
+                    "revision": spec.revision,
+                },
+                "evidence_model": {
+                    "model": EVIDENCE_LLM,
+                    "repository": evidence_spec.hf_repo,
+                    "revision": evidence_spec.revision,
+                },
                 "max_tokens": max_tokens,
                 "thinking": thinking,
                 "verification_mode": verification_mode,
@@ -332,19 +343,39 @@ def generate_notes(
         thinking,
         verification_mode,
     )
-    llm = _get_cached_llm(spec.hf_repo, spec.revision)
     evidence_cache_key = build_evidence_cache_key(
         sources,
-        f"{spec.hf_repo}@{spec.revision}",
+        f"{evidence_spec.hf_repo}@{evidence_spec.revision}",
     )
-    result = generate_notes_with_backend(
-        llm,
-        sources,
+    ledger = get_cached_evidence_ledger(
+        evidence_cache_key,
+        progress_callback=progress_callback,
+        diagnostic_capture=diagnostic_capture,
+    )
+    if ledger is None:
+        if not is_model_downloaded(EVIDENCE_LLM, "llm"):
+            raise FileNotFoundError(
+                "The evidence extraction model is not downloaded. "
+                "Download Qwen 3.5 4B in Settings, then try again."
+            )
+        evidence_llm = _get_cached_llm(evidence_spec.hf_repo, evidence_spec.revision)
+        ledger = prepare_evidence_with_backend(
+            evidence_llm,
+            sources,
+            evidence_cache_key=evidence_cache_key,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            diagnostic_capture=diagnostic_capture,
+        )
+
+    note_llm = _get_cached_llm(spec.hf_repo, spec.revision)
+    result = generate_notes_from_ledger_with_backend(
+        note_llm,
+        ledger,
         formats,
         max_tokens=max_tokens,
         thinking=thinking,
         verification_mode=verification_mode,
-        evidence_cache_key=evidence_cache_key,
         progress_callback=progress_callback,
         cancel_event=cancel_event,
         diagnostic_capture=diagnostic_capture,

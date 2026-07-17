@@ -34,6 +34,7 @@ export const AVAILABLE_LLM_MODELS: readonly AvailableModel[] = [
 ];
 
 export const DEFAULT_LLM = "qwen-3.5-4b";
+export const EVIDENCE_LLM = DEFAULT_LLM;
 
 export function recommendedLlmForMemory(totalMemoryGb: number): string {
   return totalMemoryGb >= 16 ? "qwen-3.5-9b" : DEFAULT_LLM;

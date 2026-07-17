@@ -42,6 +42,26 @@ class LLMBackend(ABC):
     ) -> str:
         ...
 
+    def generate_batch(
+        self,
+        messages_batch: List[List[ChatMessage]],
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        thinking: bool = False,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[str]:
+        """Generate several prompts, with a sequential fallback for backends."""
+        return [
+            self.generate(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                thinking=thinking,
+                cancel_event=cancel_event,
+            )
+            for messages in messages_batch
+        ]
+
     @abstractmethod
     def generate_choice(
         self,

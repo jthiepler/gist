@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 
-from .protocol import render_unit_reference
 from .types import (
     EvidenceLedger,
     EvidenceRecord,
@@ -86,10 +85,9 @@ def build_ledger(
 
 
 def _render_record(record: EvidenceRecord) -> str:
-    reference = render_unit_reference(record.unit_ids)
     return "\n".join(
         [
-            f"[{record.evidence_id}] {record.evidence_type.value} — Source {reference}",
+            f"[{record.evidence_id}] {record.evidence_type.value}",
             f"Claim: {record.claim}",
             f"Evidence: {record.source_excerpt}",
         ]

@@ -217,6 +217,11 @@ def _params_for(msg: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
 def _user_facing_error(operation: str, error: Exception) -> str:
     """Return helpful, non-technical errors while preserving diagnostics in logs."""
     detail = str(error).lower()
+    if "evidence extraction model is not downloaded" in detail:
+        return (
+            "The evidence extraction model is required. "
+            "Download Qwen 3.5 4B in Settings, then try again."
+        )
     if isinstance(error, PermissionError) or "permission denied" in detail:
         return "Gist cannot access this file or model. Check its permissions, then try again."
     if any(term in detail for term in ("no space", "disk full", "not enough space", "errno 28")):

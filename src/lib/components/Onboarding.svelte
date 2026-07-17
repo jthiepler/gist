@@ -7,6 +7,7 @@
     createModelState,
     mergeDownloadedState,
     recommendedLlmForMemory,
+    EVIDENCE_LLM,
   } from "$lib/models";
   import {
     cancelSidecar,
@@ -32,7 +33,17 @@
   let selectedPresentation = $derived(
     AVAILABLE_LLM_MODELS.find((model) => model.name === selectedModel) ?? AVAILABLE_LLM_MODELS[0],
   );
-  let selectedInstalled = $derived(models.llm[selectedModel]?.downloaded === true);
+  let selectedNoteInstalled = $derived(models.llm[selectedModel]?.downloaded === true);
+  let evidenceModelInstalled = $derived(
+    models.llm[EVIDENCE_LLM]?.downloaded === true,
+  );
+  let selectedInstalled = $derived(selectedNoteInstalled && evidenceModelInstalled);
+  let requiredDownloadSize = $derived(
+    (selectedNoteInstalled ? 0 : selectedPresentation.sizeGb) +
+      (selectedModel !== EVIDENCE_LLM && !evidenceModelInstalled
+        ? (AVAILABLE_LLM_MODELS.find((model) => model.name === EVIDENCE_LLM)?.sizeGb ?? 0)
+        : 0),
+  );
   let installedModel = $derived(
     AVAILABLE_LLM_MODELS.find((model) => models.llm[model.name]?.downloaded === true)?.name ?? null,
   );
@@ -46,7 +57,10 @@
 
     if (memory !== null) totalMemoryGb = memory / (1024 ** 3);
     const recommendation = recommendedLlmForMemory(totalMemoryGb ?? 0);
-    selectedModel = savedModel && models.llm[savedModel] ? savedModel : recommendation;
+    selectedModel =
+      savedModel && AVAILABLE_LLM_MODELS.some((model) => model.name === savedModel)
+        ? savedModel
+        : recommendation;
 
     const sidecarReady = await ensureSidecar();
     if (sidecarReady) {
@@ -63,7 +77,7 @@
       selectedModel = installedModel;
     }
 
-    if (completed === "true" && installedModel) {
+    if (completed === "true" && installedModel && evidenceModelInstalled) {
       onComplete();
       return;
     }
@@ -85,16 +99,23 @@
   async function handleDownload() {
     if ($sidecarBusy || downloading) return;
     error = "";
-    downloading = selectedModel;
     progressPercent.set(0);
-    progressStage.set("Preparing model download...");
-    activeOperation.set({ type: "download_model", label: `Downloading ${selectedPresentation.title} model…` });
 
     try {
-      await downloadModel(selectedModel);
-      await refreshModels();
-      if (models.llm[selectedModel]?.downloaded !== true) {
-        throw new Error("The download finished, but the model could not be verified.");
+      const requiredModels = [...new Set([selectedModel, EVIDENCE_LLM])].filter(
+        (name) => models.llm[name]?.downloaded !== true,
+      );
+      for (const model of requiredModels) {
+        const title =
+          AVAILABLE_LLM_MODELS.find((candidate) => candidate.name === model)?.title ?? model;
+        downloading = model;
+        progressStage.set(`Preparing ${title.toLowerCase()} download...`);
+        activeOperation.set({ type: "download_model", label: `Downloading ${title} model…` });
+        await downloadModel(model);
+        await refreshModels();
+        if (models.llm[model]?.downloaded !== true) {
+          throw new Error(`The ${title} download finished, but could not be verified.`);
+        }
       }
       await setSetting("default_llm", selectedModel);
     } catch (e) {
@@ -227,6 +248,11 @@
           {/each}
         </div>
 
+        <p class="onboarding-download-note">
+          Qwen 3.5 4B is required to organize source material before your selected model writes the note.
+          If you select 4B, the same download performs both jobs.
+        </p>
+
         {#if downloading}
           <div class="onboarding-download" role="status" aria-live="polite">
             <div class="onboarding-download-heading">
@@ -239,7 +265,7 @@
         {:else if selectedInstalled}
           <div class="onboarding-ready" role="status"><span aria-hidden="true">✓</span><div><strong>Model installed and ready</strong><small>You can use Gist offline.</small></div></div>
         {:else}
-          <p class="onboarding-download-note">Downloaded from the model provider. No client or session data is sent during this download.</p>
+          <p class="onboarding-download-note">Downloaded from the model provider. No client or session data is sent during these downloads.</p>
         {/if}
 
         {#if error}<div class="error-banner onboarding-error" role="alert">{error}</div>{/if}
@@ -252,7 +278,7 @@
             <button class="btn btn-primary onboarding-primary" onclick={finish}>Start using Gist</button>
           {:else}
             <button class="btn btn-primary onboarding-primary" onclick={handleDownload} disabled={downloading !== "" || $sidecarBusy}>
-              Download {selectedPresentation.title} · {selectedPresentation.sizeGb} GB
+              Download required {selectedModel === EVIDENCE_LLM || evidenceModelInstalled || selectedNoteInstalled ? "model" : "models"} · {requiredDownloadSize.toFixed(1)} GB
             </button>
           {/if}
         </div>

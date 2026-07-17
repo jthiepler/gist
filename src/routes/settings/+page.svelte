@@ -18,6 +18,7 @@
     AVAILABLE_LLM_MODELS,
     createModelState,
     DEFAULT_LLM,
+    EVIDENCE_LLM,
     mergeDownloadedState,
     recommendedLlmForMemory,
   } from "$lib/models";
@@ -90,7 +91,9 @@
           console.warn("Could not detect system memory:", e);
         }),
     ]);
-    if (s.defaultLlm) selectedLlm = s.defaultLlm;
+    if (s.defaultLlm && AVAILABLE_LLM_MODELS.some((model) => model.name === s.defaultLlm)) {
+      selectedLlm = s.defaultLlm;
+    }
     confirmRecordingConsent = s.confirmRecordingConsent;
     developerFeatures = s.developerFeaturesEnabled;
     captureNoteDiagnostics = s.captureNoteDiagnostics;
@@ -144,8 +147,10 @@
     try {
       await deleteModel(model);
       await refreshModels();
-      if (selectedLlm === model && models && Object.keys(models.llm).length > 0) {
-        selectedLlm = Object.keys(models.llm)[0];
+      if (selectedLlm === model) {
+        selectedLlm =
+          AVAILABLE_LLM_MODELS.find((candidate) => models.llm[candidate.name]?.downloaded === true)?.name ??
+          DEFAULT_LLM;
       }
     } catch (e) {
       const msg = String(e);
@@ -252,6 +257,7 @@
     if (downloading === name) return "Downloading";
     if (selectedLlm === name) return "Selected";
     if (info.downloaded === null) return $sidecarBusy ? "Checking when processing finishes" : "Checking availability";
+    if (name === EVIDENCE_LLM && info.downloaded) return "Required for evidence extraction";
     return info.downloaded ? "Installed" : "Not installed";
   }
 
@@ -282,7 +288,10 @@
 
   <div class="model-group">
     <div class="model-group-title">Note-writing model</div>
-    <p class="text-muted settings-help">Models are downloaded once and run on this device for note generation.</p>
+    <p class="text-muted settings-help">
+      Models are downloaded once and run on this device. Qwen 3.5 4B is always used for evidence extraction;
+      your selected model writes the final note.
+    </p>
 
     <table class="model-table">
       <thead>
@@ -294,7 +303,10 @@
         </tr>
       </thead>
       <tbody>
-        {#each Object.entries(models.llm) as [name, info]}
+        {#each AVAILABLE_LLM_MODELS as model}
+          {@const name = model.name}
+          {@const info = models.llm[name]}
+          {#if info}
           {@const presentation = modelPresentation(name, info)}
           <tr
             class="model-row {info.downloaded === true ? 'model-available' : 'model-not-downloaded'}"
@@ -324,6 +336,8 @@
               {#if info.downloaded === true}
                 {#if selectedLlm === name}
                   <span class="model-selected-marker">Selected</span>
+                {:else if name === EVIDENCE_LLM}
+                  <span class="model-selected-marker">Required</span>
                 {:else}
                   <button
                     class="btn btn-sm btn-danger"
@@ -348,6 +362,7 @@
               {/if}
             </td>
           </tr>
+          {/if}
         {/each}
       </tbody>
     </table>
