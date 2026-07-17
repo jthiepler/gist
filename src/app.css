@@ -208,6 +208,8 @@ button, input, select, textarea, a {
 
 .onboarding-loading { color: var(--text-muted); text-align: center; }
 .onboarding-loading .onboarding-mark { margin-bottom: 12px; }
+.onboarding-loading strong { display: block; color: var(--text); font-size: 15px; }
+.onboarding-check-error { max-width: 440px; margin: 8px auto 16px; font-size: 12px; line-height: 1.5; }
 
 .onboarding-eyebrow {
   margin-bottom: 8px;
@@ -300,6 +302,7 @@ button, input, select, textarea, a {
 
 .onboarding-notices p { color: var(--text-muted); font-size: 12px; line-height: 1.55; }
 .onboarding-notices strong { color: var(--text); }
+.onboarding-recovery-details { margin-top: 24px; }
 
 .onboarding-models { display: grid; gap: 10px; margin-top: 24px; }
 .onboarding-model {

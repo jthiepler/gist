@@ -23,6 +23,9 @@ export const currentOperation = writable<string | null>(null);
 export const sidecarBusy = writable<boolean>(false);
 // Active operation descriptor for the persistent progress banner
 export const activeOperation = writable<{ type: string | null; label: string }>({ type: null, label: "" });
+// Opens the required-model recovery gate if the extractor disappears while
+// the app is already running (for example, after external storage cleanup).
+export const evidenceModelRecoveryRequested = writable<boolean>(false);
 
 // Dark mode
 export const darkMode = writable<boolean>(false);

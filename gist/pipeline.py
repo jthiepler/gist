@@ -306,10 +306,11 @@ def generate_notes(
     cancel_event: Optional[threading.Event] = None,
     diagnostic_capture=None,
 ):
-    from .note_generation.pipeline import build_evidence_cache_key
-    from .note_generation.pipeline import generate_notes_from_ledger_with_backend
-    from .note_generation.pipeline import get_cached_evidence_ledger
-    from .note_generation.pipeline import prepare_evidence_with_backend
+    from .note_generation.pipeline import (
+        build_evidence_cache_key,
+        generate_notes_from_ledger_with_backend,
+        prepare_evidence_with_backend,
+    )
 
     sources = tuple(sources)
     formats = tuple(formats)
@@ -347,26 +348,24 @@ def generate_notes(
         sources,
         f"{evidence_spec.hf_repo}@{evidence_spec.revision}",
     )
-    ledger = get_cached_evidence_ledger(
-        evidence_cache_key,
+    if not is_model_downloaded(EVIDENCE_LLM, "llm"):
+        raise FileNotFoundError(
+            "The evidence extraction model is not downloaded. "
+            "Download Qwen 3.5 4B in Settings, then try again."
+        )
+    ledger = prepare_evidence_with_backend(
+        None,
+        sources,
+        evidence_cache_key=evidence_cache_key,
+        evidence_model_identity=f"{evidence_spec.hf_repo}@{evidence_spec.revision}",
+        evidence_backend_factory=lambda: _get_cached_llm(
+            evidence_spec.hf_repo,
+            evidence_spec.revision,
+        ),
         progress_callback=progress_callback,
+        cancel_event=cancel_event,
         diagnostic_capture=diagnostic_capture,
     )
-    if ledger is None:
-        if not is_model_downloaded(EVIDENCE_LLM, "llm"):
-            raise FileNotFoundError(
-                "The evidence extraction model is not downloaded. "
-                "Download Qwen 3.5 4B in Settings, then try again."
-            )
-        evidence_llm = _get_cached_llm(evidence_spec.hf_repo, evidence_spec.revision)
-        ledger = prepare_evidence_with_backend(
-            evidence_llm,
-            sources,
-            evidence_cache_key=evidence_cache_key,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event,
-            diagnostic_capture=diagnostic_capture,
-        )
 
     note_llm = _get_cached_llm(spec.hf_repo, spec.revision)
     result = generate_notes_from_ledger_with_backend(

@@ -1,51 +1,39 @@
 """Extract a chronological evidence ledger from short source blocks."""
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Iterable
 from typing import Any, Optional
 
 from ..llm.base import ChatMessage
 from .diagnostics import DiagnosticCapture, messages_to_dict
-from .protocol import EvidenceProtocolError, parse_evidence_output
-from .types import ParsedEvidence, TranscriptBlock
+from .protocol import EmptyEvidenceOutputError, parse_evidence_output
+from .types import EvidenceType, ParsedEvidence, TranscriptBlock
 
 
 EXTRACTION_MAX_TOKENS = 512
 EXTRACTION_TEMPERATURE = 0.2
 EVIDENCE_BATCH_SIZE = 4
 
-_EXTRACTION_PREFIX = """Extract note-worthy clinical evidence from this source block.
+_EXTRACTION_PREFIX = """Summarize the note-worthy clinical information in this source block.
 
-Return one record by default. Return a second only for a clearly unrelated important development.
-Use exactly this format, with no commentary:
-LABEL | concise self-contained episode
-
-Allowed labels:
-CLIENT_REPORT — patient's symptoms, experiences, history, beliefs, or circumstances
-CLINICIAN_OBSERVATION — behavior or mental state directly observed by the practitioner, not patient-reported history
-CLINICIAN_INTERVENTION — an in-session action or technique used by the practitioner
-CLIENT_RESPONSE — a clinically meaningful patient response to an intervention or formulation
-CLINICIAN_FORMULATION — a practitioner hypothesis or interpretation; preserve how tentative it was
-ACTION_OR_PLAN — a future action, referral, homework, follow-up, or scheduled plan; state whether it was only proposed or actually agreed
-RISK_OR_SAFETY — explicit suicide, self-harm, harm-to-others, abuse, or safety-planning information only; not ordinary emotional, social, or creative risk
-OTHER_RELEVANT_FACT — important clinical information that fits no other label
-
-Rules:
-- Combine connected turns into one episode and ignore standalone acknowledgements or backchannels.
-- Explicitly distinguish what the patient reported from what the practitioner asked, observed, suggested, or formulated.
-- Preserve negation, uncertainty, timing, quantities, and whether something was discussed, proposed, agreed, assigned, or scheduled.
-- Use only information in the source. Do not infer, strengthen, diagnose, or add a plan.
-- If there is no note-worthy evidence, return exactly NONE.
+Write concise, self-contained free text, usually one short paragraph.
+Combine connected turns and ignore standalone acknowledgements or backchannels.
+Clearly preserve who reported, observed, suggested, interpreted, or agreed to something.
+Preserve negation, uncertainty, timing, quantities, and whether an action was discussed, proposed, agreed, assigned, or scheduled.
+Use only information in the source. Do not infer, strengthen, diagnose, or add a plan.
+If there is no note-worthy clinical information, return NONE.
 
 """
 
-_REPAIR_PREFIX = """The previous response was invalid. Follow the format exactly.
-Do not use Markdown, commentary, or any label outside the allowed list.
+_EMPTY_RETRY_PREFIX = """The previous response was empty.
+Return a concise clinical summary in ordinary free text, or return NONE.
 
 """
 
 ProgressCallback = Callable[[int, int], None]
+log = logging.getLogger(__name__)
 
 
 def _messages(prefix: str, block: TranscriptBlock) -> list[ChatMessage]:
@@ -73,7 +61,7 @@ def _extract_batch(
     cancel_event: Optional[threading.Event],
     diagnostic_capture: DiagnosticCapture | None,
     attempt_kind: str,
-) -> list[tuple[ParsedEvidence, ...] | EvidenceProtocolError]:
+) -> list[tuple[ParsedEvidence, ...] | EmptyEvidenceOutputError]:
     messages_batch = [_messages(prefix, block) for block in blocks]
     attempts = [
         {
@@ -122,14 +110,14 @@ def _extract_batch(
                 diagnostic_capture.append_extraction(attempt)
         raise
 
-    results: list[tuple[ParsedEvidence, ...] | EvidenceProtocolError] = []
+    results: list[tuple[ParsedEvidence, ...] | EmptyEvidenceOutputError] = []
     for block, output, attempt in zip(blocks, outputs, attempts):
         attempt["output"] = {"raw_model_output": output}
         try:
             records = parse_evidence_output(output, block)
             attempt["output"]["parsed_records"] = records
             results.append(records)
-        except EvidenceProtocolError as error:
+        except EmptyEvidenceOutputError as error:
             attempt["error"] = {
                 "type": type(error).__name__,
                 "message": str(error),
@@ -148,10 +136,13 @@ def extract_evidence(
     cancel_event: Optional[threading.Event] = None,
     progress_callback: Optional[ProgressCallback] = None,
     diagnostic_capture: DiagnosticCapture | None = None,
-) -> tuple[tuple[tuple[TranscriptBlock, tuple[ParsedEvidence, ...]], ...], int]:
+) -> tuple[
+    tuple[tuple[TranscriptBlock, tuple[ParsedEvidence, ...]], ...],
+    dict[str, int],
+]:
     block_list = tuple(blocks)
     extracted: list[tuple[TranscriptBlock, tuple[ParsedEvidence, ...]]] = []
-    retry_count = 0
+    retries_by_document: dict[str, int] = {}
     for batch_start in range(0, len(block_list), EVIDENCE_BATCH_SIZE):
         if cancel_event and cancel_event.is_set():
             raise InterruptedError("Note generation cancelled")
@@ -167,29 +158,46 @@ def extract_evidence(
         failed_indexes = [
             index
             for index, result in enumerate(batch_results)
-            if isinstance(result, EvidenceProtocolError)
+            if isinstance(result, EmptyEvidenceOutputError)
         ]
         if failed_indexes:
-            retry_count += len(failed_indexes)
-            repair_blocks = tuple(batch[index] for index in failed_indexes)
-            repair_results = _extract_batch(
+            for index in failed_indexes:
+                document_id = batch[index].document_id
+                retries_by_document[document_id] = (
+                    retries_by_document.get(document_id, 0) + 1
+                )
+            retry_blocks = tuple(batch[index] for index in failed_indexes)
+            retry_results = _extract_batch(
                 llm,
-                repair_blocks,
-                _EXTRACTION_PREFIX + _REPAIR_PREFIX,
+                retry_blocks,
+                _EXTRACTION_PREFIX + _EMPTY_RETRY_PREFIX,
                 cancel_event,
                 diagnostic_capture,
-                "format_repair",
+                "empty_response_retry",
             )
-            for index, repaired in zip(failed_indexes, repair_results):
-                if isinstance(repaired, EvidenceProtocolError):
-                    raise RuntimeError(
-                        "The local model could not produce a valid evidence record for part of the source material."
-                    ) from repaired
-                batch_results[index] = repaired
+            for index, retried in zip(failed_indexes, retry_results):
+                if isinstance(retried, EmptyEvidenceOutputError):
+                    block = batch[index]
+                    fallback = " ".join(
+                        f"{unit.speaker}: {unit.text}" if unit.speaker else unit.text
+                        for unit in block.units
+                    )
+                    retried = (
+                        ParsedEvidence(
+                            unit_ids=tuple(unit.unit_id for unit in block.units),
+                            evidence_type=EvidenceType.OTHER_RELEVANT_FACT,
+                            claim=fallback,
+                        ),
+                    )
+                    log.warning(
+                        "event=evidence_extraction_source_fallback block_ordinal=%d",
+                        block.ordinal,
+                    )
+                batch_results[index] = retried
 
         for block, records in zip(batch, batch_results):
-            assert not isinstance(records, EvidenceProtocolError)
+            assert not isinstance(records, EmptyEvidenceOutputError)
             extracted.append((block, records))
         if progress_callback:
             progress_callback(batch_start + len(batch), len(block_list))
-    return tuple(extracted), retry_count
+    return tuple(extracted), retries_by_document

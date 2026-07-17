@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { ensureSidecar } from "$lib/ensureSidecar";
   import {
     AVAILABLE_LLM_MODELS,
     DEFAULT_LLM,
     createModelState,
     mergeDownloadedState,
+    missingRequiredLlmModels,
     recommendedLlmForMemory,
     EVIDENCE_LLM,
   } from "$lib/models";
@@ -29,6 +30,11 @@
   let error = $state("");
   let cancelling = $state(false);
   let totalMemoryGb = $state<number | null>(null);
+  let returningUser = $state(false);
+  let checkingModels = $state(true);
+  let retryWhenIdle = false;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let stopBusySubscription: (() => void) | undefined;
 
   let selectedPresentation = $derived(
     AVAILABLE_LLM_MODELS.find((model) => model.name === selectedModel) ?? AVAILABLE_LLM_MODELS[0],
@@ -38,22 +44,74 @@
     models.llm[EVIDENCE_LLM]?.downloaded === true,
   );
   let selectedInstalled = $derived(selectedNoteInstalled && evidenceModelInstalled);
+  let missingRequiredModels = $derived(missingRequiredLlmModels(selectedModel, models));
   let requiredDownloadSize = $derived(
-    (selectedNoteInstalled ? 0 : selectedPresentation.sizeGb) +
-      (selectedModel !== EVIDENCE_LLM && !evidenceModelInstalled
-        ? (AVAILABLE_LLM_MODELS.find((model) => model.name === EVIDENCE_LLM)?.sizeGb ?? 0)
-        : 0),
+    missingRequiredModels.reduce(
+      (total, name) =>
+        total + (AVAILABLE_LLM_MODELS.find((model) => model.name === name)?.sizeGb ?? 0),
+      0,
+    ),
   );
   let installedModel = $derived(
     AVAILABLE_LLM_MODELS.find((model) => models.llm[model.name]?.downloaded === true)?.name ?? null,
   );
+  let missingSelectedModel = $derived(!selectedNoteInstalled);
+  let missingEvidenceModel = $derived(!evidenceModelInstalled);
 
-  onMount(async () => {
-    const [completed, savedModel, memory] = await Promise.all([
-      getSetting("onboarding_completed").catch(() => null),
-      getSetting("default_llm").catch(() => null),
-      getSystemMemoryBytes().catch(() => null),
-    ]);
+  onDestroy(() => {
+    if (retryTimer) clearTimeout(retryTimer);
+    stopBusySubscription?.();
+  });
+
+  onMount(() => {
+    stopBusySubscription = sidecarBusy.subscribe((busy) => {
+      if (!busy && retryWhenIdle) {
+        retryWhenIdle = false;
+        void initialize();
+      }
+    });
+    void initialize();
+  });
+
+  function scheduleBusyRetry() {
+    retryWhenIdle = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (!$sidecarBusy && retryWhenIdle) {
+        retryWhenIdle = false;
+        void initialize();
+      }
+    }, 500);
+  }
+
+  async function initialize() {
+    if (checkingModels && step !== 0) return;
+    retryWhenIdle = false;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    checkingModels = true;
+    error = "";
+    step = 0;
+
+    let completed: string | null;
+    let savedModel: string | null;
+    let memory: number | null;
+    try {
+      [completed, savedModel, memory] = await Promise.all([
+        getSetting("onboarding_completed"),
+        getSetting("default_llm"),
+        getSystemMemoryBytes().catch(() => null),
+      ]);
+    } catch (e) {
+      checkingModels = false;
+      error = `Gist could not read its setup settings: ${String(e)}`;
+      return;
+    }
+
+    returningUser = completed === "true";
 
     if (memory !== null) totalMemoryGb = memory / (1024 ** 3);
     const recommendation = recommendedLlmForMemory(totalMemoryGb ?? 0);
@@ -62,29 +120,40 @@
         ? savedModel
         : recommendation;
 
-    const sidecarReady = await ensureSidecar();
-    if (sidecarReady) {
-      try {
-        models = mergeDownloadedState(await listModels());
-      } catch (e) {
-        error = `Gist could not check the installed models: ${String(e)}`;
-      }
-    } else {
+    if (!(await ensureSidecar())) {
+      checkingModels = false;
       error = "Gist could not start its local processing engine. Try again to continue setup.";
+      return;
     }
 
-    if (models.llm[selectedModel]?.downloaded !== true && installedModel) {
+    try {
+      models = mergeDownloadedState(await listModels());
+    } catch (e) {
+      const message = String(e);
+      if (message === "sidecar_busy" || message.toLowerCase().includes("busy")) {
+        error = "Gist is finishing another local operation. Model availability will be checked again when it is ready.";
+        scheduleBusyRetry();
+      } else {
+        error = `Gist could not check the installed models: ${message}`;
+      }
+      checkingModels = false;
+      return;
+    }
+
+    // A first-time setup can start from an existing download. Returning users
+    // keep their saved note-writing choice while a missing dependency is repaired.
+    if (!returningUser && models.llm[selectedModel]?.downloaded !== true && installedModel) {
       selectedModel = installedModel;
     }
 
-    if (completed === "true" && installedModel && evidenceModelInstalled) {
+    checkingModels = false;
+    if (returningUser && selectedNoteInstalled && evidenceModelInstalled) {
       onComplete();
       return;
     }
 
-    // Returning users who removed every model only need the required-model step.
-    step = completed === "true" ? 3 : 1;
-  });
+    step = returningUser ? 3 : 1;
+  }
 
   function chooseModel(name: string) {
     if (downloading) return;
@@ -102,9 +171,7 @@
     progressPercent.set(0);
 
     try {
-      const requiredModels = [...new Set([selectedModel, EVIDENCE_LLM])].filter(
-        (name) => models.llm[name]?.downloaded !== true,
-      );
+      const requiredModels = missingRequiredLlmModels(selectedModel, models);
       for (const model of requiredModels) {
         const title =
           AVAILABLE_LLM_MODELS.find((candidate) => candidate.name === model)?.title ?? model;
@@ -118,6 +185,9 @@
         }
       }
       await setSetting("default_llm", selectedModel);
+      if (returningUser && selectedInstalled) {
+        await finish();
+      }
     } catch (e) {
       const message = String(e);
       if (!cancelling && !message.toLowerCase().includes("cancel")) {
@@ -161,15 +231,23 @@
   {#if step === 0}
     <div class="onboarding-loading" role="status">
       <div class="onboarding-mark" aria-hidden="true">G</div>
-      <span>Preparing Gist…</span>
+      {#if checkingModels}
+        <span>Checking local models…</span>
+      {:else}
+        <strong>Gist could not verify its local models</strong>
+        {#if error}<p class="onboarding-check-error">{error}</p>{/if}
+        <button class="btn btn-primary" onclick={initialize} disabled={$sidecarBusy}>Try again</button>
+      {/if}
     </div>
   {:else}
     <div class="onboarding-card onboarding-step-{step}">
-      <div class="onboarding-progress" aria-label="Setup progress">
-        {#each [1, 2, 3] as item}
-          <span class:active={item <= step}></span>
-        {/each}
-      </div>
+      {#if !returningUser}
+        <div class="onboarding-progress" aria-label="Setup progress">
+          {#each [1, 2, 3] as item}
+            <span class:active={item <= step}></span>
+          {/each}
+        </div>
+      {/if}
 
       {#if step === 1}
         <div class="onboarding-hero-icon" aria-hidden="true">
@@ -218,40 +296,68 @@
           <button class="btn btn-primary onboarding-primary" onclick={() => (step = 3)}>I understand — continue</button>
         </div>
       {:else}
-        <div class="onboarding-eyebrow">Required model</div>
-        <h1>Choose your note-writing model</h1>
-        <p class="onboarding-lead">Gist needs a language model to turn transcripts into draft notes. It is downloaded once, then runs entirely on your Mac.</p>
+        {#if returningUser}
+          <div class="onboarding-eyebrow">Local model recovery</div>
+          <h1>{missingRequiredModels.length > 1 ? "Restore your local models" : missingEvidenceModel && !missingSelectedModel ? "Restore the evidence model" : "Restore your local model"}</h1>
+          <p class="onboarding-lead">
+            {#if selectedModel === EVIDENCE_LLM}
+              Qwen 3.5 4B handles both evidence extraction and final note writing. Its local files are missing and must be downloaded again.
+            {:else if missingEvidenceModel}
+              Gist needs Qwen 3.5 4B to organize session evidence before {selectedPresentation.title} writes the final note.
+              {missingSelectedModel ? "Both models' local files are missing and must be downloaded again." : "Its local files are missing and must be downloaded again."}
+            {:else}
+              The local files for your selected {selectedPresentation.caption} note-writing model are missing and must be downloaded again.
+            {/if}
+          </p>
 
-        <div class="onboarding-models">
-          {#each AVAILABLE_LLM_MODELS as model}
-            {@const isRecommended = model.name === recommendedLlmForMemory(totalMemoryGb ?? 0)}
-            {@const isInstalled = models.llm[model.name]?.downloaded === true}
-            <button
-              type="button"
-              class="onboarding-model"
-              class:selected={selectedModel === model.name}
-              onclick={() => chooseModel(model.name)}
-              disabled={downloading !== ""}
-            >
-              <span class="model-choice-indicator" aria-hidden="true"></span>
-              <span class="model-choice-copy">
-                <span class="model-choice-heading">
-                  <strong>{model.title}</strong>
-                  {#if isRecommended}<span class="model-recommended">Recommended</span>{/if}
-                  {#if isInstalled}<span class="model-installed">Installed</span>{/if}
+          <div class="onboarding-notices onboarding-recovery-details">
+            {#if selectedModel === EVIDENCE_LLM}
+              <p><strong>Evidence extraction and note writing:</strong> Qwen 3.5 4B · {selectedPresentation.sizeGb} GB</p>
+            {:else if missingEvidenceModel}
+              <p><strong>Evidence extraction:</strong> Qwen 3.5 4B · {AVAILABLE_LLM_MODELS.find((model) => model.name === EVIDENCE_LLM)?.sizeGb ?? 0} GB</p>
+            {/if}
+            {#if missingSelectedModel && selectedModel !== EVIDENCE_LLM}
+              <p><strong>Final note writing:</strong> {selectedPresentation.caption} · {selectedPresentation.sizeGb} GB</p>
+            {:else if selectedModel !== EVIDENCE_LLM}
+              <p><strong>Your note-writing choice stays unchanged:</strong> {selectedPresentation.caption}</p>
+            {/if}
+          </div>
+        {:else}
+          <div class="onboarding-eyebrow">Required model</div>
+          <h1>Choose your note-writing model</h1>
+          <p class="onboarding-lead">Gist needs a language model to turn transcripts into draft notes. It is downloaded once, then runs entirely on your Mac.</p>
+
+          <div class="onboarding-models">
+            {#each AVAILABLE_LLM_MODELS as model}
+              {@const isRecommended = model.name === recommendedLlmForMemory(totalMemoryGb ?? 0)}
+              {@const isInstalled = models.llm[model.name]?.downloaded === true}
+              <button
+                type="button"
+                class="onboarding-model"
+                class:selected={selectedModel === model.name}
+                onclick={() => chooseModel(model.name)}
+                disabled={downloading !== ""}
+              >
+                <span class="model-choice-indicator" aria-hidden="true"></span>
+                <span class="model-choice-copy">
+                  <span class="model-choice-heading">
+                    <strong>{model.title}</strong>
+                    {#if isRecommended}<span class="model-recommended">Recommended</span>{/if}
+                    {#if isInstalled}<span class="model-installed">Installed</span>{/if}
+                  </span>
+                  <span>{model.caption}</span>
+                  <small>{model.description}</small>
                 </span>
-                <span>{model.caption}</span>
-                <small>{model.description}</small>
-              </span>
-              <span class="model-choice-size">{model.sizeGb} GB</span>
-            </button>
-          {/each}
-        </div>
+                <span class="model-choice-size">{model.sizeGb} GB</span>
+              </button>
+            {/each}
+          </div>
 
-        <p class="onboarding-download-note">
-          Qwen 3.5 4B is required to organize source material before your selected model writes the note.
-          If you select 4B, the same download performs both jobs.
-        </p>
+          <p class="onboarding-download-note">
+            Qwen 3.5 4B is required to organize source material before your selected model writes the note.
+            If you select 4B, the same download performs both jobs.
+          </p>
+        {/if}
 
         {#if downloading}
           <div class="onboarding-download" role="status" aria-live="polite">
@@ -271,14 +377,14 @@
         {#if error}<div class="error-banner onboarding-error" role="alert">{error}</div>{/if}
 
         <div class="onboarding-actions split" class:complete={selectedInstalled}>
-          {#if step === 3 && !installedModel}
+          {#if !returningUser && step === 3 && !installedModel}
             <button class="btn" onclick={() => (step = 2)} disabled={downloading !== ""}>Back</button>
           {/if}
           {#if selectedInstalled}
-            <button class="btn btn-primary onboarding-primary" onclick={finish}>Start using Gist</button>
+            <button class="btn btn-primary onboarding-primary" onclick={finish}>{returningUser ? "Continue" : "Start using Gist"}</button>
           {:else}
             <button class="btn btn-primary onboarding-primary" onclick={handleDownload} disabled={downloading !== "" || $sidecarBusy}>
-              Download required {selectedModel === EVIDENCE_LLM || evidenceModelInstalled || selectedNoteInstalled ? "model" : "models"} · {requiredDownloadSize.toFixed(1)} GB
+              {returningUser ? "Download and continue" : `Download required ${selectedModel === EVIDENCE_LLM || evidenceModelInstalled || selectedNoteInstalled ? "model" : "models"}`} · {requiredDownloadSize.toFixed(1)} GB
             </button>
           {/if}
         </div>

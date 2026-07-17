@@ -202,6 +202,37 @@ class PipelineTests(unittest.TestCase):
 
         get_llm.assert_not_called()
 
+    def test_missing_evidence_model_fails_even_when_ledger_is_cached(self):
+        evidence_llm = Mock()
+        evidence_llm.count_tokens.side_effect = lambda text: len(text.split())
+        evidence_llm.generate.return_value = (
+            "CLIENT_REPORT | Patient reported feeling calmer."
+        )
+        note_llm = Mock()
+        note_llm.count_tokens.side_effect = lambda text: len(text.split())
+        note_llm.generate.return_value = "Initial note."
+
+        with (
+            patch.object(
+                pipeline,
+                "is_model_downloaded",
+                side_effect=(True, False),
+            ),
+            patch.object(
+                pipeline,
+                "_get_cached_llm",
+                side_effect=(evidence_llm, note_llm),
+            ),
+        ):
+            self.assertEqual(
+                pipeline.generate_note("Patient 1: I feel calmer."),
+                "Initial note.",
+            )
+            with self.assertRaisesRegex(FileNotFoundError, "evidence extraction model"):
+                pipeline.generate_note("Patient 1: I feel calmer.")
+
+        evidence_llm.generate.assert_called_once()
+
     def test_evidence_model_is_fixed_to_qwen_4b(self):
         spec = LLM_MODELS[EVIDENCE_LLM]
         self.assertEqual(EVIDENCE_LLM, "qwen-3.5-4b")
@@ -474,6 +505,44 @@ class MLXBackendTests(unittest.TestCase):
         self.assertEqual(factory.call_args.kwargs["completion_batch_size"], 2)
         self.assertEqual(factory.call_args.kwargs["prefill_batch_size"], 2)
         self.assertEqual(generator.insert.call_args.args[1], [32, 32])
+        generator.close.assert_called_once_with()
+
+    def test_native_batch_generation_preserves_empty_stopped_output(self):
+        backend = MLXBackend()
+        backend.model = object()
+        backend.tokenizer = Mock()
+        backend.tokenizer.eos_token_ids = [99]
+        backend.tokenizer.apply_chat_template.return_value = [1, 2]
+        backend.tokenizer.decode.return_value = ""
+
+        stats = SimpleNamespace(
+            prompt_tokens=2,
+            generation_tokens=0,
+            peak_memory=1.25,
+        )
+
+        class StatsContext:
+            def __enter__(self):
+                return stats
+
+            def __exit__(self, *_args):
+                return False
+
+        generator = Mock()
+        generator.insert.return_value = [100]
+        generator.stats.return_value = StatsContext()
+        generator.next_generated.return_value = [
+            SimpleNamespace(uid=100, token=99, finish_reason="stop")
+        ]
+
+        with patch("gist.llm.mlx_backend.BatchGenerator", return_value=generator):
+            outputs = backend.generate_batch(
+                [[ChatMessage(role="user", content="prompt")]],
+                max_tokens=32,
+                temperature=0.2,
+            )
+
+        self.assertEqual(outputs, [""])
         generator.close.assert_called_once_with()
 
     def test_note_generation_reuses_only_an_identical_prompt_prefix(self):

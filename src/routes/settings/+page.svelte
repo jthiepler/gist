@@ -139,6 +139,10 @@
   }
 
   async function handleDelete(model: string) {
+    if (model === EVIDENCE_LLM) {
+      error = "Qwen 3.5 4B is required for evidence extraction and cannot be removed in Gist.";
+      return;
+    }
     if ($sidecarBusy) {
       error = "Another operation is in progress. Please wait or cancel it first.";
       return;

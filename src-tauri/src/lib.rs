@@ -24,7 +24,7 @@ const MIN_DIARIZATION_SPEAKERS: i64 = 2;
 const MAX_DIARIZATION_SPEAKERS: i64 = 4;
 
 fn developer_features_available() -> bool {
-    cfg!(debug_assertions) || option_env!("GIST_DEVELOPER_FEATURES").is_some()
+    cfg!(debug_assertions) || option_env!("GIST_DEVELOPER_FEATURES") == Some("1")
 }
 
 const SESSION_COLUMNS: &str =
@@ -134,6 +134,15 @@ impl Database {
                 transcription_model TEXT,
                 include_in_notes INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evidence_ledger_cache (
+                source_id TEXT PRIMARY KEY REFERENCES session_inputs(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                model_identity TEXT NOT NULL,
+                pipeline_version TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS settings (
@@ -591,6 +600,7 @@ fn start_sidecar_process(app: &AppHandle, state: &SharedSidecarState) -> Result<
         .arg("serve")
         .env("DYLD_FALLBACK_LIBRARY_PATH", &dyld_path)
         .env("HF_HUB_CACHE", &model_cache_dir)
+        .env("GIST_DATABASE_PATH", app_dir.join("gist.db"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_file));
@@ -1446,6 +1456,12 @@ async fn update_session_input(
     if affected == 0 {
         return Err("Session input not found".into());
     }
+    db.conn
+        .execute(
+            "DELETE FROM evidence_ledger_cache WHERE source_id = ?1",
+            params![data.id],
+        )
+        .map_err(|e| e.to_string())?;
     get_session_input_by_id(&db.conn, &data.id)
 }
 

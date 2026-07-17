@@ -40,6 +40,7 @@
     recordingLevel,
     recordingJobsProcessing,
     recordingPaused,
+    evidenceModelRecoveryRequested,
     selectedPatientId,
     sessionUpdate,
     sidecarBusy,
@@ -678,8 +679,11 @@
   </main>
 </div>
 
-{#if !onboardingComplete}
-  <Onboarding onComplete={() => (onboardingComplete = true)} />
+{#if !onboardingComplete || $evidenceModelRecoveryRequested}
+  <Onboarding onComplete={() => {
+    onboardingComplete = true;
+    evidenceModelRecoveryRequested.set(false);
+  }} />
 {/if}
 
 {#if showFeedbackPrompt}

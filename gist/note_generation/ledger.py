@@ -85,10 +85,15 @@ def build_ledger(
 
 
 def _render_record(record: EvidenceRecord) -> str:
+    heading = (
+        f"[{record.evidence_id}]"
+        if record.evidence_type == EvidenceType.OTHER_RELEVANT_FACT
+        else f"[{record.evidence_id}] {record.evidence_type.value}"
+    )
     return "\n".join(
         [
-            f"[{record.evidence_id}] {record.evidence_type.value}",
-            f"Claim: {record.claim}",
+            heading,
+            f"Summary: {record.claim}",
             f"Evidence: {record.source_excerpt}",
         ]
     )

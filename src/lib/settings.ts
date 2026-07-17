@@ -21,6 +21,10 @@ export async function loadSettings(): Promise<Settings> {
   const s = { ...DEFAULTS };
   try {
     s.developerFeaturesEnabled = await developerFeaturesEnabled();
+  } catch (e) {
+    console.error("developerFeaturesEnabled failed:", e);
+  }
+  try {
     const llm = await getSetting("default_llm");
     if (llm) s.defaultLlm = llm;
     const ap = await getSetting("appearance");

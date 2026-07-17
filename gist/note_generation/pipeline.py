@@ -1,14 +1,15 @@
 """End-to-end format-neutral evidence-ledger note generation."""
 from __future__ import annotations
 
-import logging
 import hashlib
+import logging
 import threading
 from collections.abc import Callable, Iterable
 from typing import Any, Optional
 
 from .chunking import build_blocks
 from .diagnostics import DiagnosticCapture
+from .evidence_cache import load_document_evidence, save_document_evidence
 from .extraction import extract_evidence
 from .ledger import build_evidence_bundle, build_ledger
 from .rendering import render_note
@@ -20,6 +21,9 @@ from .types import (
     GeneratedNote,
     NoteFormatRequest,
     NoteGenerationSource,
+    ParsedEvidence,
+    SourceDocument,
+    TranscriptBlock,
     VerificationSummary,
 )
 from .verification import verify_note
@@ -27,7 +31,7 @@ from .verification import verify_note
 
 log = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, str], None]
-_EVIDENCE_CACHE_VERSION = "evidence-episodes-v8"
+_EVIDENCE_CACHE_VERSION = "evidence-free-text-v1"
 _cached_evidence_key: str | None = None
 _cached_evidence_ledger: EvidenceLedger | None = None
 _cached_evidence_trace: dict[str, Any] | None = None
@@ -94,10 +98,12 @@ def get_cached_evidence_ledger(
 
 
 def prepare_evidence_with_backend(
-    llm: Any,
+    llm: Any | None,
     sources: Iterable[NoteGenerationSource],
     *,
     evidence_cache_key: str | None = None,
+    evidence_model_identity: str | None = None,
+    evidence_backend_factory: Callable[[], Any] | None = None,
     progress_callback: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     diagnostic_capture: DiagnosticCapture | None = None,
@@ -120,7 +126,50 @@ def prepare_evidence_with_backend(
             "normalized_sources",
             {"input": source_list, "output": documents},
         )
-    blocks = build_blocks(documents, llm.count_tokens)
+    extracted_by_document: dict[
+        str,
+        tuple[tuple[TranscriptBlock, tuple[ParsedEvidence, ...]], ...],
+    ] = {}
+    retries_by_document: dict[str, int] = {}
+    missing_documents: list[SourceDocument] = []
+    cache_hit_count = 0
+    if evidence_model_identity is not None:
+        for document in documents:
+            cached_document = load_document_evidence(
+                document,
+                evidence_model_identity,
+                _EVIDENCE_CACHE_VERSION,
+            )
+            if cached_document is None:
+                missing_documents.append(document)
+                continue
+            extracted_by_document[document.document_id] = cached_document.extracted
+            retries_by_document[document.document_id] = cached_document.retry_count
+            cache_hit_count += 1
+    else:
+        missing_documents.extend(documents)
+
+    if missing_documents and llm is None:
+        if evidence_backend_factory is None:
+            raise RuntimeError("Evidence extraction requires a local model backend.")
+        llm = evidence_backend_factory()
+
+    missing_blocks = (
+        build_blocks(missing_documents, llm.count_tokens)
+        if missing_documents and llm is not None
+        else ()
+    )
+    cached_blocks = tuple(
+        block
+        for extracted in extracted_by_document.values()
+        for block, _records in extracted
+    )
+    blocks = tuple(
+        sorted(
+            (*cached_blocks, *missing_blocks),
+            key=lambda block: (int(block.document_id[1:]), block.ordinal),
+        )
+    )
     if diagnostic_capture:
         diagnostic_capture.set_stage(
             "chunking",
@@ -134,10 +183,12 @@ def prepare_evidence_with_backend(
             },
         )
     log.info(
-        "event=evidence_sources_prepared documents=%d units=%d blocks=%d",
+        "event=evidence_sources_prepared documents=%d units=%d blocks=%d cache_hits=%d cache_misses=%d",
         len(documents),
         sum(len(document.units) for document in documents),
         len(blocks),
+        cache_hit_count,
+        len(missing_documents),
     )
 
     def extraction_progress(completed: int, total: int) -> None:
@@ -147,13 +198,40 @@ def prepare_evidence_with_backend(
                 "Extracting clinical evidence...",
             )
 
-    extracted, retry_count = extract_evidence(
-        llm,
-        blocks,
-        cancel_event=cancel_event,
-        progress_callback=extraction_progress,
-        diagnostic_capture=diagnostic_capture,
+    if missing_blocks:
+        extracted_missing, new_retries_by_document = extract_evidence(
+            llm,
+            missing_blocks,
+            cancel_event=cancel_event,
+            progress_callback=extraction_progress,
+            diagnostic_capture=diagnostic_capture,
+        )
+        retries_by_document.update(new_retries_by_document)
+        for document in missing_documents:
+            document_extracted = tuple(
+                item
+                for item in extracted_missing
+                if item[0].document_id == document.document_id
+            )
+            extracted_by_document[document.document_id] = document_extracted
+            if evidence_model_identity is not None:
+                save_document_evidence(
+                    document,
+                    document_extracted,
+                    retries_by_document.get(document.document_id, 0),
+                    evidence_model_identity,
+                    _EVIDENCE_CACHE_VERSION,
+                )
+    else:
+        if progress_callback:
+            progress_callback(57, "Reusing extracted encounter evidence...")
+
+    extracted = tuple(
+        item
+        for document in documents
+        for item in extracted_by_document[document.document_id]
     )
+    retry_count = sum(retries_by_document.values())
     if progress_callback:
         progress_callback(57, "Organizing encounter evidence...")
     ledger = build_ledger(documents, extracted, retry_count)
@@ -182,12 +260,16 @@ def prepare_evidence_with_backend(
                 "hit": False,
                 "cache_key": evidence_cache_key,
                 "cached": evidence_cache_key is not None,
+                "persistent_document_hits": cache_hit_count,
+                "persistent_document_misses": len(missing_documents),
             },
         )
     log.info(
-        "event=evidence_ledger_cache_miss records=%d cached=%s",
+        "event=evidence_ledger_cache_miss records=%d cached=%s document_cache_hits=%d document_cache_misses=%d",
         len(ledger.records),
         evidence_cache_key is not None,
+        cache_hit_count,
+        len(missing_documents),
     )
     return ledger
 
@@ -252,7 +334,7 @@ def generate_notes_from_ledger_with_backend(
                 cancel_event=cancel_event,
                 diagnostic_capture=diagnostic_capture,
             )
-            if progress_callback:
+            if progress_callback and verification_mode != "off":
                 progress_callback(
                     60 + round(((index + 0.6) / total_formats) * 38),
                     f"Checking {format_request.name.upper()} source support...",
@@ -307,7 +389,7 @@ def generate_notes_from_ledger_with_backend(
             failures.append(
                 FormatFailure(
                     format=format_request.name,
-                    message="The note could not be generated and verified from the available evidence.",
+                    message="The note could not be generated from the available evidence.",
                 )
             )
 

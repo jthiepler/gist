@@ -337,8 +337,6 @@ class MLXBackend(LLMBackend):
         texts = [self.tokenizer.decode(tokens_by_uid[uid]).strip() for uid in uids]
         for uid, text in zip(uids, texts):
             finish_reason = finish_reasons.get(uid)
-            if not text:
-                raise RuntimeError("The model returned an empty evidence response. Please try again.")
             if finish_reason == "length":
                 raise GenerationIncompleteError(
                     "An evidence response reached the generation limit and may be incomplete.",

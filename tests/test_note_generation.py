@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from gist.note_generation.chunking import build_blocks
 from gist.note_generation.diagnostics import DiagnosticCapture, DIAGNOSTICS_DIRECTORY_ENV
+from gist.note_generation.evidence_cache import GIST_DATABASE_PATH_ENV
 from gist.note_generation.ledger import build_evidence_bundle
 from gist.note_generation.pipeline import (
     build_evidence_cache_key,
     clear_evidence_cache,
     generate_notes_with_backend,
+    prepare_evidence_with_backend,
 )
-from gist.note_generation.protocol import EvidenceProtocolError, parse_evidence_output
+from gist.note_generation.protocol import EmptyEvidenceOutputError, parse_evidence_output
 from gist.note_generation.sources import normalize_sources
 from gist.note_generation.types import (
     EvidenceLedger,
@@ -79,6 +83,44 @@ def source(text: str) -> NoteGenerationSource:
     )
 
 
+def identified_source(source_id: str, text: str) -> NoteGenerationSource:
+    return NoteGenerationSource(
+        id=source_id,
+        kind="session_transcript",
+        origin="typed",
+        title="Session transcript",
+        text=text,
+    )
+
+
+def create_evidence_cache_database(
+    directory: str,
+    source_ids: tuple[str, ...],
+) -> Path:
+    path = Path(directory) / "gist.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """PRAGMA foreign_keys = ON;
+        CREATE TABLE session_inputs (id TEXT PRIMARY KEY);
+        CREATE TABLE evidence_ledger_cache (
+            source_id TEXT PRIMARY KEY REFERENCES session_inputs(id) ON DELETE CASCADE,
+            source_fingerprint TEXT NOT NULL,
+            model_identity TEXT NOT NULL,
+            pipeline_version TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );"""
+    )
+    connection.executemany(
+        "INSERT INTO session_inputs (id) VALUES (?1)",
+        ((source_id,) for source_id in source_ids),
+    )
+    connection.commit()
+    connection.close()
+    return path
+
+
 class SourceAndProtocolTests(unittest.TestCase):
     def test_diarized_transcript_becomes_stable_units(self):
         documents = normalize_sources(
@@ -111,14 +153,21 @@ class SourceAndProtocolTests(unittest.TestCase):
         self.assertGreaterEqual(len(blocks), 2)
         self.assertEqual(blocks[0].units[-1].unit_id, blocks[1].units[0].unit_id)
 
-    def test_protocol_rejects_legacy_unit_reference_field(self):
+    def test_protocol_accepts_unstructured_free_text(self):
         documents = normalize_sources([source("Patient 1: I feel anxious.")])
         block = build_blocks(documents, lambda text: len(text.split()))[0]
-        with self.assertRaises(EvidenceProtocolError):
-            parse_evidence_output(
-                "D1U9999 | CLIENT_REPORT | Patient reported anxiety.",
-                block,
-            )
+        records = parse_evidence_output(
+            "The patient described feeling anxious and having difficulty settling at night.",
+            block,
+        )
+        self.assertEqual(records[0].evidence_type, EvidenceType.OTHER_RELEVANT_FACT)
+        self.assertIn("difficulty settling", records[0].claim)
+
+    def test_protocol_retries_only_an_empty_response(self):
+        documents = normalize_sources([source("Patient 1: I feel anxious.")])
+        block = build_blocks(documents, lambda text: len(text.split()))[0]
+        with self.assertRaises(EmptyEvidenceOutputError):
+            parse_evidence_output("", block)
 
     def test_protocol_keeps_pipes_inside_claim(self):
         documents = normalize_sources([source("Patient 1: I feel anxious.")])
@@ -129,7 +178,7 @@ class SourceAndProtocolTests(unittest.TestCase):
         )
         self.assertEqual(records[0].claim, "Patient described work | home conflict.")
 
-    def test_protocol_rejects_context_free_acknowledgement(self):
+    def test_protocol_discards_context_free_acknowledgement_as_empty_evidence(self):
         documents = normalize_sources(
             [
                 source(
@@ -139,11 +188,30 @@ class SourceAndProtocolTests(unittest.TestCase):
             ]
         )
         block = build_blocks(documents, lambda text: len(text.split()))[0]
-        with self.assertRaises(EvidenceProtocolError):
-            parse_evidence_output(
-                "CLIENT_RESPONSE | Patient agreed with the practitioner's formulation.",
-                block,
-            )
+        records = parse_evidence_output(
+            "CLIENT_RESPONSE | Patient agreed with the practitioner's formulation.",
+            block,
+        )
+        self.assertEqual(records, ())
+
+    def test_protocol_recognizes_free_text_no_evidence_response(self):
+        documents = normalize_sources([source("Patient 1: Yeah.")])
+        block = build_blocks(documents, lambda text: len(text.split()))[0]
+        records = parse_evidence_output(
+            "No note-worthy clinical information.",
+            block,
+        )
+        self.assertEqual(records, ())
+
+    def test_protocol_accepts_harmless_markdown_wrapping(self):
+        documents = normalize_sources([source("Patient 1: I feel anxious.")])
+        block = build_blocks(documents, lambda text: len(text.split()))[0]
+        records = parse_evidence_output(
+            "```text\n- **CLIENT_REPORT** | Patient reported anxiety.\n```",
+            block,
+        )
+        self.assertEqual(records[0].evidence_type, EvidenceType.CLIENT_REPORT)
+        self.assertEqual(records[0].claim, "Patient reported anxiety.")
 
     def test_protocol_accepts_formulation_with_meaningful_response(self):
         documents = normalize_sources(
@@ -190,16 +258,16 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(llm.generate_calls), 3)
         extraction_message = llm.generate_calls[0]["messages"][-1]
         extraction_prompt = extraction_message.content
-        self.assertIn("Return one record by default", extraction_prompt)
-        self.assertIn("Return a second only", extraction_prompt)
+        self.assertIn("concise, self-contained free text", extraction_prompt)
+        self.assertIn("one short paragraph", extraction_prompt)
         self.assertIn("Patient: I feel anxious.", extraction_prompt)
         self.assertNotIn("D1U0001", extraction_prompt)
         self.assertNotIn("<source_metadata>", extraction_prompt)
         self.assertNotIn("Examples:", extraction_prompt)
         self.assertNotIn("taking on too many commitments", extraction_prompt)
-        self.assertIn("not patient-reported history", extraction_prompt)
-        self.assertIn("not ordinary emotional, social, or creative risk", extraction_prompt)
-        self.assertIn("only proposed or actually agreed", extraction_prompt)
+        self.assertIn("preserve who reported, observed, suggested", extraction_prompt)
+        self.assertIn("discussed, proposed, agreed", extraction_prompt)
+        self.assertNotIn("Allowed labels", extraction_prompt)
         self.assertLess(extraction_message.cache_prefix_length, 1800)
         self.assertEqual(llm.generate_calls[0]["temperature"], 0.2)
 
@@ -249,11 +317,11 @@ class PipelineTests(unittest.TestCase):
             [4, 2],
         )
 
-    def test_invalid_extraction_retries_once(self):
+    def test_empty_extraction_retries_once(self):
         llm = FakeLLM(
             generations=[
-                "This is not valid.",
-                "CLIENT_REPORT | Patient reported feeling anxious.",
+                "",
+                "The patient reported feeling anxious.",
                 "A supported custom note.",
             ]
         )
@@ -265,6 +333,26 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(result.ledger_stats["retry_count"], 1)
         self.assertEqual(len(result.notes), 1)
+
+    def test_repeated_empty_extraction_falls_back_to_source_block(self):
+        llm = FakeLLM(
+            generations=[
+                "",
+                "",
+                "A supported custom note.",
+            ]
+        )
+        result = generate_notes_with_backend(
+            llm,
+            [source("Patient: I feel anxious.")],
+            [NoteFormatRequest(name="custom", prompt="Write a note.")],
+            verification_mode="off",
+        )
+
+        self.assertEqual(result.ledger_stats["retry_count"], 1)
+        self.assertEqual(result.notes[0].note, "A supported custom note.")
+        self.assertEqual(result.ledger_stats["evidence_records"], 1)
+        self.assertEqual(llm.generate_calls[1]["temperature"], 0.2)
 
     def test_incomplete_render_retries_with_tighter_concision(self):
         llm = FakeLLM(
@@ -354,6 +442,178 @@ class PipelineTests(unittest.TestCase):
         original = build_evidence_cache_key([source("Patient: I feel anxious.")], "model@1")
         edited = build_evidence_cache_key([source("Patient: I feel calmer.")], "model@1")
         self.assertNotEqual(original, edited)
+
+    def test_persistent_document_cache_survives_memory_cache_clear(self):
+        source_material = source("Patient 1: I feel anxious most evenings.")
+        llm = FakeLLM(
+            generations=["CLIENT_REPORT | Patient reported anxiety most evenings."]
+        )
+        backend_factory = Mock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = create_evidence_cache_database(directory, ("source-1",))
+            with patch.dict(
+                os.environ,
+                {GIST_DATABASE_PATH_ENV: str(database_path)},
+            ):
+                first = prepare_evidence_with_backend(
+                    llm,
+                    [source_material],
+                    evidence_cache_key="first-process-memory-key",
+                    evidence_model_identity="evidence-model@revision-1",
+                )
+                clear_evidence_cache()
+                second = prepare_evidence_with_backend(
+                    None,
+                    [source_material],
+                    evidence_cache_key="second-process-memory-key",
+                    evidence_model_identity="evidence-model@revision-1",
+                    evidence_backend_factory=backend_factory,
+                )
+
+                connection = sqlite3.connect(database_path)
+                cached_rows = connection.execute(
+                    "SELECT COUNT(*) FROM evidence_ledger_cache"
+                ).fetchone()[0]
+                connection.close()
+
+        self.assertEqual(second, first)
+        self.assertEqual(cached_rows, 1)
+        backend_factory.assert_not_called()
+        self.assertEqual(len(llm.generate_calls), 1)
+
+    def test_document_edit_reextracts_only_changed_document(self):
+        first_source = identified_source(
+            "source-a",
+            "Patient 1: I feel anxious most evenings.",
+        )
+        second_source = identified_source(
+            "source-b",
+            "Patient 1: I have been sleeping poorly.",
+        )
+        initial_llm = FakeLLM(
+            generations=[
+                "CLIENT_REPORT | Patient reported anxiety most evenings.",
+                "CLIENT_REPORT | Patient reported poor sleep.",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = create_evidence_cache_database(
+                directory,
+                ("source-a", "source-b"),
+            )
+            with patch.dict(
+                os.environ,
+                {GIST_DATABASE_PATH_ENV: str(database_path)},
+            ):
+                prepare_evidence_with_backend(
+                    initial_llm,
+                    [first_source, second_source],
+                    evidence_cache_key="initial-source-set",
+                    evidence_model_identity="evidence-model@revision-1",
+                )
+                clear_evidence_cache()
+
+                edited_llm = FakeLLM(
+                    generations=[
+                        "CLIENT_REPORT | Patient reported improved sleep after changing routines."
+                    ]
+                )
+                ledger = prepare_evidence_with_backend(
+                    edited_llm,
+                    [
+                        first_source,
+                        identified_source(
+                            "source-b",
+                            "Patient 1: I sleep better after changing my evening routine.",
+                        ),
+                    ],
+                    evidence_cache_key="edited-source-set",
+                    evidence_model_identity="evidence-model@revision-1",
+                )
+
+        self.assertEqual(len(initial_llm.generate_calls), 2)
+        self.assertEqual(len(edited_llm.generate_calls), 1)
+        self.assertEqual(
+            [record.claim for record in ledger.records],
+            [
+                "Patient reported anxiety most evenings.",
+                "Patient reported improved sleep after changing routines.",
+            ],
+        )
+
+    def test_deleting_source_cascades_to_evidence_cache(self):
+        source_material = source("Patient 1: I feel anxious most evenings.")
+        llm = FakeLLM(
+            generations=["CLIENT_REPORT | Patient reported anxiety most evenings."]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = create_evidence_cache_database(directory, ("source-1",))
+            with patch.dict(
+                os.environ,
+                {GIST_DATABASE_PATH_ENV: str(database_path)},
+            ):
+                prepare_evidence_with_backend(
+                    llm,
+                    [source_material],
+                    evidence_cache_key="source-set",
+                    evidence_model_identity="evidence-model@revision-1",
+                )
+
+            connection = sqlite3.connect(database_path)
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("DELETE FROM session_inputs WHERE id = ?1", ("source-1",))
+            connection.commit()
+            cached_rows = connection.execute(
+                "SELECT COUNT(*) FROM evidence_ledger_cache"
+            ).fetchone()[0]
+            connection.close()
+
+        self.assertEqual(cached_rows, 0)
+
+    def test_invalid_cached_unit_reference_degrades_to_cache_miss(self):
+        source_material = source("Patient 1: I feel anxious most evenings.")
+        initial_llm = FakeLLM(
+            generations=["The patient reported anxiety most evenings."]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = create_evidence_cache_database(directory, ("source-1",))
+            with patch.dict(
+                os.environ,
+                {GIST_DATABASE_PATH_ENV: str(database_path)},
+            ):
+                prepare_evidence_with_backend(
+                    initial_llm,
+                    [source_material],
+                    evidence_cache_key="initial-source-set",
+                    evidence_model_identity="evidence-model@revision-1",
+                )
+                clear_evidence_cache()
+
+                connection = sqlite3.connect(database_path)
+                connection.execute(
+                    "UPDATE evidence_ledger_cache SET payload_json = ?1",
+                    ('[{"ordinal":1,"unit_ordinals":[999],"records":[]}]',),
+                )
+                connection.commit()
+                connection.close()
+
+                replacement_llm = FakeLLM(
+                    generations=["The patient again reported anxiety most evenings."]
+                )
+                ledger = prepare_evidence_with_backend(
+                    replacement_llm,
+                    [source_material],
+                    evidence_cache_key="new-process-source-set",
+                    evidence_model_identity="evidence-model@revision-1",
+                )
+
+        self.assertEqual(len(replacement_llm.generate_calls), 1)
+        self.assertEqual(
+            ledger.records[0].claim,
+            "The patient again reported anxiety most evenings.",
+        )
 
     def test_complete_bundle_keeps_large_source_excerpt(self):
         ledger = EvidenceLedger(

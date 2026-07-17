@@ -1,8 +1,15 @@
 import { createSessionNote, generateNotes, listNoteFormats } from "./rpc";
 import { getNoteGenerationSources } from "./sessionInputs";
-import { activeOperation, progressBase, progressScale, progressStage } from "./stores";
+import {
+  activeOperation,
+  evidenceModelRecoveryRequested,
+  progressBase,
+  progressScale,
+  progressStage,
+} from "./stores";
 import type { NoteFormatTemplate, Session } from "./types";
 import { loadSettings } from "./settings";
+import { isMissingEvidenceModelError } from "./models";
 
 export interface GenerateDocumentationOptions {
   defaultLlm: string;
@@ -45,16 +52,24 @@ export async function generateSessionDocumentation(
     };
   });
   const settings = await loadSettings();
-  const result = await generateNotes(
-    sources,
-    requestedFormats,
-    options.defaultLlm || undefined,
-    options.thinking,
-    "off",
-    settings.captureNoteDiagnostics
-      ? { capture: true, sessionId: session.id }
-      : undefined,
-  );
+  let result: Awaited<ReturnType<typeof generateNotes>>;
+  try {
+    result = await generateNotes(
+      sources,
+      requestedFormats,
+      options.defaultLlm || undefined,
+      options.thinking,
+      "off",
+      settings.captureNoteDiagnostics
+        ? { capture: true, sessionId: session.id }
+        : undefined,
+    );
+  } catch (e) {
+    if (isMissingEvidenceModelError(e)) {
+      evidenceModelRecoveryRequested.set(true);
+    }
+    throw e;
+  }
 
   for (const generated of result.notes) {
     const note = await createSessionNote(
