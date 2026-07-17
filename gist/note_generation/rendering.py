@@ -66,7 +66,7 @@ def render_note(
         base_messages = build_messages({"prompt": format_request.prompt}, evidence_bundle)
     else:
         base_messages = get_format(format_request.name).build_messages(evidence_bundle)
-    target_words = max(50, min(900, max_tokens // 3))
+    target_words = max(50, min(600, max_tokens // 3))
     messages = _add_concision_constraints(base_messages, target_words, retry=False)
 
     def generate_attempt(attempt_kind: str, attempt_messages: list[ChatMessage]) -> str:
