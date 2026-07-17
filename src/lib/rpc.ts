@@ -1,7 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { DEFAULT_DIARIZATION_SPEAKERS } from "./diarization";
-import type { SidecarProgress, ModelsResult, NoteFormatTemplate, RecordingJob, Session, SessionInput, SessionNote } from "./types";
+import type {
+  GenerateNotesResult,
+  DiagnosticExportResult,
+  ModelsResult,
+  NoteFormatTemplate,
+  NoteGenerationFormat,
+  NoteGenerationSource,
+  RecordingJob,
+  Session,
+  SessionInput,
+  SessionNote,
+  SidecarProgress,
+} from "./types";
 
 export async function startSidecar(): Promise<string> {
   return invoke<string>("start_sidecar");
@@ -21,6 +33,13 @@ export async function cancelSidecar(): Promise<void> {
 
 async function rpcCall<T = unknown>(request: unknown): Promise<T> {
   return invoke<T>("rpc_call", { request: JSON.stringify(request) });
+}
+
+let developerFeaturesPromise: Promise<boolean> | null = null;
+
+export function developerFeaturesEnabled(): Promise<boolean> {
+  developerFeaturesPromise ??= invoke<boolean>("developer_features_enabled");
+  return developerFeaturesPromise;
 }
 
 export async function onProgress(callback: (data: SidecarProgress) => void): Promise<UnlistenFn> {
@@ -77,6 +96,32 @@ export async function generateNote(
     thinking: thinking ?? false,
     prompt: prompt || undefined,
   });
+}
+
+export async function generateNotes(
+  sources: NoteGenerationSource[],
+  formats: NoteGenerationFormat[],
+  model?: string,
+  thinking?: boolean,
+  verificationMode: "off" | "shadow" | "enforce" = "off",
+  diagnostics?: { capture: boolean; sessionId: string },
+): Promise<GenerateNotesResult> {
+  return rpcCall({
+    type: "generate_notes",
+    sources,
+    formats,
+    model: model || undefined,
+    thinking: thinking ?? false,
+    verification_mode: verificationMode,
+    capture_diagnostics: diagnostics?.capture ?? false,
+    diagnostic_session_id: diagnostics?.capture ? diagnostics.sessionId : undefined,
+  });
+}
+
+export async function exportSessionDiagnostics(
+  sessionId: string,
+): Promise<DiagnosticExportResult | null> {
+  return invoke<DiagnosticExportResult | null>("export_session_diagnostics", { sessionId });
 }
 
 export async function downloadModel(model: string): Promise<void> {

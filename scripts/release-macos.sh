@@ -114,7 +114,7 @@ echo "Building, signing, notarizing, and stapling the app and DMG..."
 # Local package commands intentionally remove signing credentials, so the
 # release path calls Tauri directly after preparing the DMG output directory.
 bash scripts/prepare-dmg.sh
-tauri build --bundles app,dmg
+env -u GIST_DEVELOPER_FEATURES tauri build --bundles app,dmg
 
 APP_PATH="$PROJECT_DIR/src-tauri/target/release/bundle/macos/Gist.app"
 if [[ ! -d "$APP_PATH" ]]; then

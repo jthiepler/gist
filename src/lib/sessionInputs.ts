@@ -1,4 +1,4 @@
-import type { Session, SessionInput, SessionInputKind } from "./types";
+import type { NoteGenerationSource, Session, SessionInput, SessionInputKind } from "./types";
 
 export const SESSION_INPUT_LABELS: Record<SessionInputKind, string> = {
   session_transcript: "Session transcript",
@@ -38,6 +38,16 @@ export function formatInputsForNoteGeneration(session: Session): string {
   return inputs
     .map((input) => `## ${getInputLabel(input)}\n\n${input.text.trim()}`)
     .join("\n\n---\n\n");
+}
+
+export function getNoteGenerationSources(session: Session): NoteGenerationSource[] {
+  return getInputsForNotes(session).map((input) => ({
+    id: input.id,
+    kind: input.kind,
+    origin: input.source,
+    title: getInputLabel(input),
+    text: input.text.trim(),
+  }));
 }
 
 export function hasNoteSourceMaterial(session: Session): boolean {

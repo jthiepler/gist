@@ -3,6 +3,11 @@ import test from "node:test";
 import { parseLocalDate } from "../src/lib/date.ts";
 import { isNewSessionRecording } from "../src/lib/releaseGuards.ts";
 import { selectNoteFormats } from "../src/lib/noteGeneration.ts";
+import {
+  createModelState,
+  isMissingEvidenceModelError,
+  missingRequiredLlmModels,
+} from "../src/lib/models.ts";
 
 test("new-session recording classification uses the explicit flag", () => {
   assert.equal(isNewSessionRecording({ isNewSession: true }), true);
@@ -33,4 +38,27 @@ test("regeneration can target one existing note", () => {
     }),
     ["soap"],
   );
+});
+
+test("9B onboarding also requires the 4B evidence model", () => {
+  const models = createModelState(false);
+  assert.deepEqual(missingRequiredLlmModels("qwen-3.5-9b", models), [
+    "qwen-3.5-9b",
+    "qwen-3.5-4b",
+  ]);
+
+  models.llm["qwen-3.5-9b"].downloaded = true;
+  assert.deepEqual(missingRequiredLlmModels("qwen-3.5-9b", models), [
+    "qwen-3.5-4b",
+  ]);
+});
+
+test("missing evidence-model errors trigger recovery", () => {
+  assert.equal(
+    isMissingEvidenceModelError(
+      "The evidence extraction model is required. Download Qwen 3.5 4B in Settings, then try again.",
+    ),
+    true,
+  );
+  assert.equal(isMissingEvidenceModelError("The note could not be generated."), false);
 });

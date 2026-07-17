@@ -23,6 +23,10 @@ const DEFAULT_DIARIZATION_SPEAKERS: i64 = 2;
 const MIN_DIARIZATION_SPEAKERS: i64 = 2;
 const MAX_DIARIZATION_SPEAKERS: i64 = 4;
 
+fn developer_features_available() -> bool {
+    cfg!(debug_assertions) || option_env!("GIST_DEVELOPER_FEATURES") == Some("1")
+}
+
 const SESSION_COLUMNS: &str =
     "id, patient_id, date, start_time, title, session_type, updated_at, created_at";
 
@@ -130,6 +134,15 @@ impl Database {
                 transcription_model TEXT,
                 include_in_notes INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evidence_ledger_cache (
+                source_id TEXT PRIMARY KEY REFERENCES session_inputs(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                model_identity TEXT NOT NULL,
+                pipeline_version TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS settings (
@@ -266,6 +279,12 @@ struct SessionNote {
     note: Option<String>,
     llm_model: Option<String>,
     created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticExportResult {
+    path: String,
+    run_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -474,7 +493,7 @@ const SIDECAR_CANCEL_POLL: std::time::Duration = std::time::Duration::from_milli
 
 fn rpc_timeout(operation_type: &str) -> std::time::Duration {
     match operation_type {
-        "generate_note" => NOTE_GENERATION_TIMEOUT,
+        "generate_note" | "generate_notes" => NOTE_GENERATION_TIMEOUT,
         "transcribe" => TRANSCRIPTION_TIMEOUT,
         "download_model" => MODEL_DOWNLOAD_TIMEOUT,
         _ => DEFAULT_RPC_TIMEOUT,
@@ -581,9 +600,16 @@ fn start_sidecar_process(app: &AppHandle, state: &SharedSidecarState) -> Result<
         .arg("serve")
         .env("DYLD_FALLBACK_LIBRARY_PATH", &dyld_path)
         .env("HF_HUB_CACHE", &model_cache_dir)
+        .env("GIST_DATABASE_PATH", app_dir.join("gist.db"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_file));
+    if developer_features_available() {
+        sidecar_command.env(
+            "GIST_DIAGNOSTICS_DIR",
+            app_dir.join("note-generation-diagnostics"),
+        );
+    }
     let mut child = sidecar_command
         .spawn()
         .map_err(|e| format!("Failed to start sidecar: {}", e))?;
@@ -873,6 +899,16 @@ async fn rpc_call(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let capture_diagnostics = request_object
+            .get("capture_diagnostics")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if capture_diagnostics && !developer_features_available() {
+            return Err("Developer diagnostics are unavailable in release builds".into());
+        }
+        if !capture_diagnostics {
+            request_object.remove("diagnostic_session_id");
+        }
         request_object.insert("request_id".into(), Value::String(request_id.clone()));
         operation_type
     };
@@ -882,7 +918,7 @@ async fn rpc_call(
     // return path, including cancellation and timeout.
     let _sleep_assertion = matches!(
         operation_type.as_str(),
-        "transcribe" | "generate_note" | "download_model"
+        "transcribe" | "generate_note" | "generate_notes" | "download_model"
     )
     .then(|| audio::recorder::SleepAssertion::acquire("Gist is processing session data"));
     {
@@ -1003,6 +1039,11 @@ async fn rpc_call(
     };
 
     result
+}
+
+#[tauri::command]
+async fn developer_features_enabled() -> bool {
+    developer_features_available()
 }
 
 #[tauri::command]
@@ -1204,6 +1245,18 @@ async fn delete_patient(
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let paths = audio_paths_for_patient(&db.conn, &id)?;
+    let session_ids = {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT id FROM sessions WHERE patient_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
     let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM sessions WHERE patient_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
@@ -1213,6 +1266,11 @@ async fn delete_patient(
     drop(db);
     if let Err(error) = remove_managed_audio_files(&app, paths) {
         log::warn!("Patient was deleted, but managed audio cleanup failed: {error}");
+    }
+    for session_id in session_ids {
+        if let Err(error) = remove_session_diagnostics(&app, &session_id) {
+            log::warn!("Patient was deleted, but diagnostic cleanup failed: {error}");
+        }
     }
     Ok(())
 }
@@ -1330,6 +1388,9 @@ async fn delete_session(
     if let Err(error) = remove_managed_audio_files(&app, paths) {
         log::warn!("Session was deleted, but managed audio cleanup failed: {error}");
     }
+    if let Err(error) = remove_session_diagnostics(&app, &id) {
+        log::warn!("Session was deleted, but diagnostic cleanup failed: {error}");
+    }
     Ok(())
 }
 
@@ -1395,6 +1456,12 @@ async fn update_session_input(
     if affected == 0 {
         return Err("Session input not found".into());
     }
+    db.conn
+        .execute(
+            "DELETE FROM evidence_ledger_cache WHERE source_id = ?1",
+            params![data.id],
+        )
+        .map_err(|e| e.to_string())?;
     get_session_input_by_id(&db.conn, &data.id)
 }
 
@@ -1804,6 +1871,92 @@ async fn toggle_note_format_hidden(
 }
 
 // ── File Dialog ───────────────────────────────────────────────────────────
+
+fn note_generation_diagnostics_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("note-generation-diagnostics"))
+}
+
+fn remove_session_diagnostics(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    let directory = note_generation_diagnostics_dir(app)?.join(session_id);
+    if directory.exists() {
+        std::fs::remove_dir_all(directory).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn export_session_diagnostics(
+    app: AppHandle,
+    session_id: String,
+) -> Result<Option<DiagnosticExportResult>, String> {
+    if !developer_features_available() {
+        return Err("Developer diagnostics are unavailable in release builds".into());
+    }
+    Uuid::parse_str(&session_id).map_err(|_| "Invalid session identifier".to_string())?;
+    let directory = note_generation_diagnostics_dir(&app)?.join(&session_id);
+    let mut run_paths = if directory.exists() {
+        std::fs::read_dir(&directory)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    run_paths.sort();
+    if run_paths.is_empty() {
+        return Err("No diagnostic runs have been captured for this session".into());
+    }
+    let runs = run_paths
+        .iter()
+        .map(|path| {
+            let file = File::open(path).map_err(|e| e.to_string())?;
+            serde_json::from_reader::<_, Value>(file).map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let export = serde_json::json!({
+        "schema_version": 1,
+        "exported_at": Local::now().to_rfc3339(),
+        "session_id": session_id,
+        "contains_sensitive_clinical_data": true,
+        "runs": runs,
+    });
+    let contents = serde_json::to_vec_pretty(&export).map_err(|e| e.to_string())?;
+
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("JSON", &["json"])
+        .set_file_name(format!(
+            "gist-session-diagnostics-{}.json",
+            &session_id[..8]
+        ))
+        .save_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let Some(path) = rx.await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).map_err(|e| e.to_string())?;
+    file.write_all(&contents).map_err(|e| e.to_string())?;
+    file.write_all(b"\n").map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())?;
+    Ok(Some(DiagnosticExportResult {
+        path: path.to_string_lossy().into_owned(),
+        run_count: run_paths.len(),
+    }))
+}
 
 #[tauri::command]
 async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
@@ -2257,6 +2410,7 @@ pub fn run() {
             rpc_call,
             is_running,
             cancel_sidecar,
+            developer_features_enabled,
             list_patients,
             create_patient,
             update_patient,
@@ -2276,6 +2430,7 @@ pub fn run() {
             set_setting,
             get_system_memory_bytes,
             pick_audio_file,
+            export_session_diagnostics,
             list_note_formats,
             create_note_format,
             update_note_format,

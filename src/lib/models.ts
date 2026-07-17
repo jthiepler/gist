@@ -34,6 +34,24 @@ export const AVAILABLE_LLM_MODELS: readonly AvailableModel[] = [
 ];
 
 export const DEFAULT_LLM = "qwen-3.5-4b";
+export const EVIDENCE_LLM = DEFAULT_LLM;
+
+export function isMissingEvidenceModelError(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return (
+    message.includes("evidence extraction model is required") ||
+    message.includes("evidence extraction model is not downloaded")
+  );
+}
+
+export function missingRequiredLlmModels(
+  selectedModel: string,
+  models: ModelsResult,
+): string[] {
+  return [...new Set([selectedModel, EVIDENCE_LLM])].filter(
+    (name) => models.llm[name]?.downloaded !== true,
+  );
+}
 
 export function recommendedLlmForMemory(totalMemoryGb: number): string {
   return totalMemoryGb >= 16 ? "qwen-3.5-9b" : DEFAULT_LLM;

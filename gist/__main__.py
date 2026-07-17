@@ -110,7 +110,7 @@ def models():
 
 @models.command(name="list")
 def list_models():
-    """Show all available note-generation models."""
+    """Show all available local language models."""
     click.echo("\nLLM models:")
     for name, spec in LLM_MODELS.items():
         default = " (default)" if spec.default else ""
@@ -122,8 +122,9 @@ def list_models():
 def download(model, kind):
     """Download models from HuggingFace Hub.
 
-    If MODEL is specified, download that note-generation model.
-    If neither is specified, download the default note-generation model.
+    If MODEL is specified, download that language model.
+    If neither is specified, download the default model, which also performs
+    evidence extraction.
     """
     from .downloader import download_model
 

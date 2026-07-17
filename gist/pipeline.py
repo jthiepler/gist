@@ -8,7 +8,8 @@ from typing import Optional
 
 from .audio import cleanup_normalized_audio, normalize_audio_for_pipeline
 from .diarization import DEFAULT_NUM_SPEAKERS
-from .models import DEFAULT_LLM, resolve_model
+from .downloader import is_model_downloaded
+from .models import DEFAULT_LLM, EVIDENCE_LLM, resolve_model
 from .transcription.base import ProgressCallback, TranscriptResult
 from .transcription.factory import create_transcription_backend
 from .transcription.parakeet_backend import resolve_model_path
@@ -294,6 +295,99 @@ def transcribe_audio(
         cleanup_normalized_audio(normalized_audio_path)
 
 
+def generate_notes(
+    sources,
+    formats,
+    llm_model: str = "qwen-3.5-4b",
+    max_tokens: int = 4096,
+    thinking: bool = False,
+    verification_mode: str = "off",
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    diagnostic_capture=None,
+):
+    from .note_generation.pipeline import (
+        build_evidence_cache_key,
+        generate_notes_from_ledger_with_backend,
+        prepare_evidence_with_backend,
+    )
+
+    sources = tuple(sources)
+    formats = tuple(formats)
+    spec = resolve_model(llm_model, "llm")
+    evidence_spec = resolve_model(EVIDENCE_LLM, "llm")
+    if diagnostic_capture:
+        diagnostic_capture.set_stage(
+            "model",
+            {
+                "note_model": {
+                    "requested_model": llm_model,
+                    "repository": spec.hf_repo,
+                    "revision": spec.revision,
+                },
+                "evidence_model": {
+                    "model": EVIDENCE_LLM,
+                    "repository": evidence_spec.hf_repo,
+                    "revision": evidence_spec.revision,
+                },
+                "max_tokens": max_tokens,
+                "thinking": thinking,
+                "verification_mode": verification_mode,
+            },
+        )
+    log.info(
+        "event=note_generation_pipeline_started model=%s source_count=%d format_count=%d source_chars=%d thinking=%s verification_mode=%s",
+        llm_model,
+        len(sources),
+        len(formats),
+        sum(len(source.text) for source in sources),
+        thinking,
+        verification_mode,
+    )
+    evidence_cache_key = build_evidence_cache_key(
+        sources,
+        f"{evidence_spec.hf_repo}@{evidence_spec.revision}",
+    )
+    if not is_model_downloaded(EVIDENCE_LLM, "llm"):
+        raise FileNotFoundError(
+            "The evidence extraction model is not downloaded. "
+            "Download Qwen 3.5 4B in Settings, then try again."
+        )
+    ledger = prepare_evidence_with_backend(
+        None,
+        sources,
+        evidence_cache_key=evidence_cache_key,
+        evidence_model_identity=f"{evidence_spec.hf_repo}@{evidence_spec.revision}",
+        evidence_backend_factory=lambda: _get_cached_llm(
+            evidence_spec.hf_repo,
+            evidence_spec.revision,
+        ),
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+        diagnostic_capture=diagnostic_capture,
+    )
+
+    note_llm = _get_cached_llm(spec.hf_repo, spec.revision)
+    result = generate_notes_from_ledger_with_backend(
+        note_llm,
+        ledger,
+        formats,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        verification_mode=verification_mode,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+        diagnostic_capture=diagnostic_capture,
+    )
+    log.info(
+        "event=note_generation_pipeline_completed note_count=%d failure_count=%d evidence_records=%d",
+        len(result.notes),
+        len(result.failures),
+        result.ledger_stats.get("evidence_records", 0),
+    )
+    return result
+
+
 def generate_note(
     transcript: str,
     format_name: str = "soap",
@@ -304,45 +398,27 @@ def generate_note(
     prompt: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> str:
-    from .formats.registry import get_format
-    from .formats.defaults import build_messages
+    from .note_generation.types import NoteFormatRequest, NoteGenerationSource
 
-    spec = resolve_model(llm_model, "llm")
-    log.info(
-        "event=note_generation_pipeline_started model=%s format=%s source_chars=%d thinking=%s prompt_provided=%s",
-        llm_model,
-        format_name,
-        len(transcript),
-        thinking,
-        prompt is not None,
-    )
-
-    if progress_callback:
-        progress_callback(0, "Preparing note generation...")
-
-    llm = _get_cached_llm(spec.hf_repo, spec.revision)
-
-    if progress_callback:
-        progress_callback(30, "Generating note...")
-
-    if cancel_event and cancel_event.is_set():
-        raise InterruptedError("Note generation cancelled")
-
-    if prompt:
-        messages = build_messages({"prompt": prompt}, transcript)
-    else:
-        messages = get_format(format_name).build_messages(transcript)
-    log.info("event=note_generation_messages_ready message_count=%d", len(messages))
-
-    note = llm.generate(
-        messages=messages,
+    result = generate_notes(
+        sources=(
+            NoteGenerationSource(
+                id="source-1",
+                kind="session_transcript",
+                origin="legacy",
+                title="Session transcript",
+                text=transcript,
+            ),
+        ),
+        formats=(NoteFormatRequest(name=format_name, prompt=prompt),),
+        llm_model=llm_model,
         max_tokens=max_tokens,
         thinking=thinking,
+        verification_mode="off",
+        progress_callback=progress_callback,
         cancel_event=cancel_event,
     )
-
-    if progress_callback:
-        progress_callback(100, "Finalizing note...")
-
-    log.info("event=note_generation_pipeline_completed note_chars=%d", len(note))
-    return note
+    if result.notes:
+        return result.notes[0].note
+    message = result.failures[0].message if result.failures else "The note could not be generated."
+    raise RuntimeError(message)

@@ -40,6 +40,7 @@ LLM_MODELS: Dict[str, ModelSpec] = {
 }
 
 DEFAULT_LLM = "qwen-3.5-4b"
+EVIDENCE_LLM = DEFAULT_LLM
 
 
 def resolve_model(name: str, kind: str) -> ModelSpec:
