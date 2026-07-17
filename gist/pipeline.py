@@ -294,6 +294,70 @@ def transcribe_audio(
         cleanup_normalized_audio(normalized_audio_path)
 
 
+def generate_notes(
+    sources,
+    formats,
+    llm_model: str = "qwen-3.5-4b",
+    max_tokens: int = 4096,
+    thinking: bool = False,
+    verification_mode: str = "off",
+    progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    diagnostic_capture=None,
+):
+    from .note_generation.pipeline import generate_notes_with_backend
+    from .note_generation.pipeline import build_evidence_cache_key
+
+    sources = tuple(sources)
+    formats = tuple(formats)
+    spec = resolve_model(llm_model, "llm")
+    if diagnostic_capture:
+        diagnostic_capture.set_stage(
+            "model",
+            {
+                "requested_model": llm_model,
+                "repository": spec.hf_repo,
+                "revision": spec.revision,
+                "max_tokens": max_tokens,
+                "thinking": thinking,
+                "verification_mode": verification_mode,
+            },
+        )
+    log.info(
+        "event=note_generation_pipeline_started model=%s source_count=%d format_count=%d source_chars=%d thinking=%s verification_mode=%s",
+        llm_model,
+        len(sources),
+        len(formats),
+        sum(len(source.text) for source in sources),
+        thinking,
+        verification_mode,
+    )
+    llm = _get_cached_llm(spec.hf_repo, spec.revision)
+    evidence_cache_key = build_evidence_cache_key(
+        sources,
+        f"{spec.hf_repo}@{spec.revision}",
+    )
+    result = generate_notes_with_backend(
+        llm,
+        sources,
+        formats,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        verification_mode=verification_mode,
+        evidence_cache_key=evidence_cache_key,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+        diagnostic_capture=diagnostic_capture,
+    )
+    log.info(
+        "event=note_generation_pipeline_completed note_count=%d failure_count=%d evidence_records=%d",
+        len(result.notes),
+        len(result.failures),
+        result.ledger_stats.get("evidence_records", 0),
+    )
+    return result
+
+
 def generate_note(
     transcript: str,
     format_name: str = "soap",
@@ -304,45 +368,27 @@ def generate_note(
     prompt: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> str:
-    from .formats.registry import get_format
-    from .formats.defaults import build_messages
+    from .note_generation.types import NoteFormatRequest, NoteGenerationSource
 
-    spec = resolve_model(llm_model, "llm")
-    log.info(
-        "event=note_generation_pipeline_started model=%s format=%s source_chars=%d thinking=%s prompt_provided=%s",
-        llm_model,
-        format_name,
-        len(transcript),
-        thinking,
-        prompt is not None,
-    )
-
-    if progress_callback:
-        progress_callback(0, "Preparing note generation...")
-
-    llm = _get_cached_llm(spec.hf_repo, spec.revision)
-
-    if progress_callback:
-        progress_callback(30, "Generating note...")
-
-    if cancel_event and cancel_event.is_set():
-        raise InterruptedError("Note generation cancelled")
-
-    if prompt:
-        messages = build_messages({"prompt": prompt}, transcript)
-    else:
-        messages = get_format(format_name).build_messages(transcript)
-    log.info("event=note_generation_messages_ready message_count=%d", len(messages))
-
-    note = llm.generate(
-        messages=messages,
+    result = generate_notes(
+        sources=(
+            NoteGenerationSource(
+                id="source-1",
+                kind="session_transcript",
+                origin="legacy",
+                title="Session transcript",
+                text=transcript,
+            ),
+        ),
+        formats=(NoteFormatRequest(name=format_name, prompt=prompt),),
+        llm_model=llm_model,
         max_tokens=max_tokens,
         thinking=thinking,
+        verification_mode="off",
+        progress_callback=progress_callback,
         cancel_event=cancel_event,
     )
-
-    if progress_callback:
-        progress_callback(100, "Finalizing note...")
-
-    log.info("event=note_generation_pipeline_completed note_chars=%d", len(note))
-    return note
+    if result.notes:
+        return result.notes[0].note
+    message = result.failures[0].message if result.failures else "The note could not be generated."
+    raise RuntimeError(message)

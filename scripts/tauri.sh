@@ -29,6 +29,7 @@ if [[ "${1:-}" == "build" ]]; then
     -u TAURI_SIGNING_PRIVATE_KEY \
     -u TAURI_SIGNING_PRIVATE_KEY_PATH \
     -u TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+    GIST_DEVELOPER_FEATURES=1 \
     tauri "$@" --config "$DEV_CONFIG"
 fi
 

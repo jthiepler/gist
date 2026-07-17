@@ -7,6 +7,14 @@ from typing import List, Optional
 import threading
 
 
+class GenerationIncompleteError(RuntimeError):
+    """The model produced output but did not complete it with a normal stop."""
+
+    def __init__(self, message: str, partial_output: str | None = None):
+        super().__init__(message)
+        self.partial_output = partial_output
+
+
 @dataclass
 class ChatMessage:
     role: str
@@ -42,6 +50,10 @@ class LLMBackend(ABC):
         max_tokens: int = 16,
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
+        ...
+
+    @abstractmethod
+    def count_tokens(self, text: str) -> int:
         ...
 
     @abstractmethod

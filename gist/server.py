@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 from typing import Any, Dict, Optional
+from uuid import UUID
 
 from .downloader import delete_model, download_model, is_model_downloaded
 from .diarization import (
@@ -22,7 +23,9 @@ from .models import (
     DEFAULT_LLM,
     LLM_MODELS,
 )
-from .pipeline import generate_note, release_cached_llm, transcribe_audio
+from .pipeline import generate_note, generate_notes, release_cached_llm, transcribe_audio
+from .note_generation.diagnostics import create_diagnostic_capture
+from .note_generation.types import NoteFormatRequest, NoteGenerationSource
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +34,17 @@ _cancel_event = threading.Event()
 # Request queue — stdin reader thread puts messages here, main thread processes
 _request_queue: "queue.Queue[Optional[dict]]" = queue.Queue()
 _active_request_id: Optional[str] = None
+
+
+def _save_diagnostic_capture(capture: Any) -> None:
+    try:
+        capture.save()
+    except Exception as error:
+        _log_event(
+            "note_generation_diagnostics",
+            "save_failed",
+            error_type=type(error).__name__,
+        )
 
 
 def _log_event(operation: str, event: str, started_at: Optional[float] = None, **fields: Any) -> None:
@@ -136,6 +150,63 @@ def _params_for(msg: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
             raise ValueError("'max_tokens' must be an integer between 1 and 4096")
         if not isinstance(params.get("thinking", False), bool):
             raise ValueError("'thinking' must be true or false")
+    elif msg_type == "generate_notes":
+        sources = params.get("sources")
+        if not isinstance(sources, list) or not 1 <= len(sources) <= 50:
+            raise ValueError("'sources' must contain between 1 and 50 source objects")
+        seen_source_ids: set[str] = set()
+        for source in sources:
+            if not isinstance(source, dict):
+                raise ValueError("Every source must be a JSON object")
+            for name in ("id", "kind", "origin", "title", "text"):
+                if not isinstance(source.get(name), str):
+                    raise ValueError(f"Every source '{name}' must be a string")
+            if not source["id"].strip() or source["id"] in seen_source_ids:
+                raise ValueError("Source ids must be non-empty and unique")
+            if not source["text"].strip():
+                raise ValueError("Every source must contain non-empty text")
+            seen_source_ids.add(source["id"])
+
+        formats = params.get("formats")
+        if not isinstance(formats, list) or not 1 <= len(formats) <= 20:
+            raise ValueError("'formats' must contain between 1 and 20 format objects")
+        seen_formats: set[str] = set()
+        for format_request in formats:
+            if not isinstance(format_request, dict):
+                raise ValueError("Every format must be a JSON object")
+            name = format_request.get("name")
+            prompt = format_request.get("prompt")
+            if not isinstance(name, str) or not name.strip() or name in seen_formats:
+                raise ValueError("Format names must be non-empty and unique")
+            if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
+                raise ValueError("A supplied format prompt must be a non-empty string")
+            seen_formats.add(name)
+        optional_string("model")
+        optional_string("verification_mode")
+        if params.get("verification_mode", "off") not in {"off", "shadow", "enforce"}:
+            raise ValueError("'verification_mode' must be 'off', 'shadow', or 'enforce'")
+        max_tokens = params.get("max_tokens", 4096)
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 4096:
+            raise ValueError("'max_tokens' must be an integer between 1 and 4096")
+        if not isinstance(params.get("thinking", False), bool):
+            raise ValueError("'thinking' must be true or false")
+        capture_diagnostics = params.get("capture_diagnostics", False)
+        if not isinstance(capture_diagnostics, bool):
+            raise ValueError("'capture_diagnostics' must be true or false")
+        diagnostic_session_id = params.get("diagnostic_session_id")
+        if capture_diagnostics:
+            if not isinstance(diagnostic_session_id, str):
+                raise ValueError(
+                    "'diagnostic_session_id' must be supplied when diagnostics are enabled"
+                )
+            try:
+                UUID(diagnostic_session_id)
+            except ValueError as error:
+                raise ValueError("'diagnostic_session_id' must be a UUID") from error
+        elif diagnostic_session_id is not None:
+            raise ValueError(
+                "'diagnostic_session_id' is only accepted when diagnostics are enabled"
+            )
     elif msg_type in {"download_model", "delete_model"}:
         optional_string("model")
         if params.get("kind", "llm") != "llm":
@@ -374,6 +445,102 @@ def _handle_generate_note(params: Dict[str, Any]):
         _send({"type": "error", "message": _user_facing_error("note_generation", e)})
 
 
+def _handle_generate_notes(params: Dict[str, Any]):
+    llm_model = params.get("model", DEFAULT_LLM)
+    max_tokens = params.get("max_tokens", 4096)
+    thinking = params.get("thinking", False)
+    verification_mode = params.get("verification_mode", "off")
+    capture_diagnostics = params.get("capture_diagnostics", False)
+    diagnostic_capture = (
+        create_diagnostic_capture(params.get("diagnostic_session_id"))
+        if capture_diagnostics
+        else None
+    )
+    if capture_diagnostics and diagnostic_capture is None:
+        raise PermissionError("Developer diagnostics are not enabled for this sidecar process.")
+    sources = tuple(
+        NoteGenerationSource(
+            id=source["id"],
+            kind=source["kind"],
+            origin=source["origin"],
+            title=source["title"],
+            text=source["text"],
+        )
+        for source in params["sources"]
+    )
+    formats = tuple(
+        NoteFormatRequest(name=format_request["name"], prompt=format_request.get("prompt"))
+        for format_request in params["formats"]
+    )
+    started_at = time.monotonic()
+    if diagnostic_capture:
+        diagnostic_capture.set_request(
+            {
+                "request_id": _active_request_id,
+                "sources": sources,
+                "formats": formats,
+                "model": llm_model,
+                "max_tokens": max_tokens,
+                "thinking": thinking,
+                "verification_mode": verification_mode,
+            }
+        )
+    _log_event(
+        "note_generation",
+        "started",
+        model=llm_model,
+        format_count=len(formats),
+        source_count=len(sources),
+        source_chars=sum(len(source.text) for source in sources),
+        thinking=thinking,
+        verification_mode=verification_mode,
+    )
+    progress_log = _ProgressTracker("note_generation")
+
+    def progress(pct, stage):
+        progress_log.report(pct, stage)
+        _send_progress(pct, stage)
+
+    try:
+        result = generate_notes(
+            sources=sources,
+            formats=formats,
+            llm_model=llm_model,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            verification_mode=verification_mode,
+            progress_callback=progress,
+            cancel_event=_cancel_event,
+            diagnostic_capture=diagnostic_capture,
+        )
+        payload = result.to_dict()
+        if diagnostic_capture:
+            diagnostic_capture.finish("completed")
+            _save_diagnostic_capture(diagnostic_capture)
+        _send({"type": "result", **payload})
+        _log_event(
+            "note_generation",
+            "completed",
+            started_at,
+            model=llm_model,
+            note_count=len(result.notes),
+            failure_count=len(result.failures),
+            evidence_records=result.ledger_stats.get("evidence_records", 0),
+        )
+    except InterruptedError:
+        if diagnostic_capture:
+            diagnostic_capture.finish("cancelled")
+            _save_diagnostic_capture(diagnostic_capture)
+        _log_event("note_generation", "cancelled", started_at, model=llm_model)
+        _send({"type": "error", "message": "Note generation cancelled"})
+    except Exception as e:
+        if diagnostic_capture:
+            diagnostic_capture.finish("failed", e)
+            _save_diagnostic_capture(diagnostic_capture)
+        _log_failure("note_generation", e, started_at, model=llm_model)
+        _send({"type": "error", "message": _user_facing_error("note_generation", e)})
+
+
 def _handle_download_model(params: Dict[str, Any]):
     model_name = params.get("model", DEFAULT_LLM)
     kind = params.get("kind", "llm")
@@ -480,6 +647,8 @@ def run_server():
                 _handle_transcribe(params)
             elif msg_type == "generate_note":
                 _handle_generate_note(params)
+            elif msg_type == "generate_notes":
+                _handle_generate_notes(params)
             elif msg_type == "download_model":
                 _handle_download_model(params)
             elif msg_type == "delete_model":

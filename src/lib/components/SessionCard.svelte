@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { ask, confirm } from "@tauri-apps/plugin-dialog";
+  import { ask, confirm, message } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { renderSafeMarkdown } from "$lib/markdown";
   import { formatLocalDate } from "$lib/date";
@@ -10,6 +10,8 @@
     createSessionInput,
     createSessionNote,
     deleteSessionInput,
+    developerFeaturesEnabled,
+    exportSessionDiagnostics,
     getSession,
     listAudioDevices,
     listNoteFormats,
@@ -119,6 +121,7 @@
   let initializedSessionId = $state<string | null>(null);
   let previousNoteCount = $state(0);
   let inlineRecordingStarted = $state(false);
+  let developerFeatures = $state(false);
   let noteFormats = $state<NoteFormatTemplate[]>([]);
   let noteFormatsLoading = $state(false);
   let generatingFormat = $state<string | null>(null);
@@ -264,6 +267,12 @@
     inputAudioPath = "";
     diarizeInput = DEFAULT_DIARIZATION_ENABLED;
     diarizationSpeakers = DEFAULT_DIARIZATION_SPEAKERS;
+  });
+
+  $effect(() => {
+    void developerFeaturesEnabled()
+      .then((enabled) => (developerFeatures = enabled))
+      .catch(() => (developerFeatures = false));
   });
 
   $effect(() => {
@@ -709,6 +718,34 @@
     const settings = await loadSettings();
     defaultLlm = settings.defaultLlm;
     confirmRecordingConsent = settings.confirmRecordingConsent;
+  }
+
+  async function exportDiagnostics() {
+    openSessionMenu = false;
+    const approved = await ask(
+      "This export contains the complete transcript, intermediate model outputs, prompts, and generated notes. Keep it as securely as the original clinical record.",
+      {
+        title: "Export sensitive developer diagnostics?",
+        kind: "warning",
+        okLabel: "Choose export location",
+        cancelLabel: "Cancel",
+      },
+    );
+    if (!approved) return;
+    try {
+      const result = await exportSessionDiagnostics(session.id);
+      if (result) {
+        await message(
+          `Exported ${result.run_count} diagnostic run${result.run_count === 1 ? "" : "s"}.`,
+          { title: "Diagnostics exported", kind: "info" },
+        );
+      }
+    } catch (error) {
+      await message(String(error), {
+        title: "Diagnostics could not be exported",
+        kind: "error",
+      });
+    }
   }
 
   async function loadAudioDevices() {
@@ -1189,6 +1226,18 @@
         </button>
         {#if openSessionMenu}
           <div class="action-menu-popover" role="menu" aria-label="Session actions">
+            {#if developerFeatures}
+              <button
+                class="action-menu-item"
+                role="menuitem"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  void exportDiagnostics();
+                }}
+              >
+                Export generation diagnostics
+              </button>
+            {/if}
             <button
               class="action-menu-item danger"
               role="menuitem"

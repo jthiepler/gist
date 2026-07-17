@@ -89,3 +89,54 @@ export interface NoteFormatTemplate {
   hidden: boolean;
   created_at: string;
 }
+
+export interface NoteGenerationSource {
+  id: string;
+  kind: string;
+  origin: string;
+  title: string;
+  text: string;
+}
+
+export interface NoteGenerationFormat {
+  name: string;
+  prompt?: string;
+}
+
+export interface NoteVerificationSummary {
+  claims_checked: number;
+  supported: number;
+  partly_supported: number;
+  unsupported: number;
+  contradicted: number;
+  claims_removed: number;
+}
+
+export interface GeneratedNoteResult {
+  format: string;
+  note: string;
+  verification: NoteVerificationSummary;
+}
+
+export interface NoteGenerationFailure {
+  format: string;
+  message: string;
+}
+
+export interface GenerateNotesResult {
+  notes: GeneratedNoteResult[];
+  failures: NoteGenerationFailure[];
+  ledger_stats: {
+    documents: number;
+    units: number;
+    blocks: number;
+    evidence_records: number;
+    retry_count: number;
+    evidence_tokens: number;
+  };
+}
+
+export interface DiagnosticExportResult {
+  path: string;
+  run_count: number;
+}

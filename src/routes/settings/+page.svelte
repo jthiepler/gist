@@ -42,6 +42,8 @@
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let saveQueue: Promise<void> = Promise.resolve();
   let confirmRecordingConsent = $state(true);
+  let developerFeatures = $state(false);
+  let captureNoteDiagnostics = $state(false);
   let settingVersions = new Map<string, number>();
   let sidecarAvailable = false;
   let modelRefreshInFlight = false;
@@ -90,6 +92,8 @@
     ]);
     if (s.defaultLlm) selectedLlm = s.defaultLlm;
     confirmRecordingConsent = s.confirmRecordingConsent;
+    developerFeatures = s.developerFeaturesEnabled;
+    captureNoteDiagnostics = s.captureNoteDiagnostics;
     appearance.set(s.appearance);
 
     sidecarAvailable = ok;
@@ -203,6 +207,22 @@
       settingVersions.get("confirm_recording_consent") === version
     ) {
       confirmRecordingConsent = previous;
+    }
+  }
+
+  async function toggleNoteDiagnostics() {
+    if (!developerFeatures) return;
+    const previous = captureNoteDiagnostics;
+    const version = (settingVersions.get("capture_note_generation_diagnostics") ?? 0) + 1;
+    settingVersions.set("capture_note_generation_diagnostics", version);
+    captureNoteDiagnostics = !captureNoteDiagnostics;
+    if (
+      !(await persistSetting(
+        "capture_note_generation_diagnostics",
+        String(captureNoteDiagnostics),
+      )) && settingVersions.get("capture_note_generation_diagnostics") === version
+    ) {
+      captureNoteDiagnostics = previous;
     }
   }
 
@@ -337,6 +357,33 @@
   </div>
 
 </div>
+
+{#if developerFeatures}
+  <div class="settings-section">
+    <h3>Developer diagnostics</h3>
+    <p class="settings-help">
+      Local developer builds only. Captured runs contain complete clinical source material, model prompts,
+      intermediate evidence, and generated notes. They remain on this Mac until the session is deleted.
+    </p>
+    <div class="settings-row">
+      <div>
+        <div class="setting-label">Capture note-generation pipeline</div>
+        <div class="setting-desc">Save every stage of future note generations so it can be exported from the session menu.</div>
+      </div>
+      <button
+        type="button"
+        class="toggle"
+        class:active={captureNoteDiagnostics}
+        role="switch"
+        aria-checked={captureNoteDiagnostics}
+        aria-label="Capture note-generation pipeline"
+        onclick={toggleNoteDiagnostics}
+      >
+        <div class="toggle-knob"></div>
+      </button>
+    </div>
+  </div>
+{/if}
 
 <div class="settings-section">
   <h3>Appearance</h3>

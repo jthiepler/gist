@@ -12,7 +12,7 @@ from mlx_lm import load, stream_generate
 from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import make_prompt_cache
 
-from .base import ChatMessage, LLMBackend
+from .base import ChatMessage, GenerationIncompleteError, LLMBackend
 
 log = logging.getLogger(__name__)
 
@@ -240,12 +240,16 @@ class MLXBackend(LLMBackend):
         if not text:
             raise RuntimeError("The model returned an empty note. Please try again.")
         if finish_reason == "length":
-            raise RuntimeError(
+            raise GenerationIncompleteError(
                 "The note reached the generation limit and may be incomplete. "
-                "Use shorter source material or a more concise template and try again."
+                "Use shorter source material or a more concise template and try again.",
+                partial_output=text,
             )
         if finish_reason != "stop":
-            raise RuntimeError("The model stopped without completing the note. Please try again.")
+            raise GenerationIncompleteError(
+                "The model stopped without completing the note. Please try again.",
+                partial_output=text,
+            )
         log.info(
             "event=mlx_generation_completed finish_reason=%s output_chars=%d",
             finish_reason,
@@ -314,6 +318,11 @@ class MLXBackend(LLMBackend):
             finish_reason,
         )
         return text
+
+    def count_tokens(self, text: str) -> int:
+        if self.tokenizer is None:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
 
     def cleanup(self):
         self._prompt_cache_entry = None

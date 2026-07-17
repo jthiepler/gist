@@ -1,7 +1,8 @@
-import { createSessionNote, generateNote, listNoteFormats } from "./rpc";
-import { formatInputsForNoteGeneration } from "./sessionInputs";
+import { createSessionNote, generateNotes, listNoteFormats } from "./rpc";
+import { getNoteGenerationSources } from "./sessionInputs";
 import { activeOperation, progressBase, progressScale, progressStage } from "./stores";
 import type { NoteFormatTemplate, Session } from "./types";
+import { loadSettings } from "./settings";
 
 export interface GenerateDocumentationOptions {
   defaultLlm: string;
@@ -18,7 +19,7 @@ export async function generateSessionDocumentation(
   const selectedFormats = [...new Set(formats)].sort((a, b) => a.localeCompare(b));
   if (selectedFormats.length === 0) return session;
 
-  const sourceMaterial = formatInputsForNoteGeneration(session);
+  const sources = getNoteGenerationSources(session);
   let templates: NoteFormatTemplate[] = [];
   try {
     templates = await listNoteFormats();
@@ -26,44 +27,57 @@ export async function generateSessionDocumentation(
     // Built-in prompts remain available in the sidecar when templates cannot load.
   }
 
-  const totalNotes = selectedFormats.length;
-  const noteRange = 70;
   let updatedSession = session;
 
-  for (let index = 0; index < totalNotes; index += 1) {
-    const format = selectedFormats[index];
-    const label = `${options.verb} ${format.toUpperCase()} note (${index + 1}/${totalNotes})...`;
-    progressStage.set(label);
-    activeOperation.set({ type: "generate_note", label });
-    progressBase.set(30 + Math.round((index / totalNotes) * noteRange));
-    progressScale.set(Math.round(noteRange / totalNotes));
+  const label = selectedFormats.length === 1
+    ? `${options.verb} ${selectedFormats[0].toUpperCase()} note...`
+    : `${options.verb} ${selectedFormats.length} notes...`;
+  progressStage.set(label);
+  activeOperation.set({ type: "generate_note", label });
+  progressBase.set(30);
+  progressScale.set(70);
 
-    try {
-      const template = templates.find((item) => item.name === format);
-      const result = await generateNote(
-        sourceMaterial,
-        format,
-        options.defaultLlm || undefined,
-        options.thinking,
-        template?.prompt,
-      );
-      const note = await createSessionNote(
-        session.id,
-        format,
-        result.note,
-        options.defaultLlm || null,
-      );
-      updatedSession = {
-        ...updatedSession,
-        notes: [
-          ...updatedSession.notes.filter((existing) => existing.format !== note.format),
-          note,
-        ].sort((a, b) => a.format.localeCompare(b.format)),
-      };
-      options.onSessionUpdate?.(updatedSession);
-    } catch (error) {
-      throw new Error(`${format.toUpperCase()} note generation failed: ${String(error)}`);
-    }
+  const requestedFormats = selectedFormats.map((format) => {
+    const template = templates.find((item) => item.name === format);
+    return {
+      name: format,
+      prompt: template?.prompt,
+    };
+  });
+  const settings = await loadSettings();
+  const result = await generateNotes(
+    sources,
+    requestedFormats,
+    options.defaultLlm || undefined,
+    options.thinking,
+    "off",
+    settings.captureNoteDiagnostics
+      ? { capture: true, sessionId: session.id }
+      : undefined,
+  );
+
+  for (const generated of result.notes) {
+    const note = await createSessionNote(
+      session.id,
+      generated.format,
+      generated.note,
+      options.defaultLlm || null,
+    );
+    updatedSession = {
+      ...updatedSession,
+      notes: [
+        ...updatedSession.notes.filter((existing) => existing.format !== note.format),
+        note,
+      ].sort((a, b) => a.format.localeCompare(b.format)),
+    };
+    options.onSessionUpdate?.(updatedSession);
+  }
+
+  if (result.failures.length > 0) {
+    const details = result.failures
+      .map((failure) => `${failure.format.toUpperCase()}: ${failure.message}`)
+      .join("; ");
+    throw new Error(details);
   }
 
   return updatedSession;
