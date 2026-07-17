@@ -109,11 +109,14 @@ button, input, select, textarea, a {
   display: grid;
   place-items: center;
   padding: 24px;
+  overflow-y: auto;
   background: rgba(23, 33, 30, 0.28);
 }
 
 .feedback-prompt-card {
   width: min(430px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
   padding: 28px;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -495,6 +498,7 @@ button, input, select, textarea, a {
 
 .main-content {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
   padding: 32px 40px;
 }
@@ -573,6 +577,9 @@ button, input, select, textarea, a {
   z-index: 20;
   display: grid;
   min-width: 150px;
+  max-width: calc(100vw - 32px);
+  max-height: min(320px, calc(100vh - 64px));
+  overflow: auto;
   padding: 6px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -1044,6 +1051,9 @@ button, input, select, textarea, a {
   z-index: 30;
   display: grid;
   min-width: 150px;
+  max-width: calc(100vw - 32px);
+  max-height: min(320px, calc(100vh - 64px));
+  overflow: auto;
   padding: 6px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -1066,7 +1076,8 @@ button, input, select, textarea, a {
   font-size: 13px;
   font-weight: 500;
   text-align: left;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .action-menu-item:hover {
@@ -1547,6 +1558,25 @@ button, input, select, textarea, a {
 .editor-pane-header { min-height: 40px; }
 .editor-pane-title { font-size: 13px; letter-spacing: 0.04em; }
 
+/* Keep a note inside its session when the window height changes. */
+.focus-mode .editor-pane {
+  height: min(62vh, 620px);
+  overflow: hidden;
+}
+
+.focus-mode .rendered-content,
+.focus-mode .clinical-editor {
+  min-height: 0;
+  max-height: none;
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+
+.focus-mode .clinical-editor {
+  height: auto;
+  resize: none;
+}
+
 /* Keep each side of the split workspace contained and independently scrollable. */
 .compare-mode .editor-pane {
   height: min(62vh, 620px);
@@ -1991,6 +2021,9 @@ button, input, select, textarea, a {
 }
 
 .markdown-content table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
   width: 100%;
   margin: 0.8em 0;
@@ -2002,6 +2035,7 @@ button, input, select, textarea, a {
   border: 1px solid var(--border);
   padding: 6px 10px;
   text-align: left;
+  overflow-wrap: anywhere;
 }
 
 .markdown-content th {
@@ -2138,6 +2172,7 @@ button, input, select, textarea, a {
   display: flex;
   width: fit-content;
   max-width: 100%;
+  overflow-x: auto;
   gap: 2px;
   padding: 3px;
   border: 1px solid var(--border);
@@ -2534,6 +2569,8 @@ textarea {
   right: 24px;
   z-index: 1003;
   width: min(420px, calc(100vw - 48px));
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
   padding: 17px 18px;
   border: 1px solid var(--accent);
   border-radius: 10px;
@@ -2649,9 +2686,11 @@ textarea {
   font-weight: 600;
   color: var(--text);
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 8px;
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
 .recording-card-actions {
