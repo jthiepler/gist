@@ -3219,6 +3219,30 @@ textarea {
   color: var(--accent);
 }
 
+.visibility-toggle {
+  position: relative;
+}
+
+.visibility-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+
+.visibility-icon-action { display: none; }
+
+.visibility-toggle:hover .visibility-icon-default,
+.visibility-toggle:focus-visible .visibility-icon-default {
+  display: none;
+}
+
+.visibility-toggle:hover .visibility-icon-action,
+.visibility-toggle:focus-visible .visibility-icon-action {
+  display: inline-flex;
+}
+
 .template-editor-label {
   display: block;
   margin-bottom: 6px;
