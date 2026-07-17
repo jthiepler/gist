@@ -272,6 +272,26 @@ Required output format:
             </div>
             <div class="template-actions">
               <button
+                class="icon-btn visibility-toggle"
+                onclick={() => toggleHidden(fmt)}
+                title={fmt.hidden ? "Show note type" : "Hide note type"}
+                aria-label={fmt.hidden ? `Show ${fmt.name}` : `Hide ${fmt.name}`}
+                aria-pressed={!fmt.hidden}
+              >
+                <span class="visibility-icon visibility-icon-default" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
+                    <circle cx="12" cy="12" r="2.5" />
+                  </svg>
+                </span>
+                <span class="visibility-icon visibility-icon-action" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
+                    <path d="m4 4 16 16" />
+                  </svg>
+                </span>
+              </button>
+              <button
                 class="btn btn-sm"
                 class:preview-active={previewId === fmt.id}
                 onclick={() => previewId = previewId === fmt.id ? null : fmt.id}
@@ -295,7 +315,6 @@ Required output format:
                 {#if openTemplateMenu === fmt.id}
                   <div class="action-menu-popover">
                     <button class="action-menu-item" onclick={() => duplicateFormat(fmt)}>Duplicate</button>
-                    <button class="action-menu-item" onclick={() => toggleHidden(fmt)}>Hide</button>
                     {#if fmt.is_builtin}
                       <button class="action-menu-item" onclick={() => resetFormat(fmt)}>Reset</button>
                     {:else}
@@ -336,6 +355,26 @@ Required output format:
                 </div>
               </div>
               <div class="template-actions">
+                <button
+                  class="icon-btn visibility-toggle"
+                  onclick={() => toggleHidden(fmt)}
+                  title={fmt.hidden ? "Show note type" : "Hide note type"}
+                  aria-label={fmt.hidden ? `Show ${fmt.name}` : `Hide ${fmt.name}`}
+                  aria-pressed={!fmt.hidden}
+                >
+                  <span class="visibility-icon visibility-icon-default" aria-hidden="true">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
+                      <path d="m4 4 16 16" />
+                    </svg>
+                  </span>
+                  <span class="visibility-icon visibility-icon-action" aria-hidden="true">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
+                      <circle cx="12" cy="12" r="2.5" />
+                    </svg>
+                  </span>
+                </button>
                 <button class="btn btn-sm" onclick={() => startEdit(fmt)}>{fmt.is_builtin ? "Customize" : "Edit"}</button>
                 <div class="action-menu">
                   <button
@@ -354,7 +393,6 @@ Required output format:
                   {#if openTemplateMenu === fmt.id}
                     <div class="action-menu-popover">
                       <button class="action-menu-item" onclick={() => duplicateFormat(fmt)}>Duplicate</button>
-                      <button class="action-menu-item" onclick={() => toggleHidden(fmt)}>Show</button>
                       {#if fmt.is_builtin}
                         <button class="action-menu-item" onclick={() => resetFormat(fmt)}>Reset</button>
                       {:else}
