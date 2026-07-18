@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.0.0",
-    "mlx-lm>=0.31.0",
+    "mlx-lm @ git+https://github.com/AirRunner/mlx-lm.git@45f53582d64287aa875c1606e479f7f66c0afb58",
     "transformers>=5.0.0,<5.13.0",
     "huggingface-hub>=0.20.0",
     "tqdm>=4.60.0",
@@ -26,6 +26,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gist"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 
 [dependency-groups]

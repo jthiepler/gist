@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import os
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
+from huggingface_hub import snapshot_download
 from mlx_lm import load, stream_generate
-from mlx_lm.generate import BatchGenerator, generate_step
+from mlx_lm.generate import BatchGenerator, generate_step, mtp_generate_step
 from mlx_lm.models.cache import make_prompt_cache
 
 from .base import ChatMessage, GenerationIncompleteError, LLMBackend
@@ -17,6 +21,99 @@ from .base import ChatMessage, GenerationIncompleteError, LLMBackend
 log = logging.getLogger(__name__)
 
 _CACHE_BOUNDARY_MARKER = "\ue000GIST_CACHE_BOUNDARY\ue001"
+_MTP_WEIGHT_ALIAS = "model-mtp.safetensors"
+
+
+def _float16_mtp_sidecar(sidecar: Path, *, add_native_prefix: bool = False) -> Path:
+    """Create an M1/M2-compatible copy without changing quantized tensors."""
+    suffix = "-native-fp16" if add_native_prefix else "-fp16"
+    converted = sidecar.with_name(f"{sidecar.stem}{suffix}{sidecar.suffix}")
+    if converted.is_file():
+        return converted
+
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    with safe_open(sidecar, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata()
+        tensors = {}
+        for name in handle.keys():
+            tensor = handle.get_tensor(name)
+            output_name = f"mtp.{name}" if add_native_prefix else name
+            tensors[output_name] = (
+                tensor.to(torch.float16) if tensor.dtype == torch.bfloat16 else tensor
+            )
+    temporary = converted.with_suffix(f"{converted.suffix}.tmp")
+    save_file(tensors, temporary, metadata=metadata)
+    temporary.replace(converted)
+    return converted
+
+
+def _prepare_mtp_model_path(
+    model_path: str,
+    revision: Optional[str],
+    mtp_model_path: Optional[str] = None,
+    mtp_revision: Optional[str] = None,
+) -> str:
+    """Expose an OptiQ MTP sidecar under mlx-lm's model weight glob."""
+    path = Path(model_path)
+    if not path.exists():
+        path = Path(
+            snapshot_download(
+                repo_id=model_path,
+                revision=revision,
+                local_files_only=True,
+            )
+        )
+
+    add_native_prefix = mtp_model_path is not None
+    if mtp_model_path is not None:
+        mtp_path = Path(mtp_model_path)
+        if not mtp_path.exists():
+            mtp_path = Path(
+                snapshot_download(
+                    repo_id=mtp_model_path,
+                    revision=mtp_revision,
+                    local_files_only=True,
+                )
+            )
+        weight_files = [
+            candidate
+            for candidate in mtp_path.glob("model*.safetensors")
+            if not candidate.stem.endswith(("-fp16", "-native-fp16"))
+        ]
+        if len(weight_files) != 1:
+            raise RuntimeError(
+                f"Expected one MTP weight file in {mtp_path}, found {len(weight_files)}."
+            )
+        sidecar = weight_files[0]
+    else:
+        config_path = path / "config.json"
+        if not config_path.is_file():
+            return str(path)
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        mtp_file = config.get("mtp_file")
+        if not mtp_file:
+            mtp_file = config.get("mlx_lm_extra_tensors", {}).get("mtp_file")
+        if not mtp_file:
+            return str(path)
+        sidecar = path / mtp_file
+        if not sidecar.is_file():
+            raise FileNotFoundError(f"Configured MTP weights were not downloaded: {sidecar}")
+
+    sidecar = _float16_mtp_sidecar(
+        sidecar,
+        add_native_prefix=add_native_prefix,
+    )
+    alias = path / _MTP_WEIGHT_ALIAS
+    if alias.is_symlink() and alias.resolve() != sidecar.resolve():
+        alias.unlink()
+    elif alias.exists() and not alias.is_symlink():
+        raise FileExistsError(f"Cannot expose MTP weights over existing file: {alias}")
+    if not alias.exists():
+        alias.symlink_to(os.path.relpath(sidecar, start=path))
+    return str(path)
 
 
 @dataclass
@@ -41,12 +138,36 @@ class MLXBackend(LLMBackend):
         self.model = None
         self.tokenizer = None
         self._prompt_cache_entry: Optional[_PromptCacheEntry] = None
+        self._use_mtp = os.environ.get("GIST_MLX_MTP", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
-    def load(self, model_path: str, revision: Optional[str] = None):
+    def load(
+        self,
+        model_path: str,
+        revision: Optional[str] = None,
+        mtp_model_path: Optional[str] = None,
+        mtp_revision: Optional[str] = None,
+    ):
         self._prompt_cache_entry = None
         log.info("event=mlx_model_load_started revision=%s", revision or "default")
-        self.model, self.tokenizer = load(model_path, revision=revision)
-        log.info("event=mlx_model_loaded revision=%s", revision or "default")
+        prepared_path = _prepare_mtp_model_path(
+            model_path,
+            revision,
+            mtp_model_path,
+            mtp_revision,
+        )
+        self.model, self.tokenizer = load(prepared_path)
+        if not hasattr(self.model, "mtp_forward"):
+            raise RuntimeError("The selected model did not load an MTP head.")
+        log.info(
+            "event=mlx_model_loaded revision=%s mtp=%s",
+            revision or "default",
+            self._use_mtp,
+        )
 
     def _render_cacheable_prompt(
         self,
@@ -147,19 +268,34 @@ class MLXBackend(LLMBackend):
                 raise InterruptedError("Generation cancelled")
 
             prompt_cache = make_prompt_cache(self.model)
+            if self._use_mtp:
+                prompt_cache += self.model.make_mtp_cache()
 
             def check_cancelled(_processed: int, _total: int) -> None:
                 if cancel_event and cancel_event.is_set():
                     raise InterruptedError("Generation cancelled")
 
-            for _ in generate_step(
-                mx.array(prefix_tokens),
-                self.model,
-                max_tokens=0,
-                prompt_cache=prompt_cache,
-                prompt_progress_callback=check_cancelled,
-            ):
-                pass
+            if self._use_mtp:
+                for _ in mtp_generate_step(
+                    mx.array(prefix_tokens),
+                    self.model,
+                    # One prediction is evaluated but not committed. This fills the
+                    # backbone cache through the prefix and aligns the MTP cache one
+                    # token behind it, as the MTP decode loop expects.
+                    max_tokens=1,
+                    prompt_cache=prompt_cache,
+                ):
+                    check_cancelled(len(prefix_tokens), len(prefix_tokens))
+                    break
+            else:
+                for _ in generate_step(
+                    mx.array(prefix_tokens),
+                    self.model,
+                    max_tokens=0,
+                    prompt_cache=prompt_cache,
+                    prompt_progress_callback=check_cancelled,
+                ):
+                    pass
             self._prompt_cache_entry = _PromptCacheEntry(
                 prefix_tokens=prefix_tokens,
                 prompt_cache=prompt_cache,
@@ -212,17 +348,15 @@ class MLXBackend(LLMBackend):
             cached_prefix_tokens,
         )
 
-        sampler = _make_sampler(temperature)
-
         text_parts: list[str] = []
         finish_reason: Optional[str] = None
         if cancel_event and cancel_event.is_set():
             raise InterruptedError("Generation cancelled")
-        generation_args = {
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "sampler": sampler,
-        }
+        generation_args = {"prompt": prompt, "max_tokens": max_tokens}
+        if self._use_mtp:
+            generation_args.update({"mtp": True, "temp": temperature})
+        else:
+            generation_args["sampler"] = _make_sampler(temperature)
         if prompt_cache is not None:
             generation_args["prompt_cache"] = prompt_cache
         for response in stream_generate(
@@ -393,13 +527,19 @@ class MLXBackend(LLMBackend):
 
         text_parts: list[str] = []
         finish_reason: Optional[str] = None
+        generation_args = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "logits_processors": [logits_processor],
+        }
+        if self._use_mtp:
+            generation_args.update({"mtp": True, "temp": 0.0})
+        else:
+            generation_args["sampler"] = _make_sampler(0.0)
         for response in stream_generate(
             self.model,
             self.tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=_make_sampler(0.0),
-            logits_processors=[logits_processor],
+            **generation_args,
         ):
             if cancel_event and cancel_event.is_set():
                 raise InterruptedError("Generation cancelled")

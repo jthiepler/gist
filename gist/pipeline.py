@@ -20,10 +20,15 @@ _cached_llm = None
 _cached_llm_repo: Optional[str] = None
 
 
-def _get_cached_llm(model_repo: str, revision: str):
+def _get_cached_llm(
+    model_repo: str,
+    revision: str,
+    mtp_repo: str = "",
+    mtp_revision: str = "",
+):
     """Return the loaded MLX model, retaining one model between note requests."""
     global _cached_llm, _cached_llm_repo
-    cache_key = f"{model_repo}@{revision}"
+    cache_key = f"{model_repo}@{revision}+{mtp_repo}@{mtp_revision}"
     if _cached_llm is not None and _cached_llm_repo == cache_key:
         log.info("event=llm_model_cache_hit model_repo=%s revision=%s", model_repo, revision)
         return _cached_llm
@@ -33,7 +38,12 @@ def _get_cached_llm(model_repo: str, revision: str):
     from .llm.mlx_backend import MLXBackend
 
     llm = MLXBackend()
-    llm.load(model_repo, revision=revision)
+    llm.load(
+        model_repo,
+        revision=revision,
+        mtp_model_path=mtp_repo or None,
+        mtp_revision=mtp_revision or None,
+    )
     _cached_llm = llm
     _cached_llm_repo = cache_key
     log.info("event=llm_model_cached model_repo=%s revision=%s", model_repo, revision)
@@ -46,7 +56,10 @@ def release_cached_llm(model_name: Optional[str] = None) -> None:
     if model_name is not None:
         try:
             spec = resolve_model(model_name, "llm")
-            if _cached_llm_repo != f"{spec.hf_repo}@{spec.revision}":
+            if _cached_llm_repo != (
+                f"{spec.hf_repo}@{spec.revision}+"
+                f"{spec.mtp_hf_repo}@{spec.mtp_revision}"
+            ):
                 return
         except (KeyError, ValueError):
             return
@@ -128,7 +141,12 @@ def _postprocess_diarization(
     role_identified = False
     try:
         spec = resolve_model(llm_model, "llm")
-        llm = _get_cached_llm(spec.hf_repo, spec.revision)
+        llm = _get_cached_llm(
+            spec.hf_repo,
+            spec.revision,
+            spec.mtp_hf_repo,
+            spec.mtp_revision,
+        )
         if progress_callback:
             progress_callback(
                 28,
@@ -361,13 +379,20 @@ def generate_notes(
         evidence_backend_factory=lambda: _get_cached_llm(
             evidence_spec.hf_repo,
             evidence_spec.revision,
+            evidence_spec.mtp_hf_repo,
+            evidence_spec.mtp_revision,
         ),
         progress_callback=progress_callback,
         cancel_event=cancel_event,
         diagnostic_capture=diagnostic_capture,
     )
 
-    note_llm = _get_cached_llm(spec.hf_repo, spec.revision)
+    note_llm = _get_cached_llm(
+        spec.hf_repo,
+        spec.revision,
+        spec.mtp_hf_repo,
+        spec.mtp_revision,
+    )
     result = generate_notes_from_ledger_with_backend(
         note_llm,
         ledger,

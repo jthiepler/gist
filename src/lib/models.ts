@@ -19,7 +19,7 @@ export const AVAILABLE_LLM_MODELS: readonly AvailableModel[] = [
     caption: "Qwen 3.5 · 4 billion parameters",
     display: "Qwen 3.5 4B",
     backend: "mlx",
-    sizeGb: 2.5,
+    sizeGb: 2.6,
     description: "Fast everyday note generation",
   },
   {
@@ -28,7 +28,7 @@ export const AVAILABLE_LLM_MODELS: readonly AvailableModel[] = [
     caption: "Qwen 3.5 · 9 billion parameters",
     display: "Qwen 3.5 9B",
     backend: "mlx",
-    sizeGb: 5.5,
+    sizeGb: 5.7,
     description: "More detailed notes, with slower processing",
   },
 ];
