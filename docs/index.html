@@ -6,12 +6,12 @@
     <meta name="theme-color" content="#f6f8f7" />
     <meta
       name="description"
-      content="Gist is a free, local clinical note assistant for independent therapists. Record or import a session, identify speakers, and draft notes on your Mac."
+      content="Gist is a free, local, evidence-first clinical note assistant for independent therapists. Turn selected session sources into reviewable notes on your Mac."
     />
     <meta property="og:title" content="Gist — The session stays on your Mac" />
-    <meta property="og:description" content="A free, open-source clinical note assistant that transcribes sessions and identifies speakers locally for solo therapists and private practice." />
+    <meta property="og:description" content="Private clinical note drafting grounded in encounter evidence. Record or import a session, organize its evidence, and draft notes locally on your Mac." />
     <meta property="og:type" content="website" />
-    <title>Gist — Private clinical notes</title>
+    <title>Gist — Private, evidence-first clinical notes</title>
     <link rel="icon" href="favicon.png" type="image/png" />
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -24,6 +24,7 @@
       <nav class="nav-links" aria-label="Primary navigation">
         <a href="#why-gist">Why Gist</a>
         <a href="#workflow">How it works</a>
+        <a href="#evidence">Evidence pipeline</a>
         <a href="#privacy">Privacy</a>
         <a href="#about">About</a>
         <a href="https://github.com/jthiepler/gist" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a>
@@ -36,7 +37,8 @@
         <div class="hero-copy">
           <div class="eyebrow"><span class="eyebrow-dot"></span> Built for independent therapists</div>
           <h1>The session stays<br /><em>on your Mac.</em></h1>
-          <p class="hero-lede">Gist records, transcribes, separates speaker turns, and turns a therapy session into an editable clinical note. No account, no subscription, and no clinical data sent to a cloud service in the bundled workflow.</p>
+          <p class="hero-lede">Gist records or imports a therapy session, organizes its clinical evidence, and drafts an editable note through a local, evidence-first pipeline. No account, no subscription, and no clinical data sent to a cloud service—ever.</p>
+          <p class="hero-detail">Not a one-pass transcript summary: selected source material is processed into a reusable encounter evidence ledger before a note is written.</p>
           <div class="hero-actions">
             <a class="button" href="https://github.com/jthiepler/gist/releases/latest/download/Gist.dmg">Download v0.1 beta <span aria-hidden="true">→</span></a>
             <a class="text-link" href="https://github.com/jthiepler/gist" target="_blank" rel="noreferrer">Read the source <span aria-hidden="true">↗</span></a>
@@ -53,7 +55,7 @@
       <section class="trust-strip">
         <div class="page-width trust-inner">
           <span>Free and open source for solo practice.</span>
-          <div class="trust-items"><span>Local by default</span><span>No account</span><span>No subscription</span></div>
+          <div class="trust-items"><span>Evidence first</span><span>Local by default</span><span>No account</span><span>No subscription</span></div>
         </div>
       </section>
 
@@ -64,9 +66,9 @@
           <p>Independent therapists deserve documentation help without paying indefinitely or trusting an additional company with intimate conversations. Gist is a small, focused alternative for technically curious clinicians who would rather keep the work on their own machine.</p>
         </div>
         <div class="feature-grid">
-          <article class="feature-card feature-card-accent"><div class="feature-icon">⌁</div><h3>Keep custody of the data</h3><p>The bundled models run on your Mac. Gist has no account, telemetry, cloud sync, or hidden online processing.</p></article>
-          <article class="feature-card"><div class="feature-icon">▤</div><h3>Bring the material you have</h3><p>Record a session or import audio and Gist automatically separates speakers locally. You can also paste a transcript or begin with your own observations.</p></article>
-          <article class="feature-card"><div class="feature-icon">✦</div><h3>Keep the clinical judgment</h3><p>Draft SOAP, DAP, CBT, intake, and other formats, then check every statement beside the source.</p></article>
+          <article class="feature-card"><div class="feature-icon">⌁</div><h3>Private by architecture</h3><p>Gist's models run on your Mac. There is no account, telemetry, cloud sync, clinical-data upload, or hidden online processing.</p></article>
+          <article class="feature-card feature-card-accent"><div class="feature-icon">▤</div><h3>Evidence before prose</h3><p>Gist organizes note-worthy source material into one encounter evidence ledger before asking a model to write polished clinical prose.</p></article>
+          <article class="feature-card"><div class="feature-icon">✦</div><h3>Clinical judgment stays human</h3><p>Draft SOAP, DAP, CBT, intake, and custom formats, then check and edit every result beside its source.</p></article>
         </div>
       </section>
 
@@ -75,19 +77,37 @@
           <div class="section-intro">
             <div class="eyebrow">The actual workflow</div>
             <h2>From source material<br /><span>to a reviewable draft.</span></h2>
-            <p>The transcript and note stay connected. For recorded or imported audio, speaker identification is enabled by default: Gist separates speaker turns locally and makes a best-effort attempt to label the practitioner and patient(s).</p>
+            <p>The transcript and note stay connected. For recorded or imported audio, Gist separates speaker turns locally and makes a best-effort attempt to label the practitioner and patient(s).</p>
             <ol class="steps">
               <li><span>01</span><div><strong>Add a client and session</strong><p>Keep your session history in one local workspace.</p></div></li>
-              <li><span>02</span><div><strong>Record or import</strong><p>Use an existing recording or record a session; speaker identification runs automatically by default.</p></div></li>
-              <li><span>03</span><div><strong>Review and edit</strong><p>Generate a structured draft and check it against the source material.</p></div></li>
+              <li><span>02</span><div><strong>Record, import, or write</strong><p>Use session audio, a pasted transcript, or your own observations—and choose which sources contribute to the note.</p></div></li>
+              <li><span>03</span><div><strong>Organize the evidence</strong><p>Gist extracts note-worthy information while preserving attribution, uncertainty, timing, and action status.</p></div></li>
+              <li><span>04</span><div><strong>Draft, review, and edit</strong><p>Generate one or more formats from the shared evidence, then check each draft against the source.</p></div></li>
             </ol>
           </div>
           <figure class="screenshot-card"><img src="assets/new-session.png" alt="Gist's new session panel showing recording and note format options" /><figcaption>Choose how to add source material and which notes to generate.</figcaption></figure>
         </div>
       </section>
 
+      <section class="section evidence-section" id="evidence">
+        <div class="page-width">
+          <div class="section-intro evidence-intro">
+            <div class="eyebrow">Evidence-first generation</div>
+            <h2>One encounter record.<br /><span>Every note format.</span></h2>
+            <p>Instead of summarizing a full transcript in one pass, Gist first creates a chronological, format-neutral evidence ledger. SOAP, DAP, CBT, intake, and custom drafts all begin from that same source-grounded representation.</p>
+          </div>
+          <ol class="pipeline" aria-label="Gist evidence-ledger processing pipeline">
+            <li><span class="pipeline-number">01</span><strong>Selected sources</strong><p>Transcript, observations, and other included session material.</p></li>
+            <li><span class="pipeline-number">02</span><strong>Local extraction</strong><p>Preserve who said what, negation, uncertainty, timing, quantities, and commitments.</p></li>
+            <li><span class="pipeline-number">03</span><strong>Evidence ledger</strong><p>Retain supporting excerpts, remove duplicates, and organize evidence chronologically.</p></li>
+            <li><span class="pipeline-number">04</span><strong>Reviewable drafts</strong><p>Generate multiple formats from shared evidence, then review and edit beside the source.</p></li>
+          </ol>
+          <p class="evidence-caveat">This pipeline is designed to improve source fidelity and reduce opportunities for unsupported additions, attribution errors, and information loss. It is an engineering safeguard—not a guarantee of correctness or clinical validation.</p>
+        </div>
+      </section>
+
       <section class="section notes-section page-width" id="privacy">
-        <div class="notes-copy"><div class="eyebrow">What “local” means</div><h2>Download the models once.<br /><span>Run them on your Mac.</span></h2><p>Speech recognition, speaker diarization, best-effort speaker-role identification, note generation, and storage all happen on the device in the bundled workflow. Internet access is needed for the initial model downloads—not for ordinary processing afterward.</p><p class="fine-print">Speaker diarization is generally useful on clear recordings, though it is not perfect and can make mistakes with noisy audio, overlapping speech, or unexpected participant counts. Role identification is a best-effort second step. Local architecture reduces the compliance surface; it does not make a practice automatically HIPAA compliant. Device security, access, backups, consent, retention, and clinical use remain the practitioner’s responsibility.</p><a class="text-link" href="https://github.com/jthiepler/gist#local-means-local" target="_blank" rel="noreferrer">Read the technical privacy details <span aria-hidden="true">↗</span></a></div>
+        <div class="notes-copy"><div class="eyebrow">What “local” means</div><h2>Download the models once.<br /><span>Run them on your Mac.</span></h2><p>Speech recognition, speaker diarization, best-effort speaker-role identification, evidence extraction, note generation, caching, and storage all happen on your Mac. Gist never uploads recordings, transcripts, client records, session evidence, or generated notes. Internet access is needed only for model downloads and application update checks.</p><p class="fine-print">Speaker diarization is generally useful on clear recordings, though it is not perfect and can make mistakes with noisy audio, overlapping speech, or unexpected participant counts. Role identification is a best-effort second step. Local architecture reduces the compliance surface; it does not make a practice automatically HIPAA compliant. Device security, access, backups, consent, retention, and clinical use remain the practitioner’s responsibility.</p><a class="text-link" href="https://github.com/jthiepler/gist#local-means-local" target="_blank" rel="noreferrer">Read the technical privacy details <span aria-hidden="true">↗</span></a></div>
         <figure class="screenshot-card screenshot-note"><img src="assets/local-models.png" alt="Gist settings showing local Qwen note-writing models and their storage sizes" /><figcaption>Models are downloaded, selected, and removed from Settings.</figcaption></figure>
       </section>
 
@@ -108,6 +128,6 @@
       <section class="disclaimer page-width"><span class="info-icon">i</span><p>Gist is documentation assistance, not a diagnostic or clinical decision-making system. Review every generated note against the source material before using it in a clinical record.</p></section>
     </main>
 
-    <footer class="site-footer page-width"><a class="brand" href="#top"><img class="brand-mark" src="favicon.png" alt="" aria-hidden="true" /><span>Gist</span></a><span>Privacy-first clinical note-taking · MIT licensed</span><div><a href="https://tally.so/r/EkEWVo" target="_blank" rel="noreferrer">Feedback</a><a href="mailto:gist@jthiepler.com">Email</a><a href="https://github.com/jthiepler/gist/issues" target="_blank" rel="noreferrer">Issues</a><a href="https://github.com/jthiepler/gist" target="_blank" rel="noreferrer">GitHub ↗</a></div></footer>
+    <footer class="site-footer page-width"><a class="brand" href="#top"><img class="brand-mark" src="favicon.png" alt="" aria-hidden="true" /><span>Gist</span></a><span>Private, evidence-first clinical note drafting · MIT licensed</span><div><a href="https://tally.so/r/EkEWVo" target="_blank" rel="noreferrer">Feedback</a><a href="mailto:gist@jthiepler.com">Email</a><a href="https://github.com/jthiepler/gist/issues" target="_blank" rel="noreferrer">Issues</a><a href="https://github.com/jthiepler/gist" target="_blank" rel="noreferrer">GitHub ↗</a></div></footer>
   </body>
 </html>

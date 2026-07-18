@@ -1,6 +1,6 @@
 {
   "name": "gist",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local-first therapy session tool",
   "type": "module",
   "scripts": {
