@@ -122,6 +122,10 @@
   let primaryActionLabel = $derived.by(() => {
     if (phase === "transcribing") return "Transcribing...";
     if (phase === "generating") return "Generating notes...";
+    if (selectedFormats.size === 0) {
+      if (inputMethod === "audio_file") return "Transcribe and save transcript";
+      if (inputMethod === "text") return "Save transcript";
+    }
     if (inputMethod === "audio_file") return "Transcribe and generate notes";
     if (inputMethod === "text") return "Save and generate notes";
     return "Start";
@@ -291,8 +295,8 @@
 
   async function handleStartRecording() {
     if (startingRecording || phase !== "idle" || $isRecording) return;
-    if (!formatsLoaded || selectedFormats.size === 0) {
-      error = "Please wait for note types to load and select at least one note type.";
+    if (!formatsLoaded) {
+      error = "Please wait for note types to load.";
       return;
     }
     if ($sidecarBusy) {
@@ -420,10 +424,6 @@
         sourceKind === "session_transcript"
           ? "Please paste a session transcript."
           : "Please add a clinician note.";
-      return;
-    }
-    if (selectedFormats.size === 0) {
-      error = "Please select at least one note type.";
       return;
     }
     if ($sidecarBusy) {
@@ -769,7 +769,7 @@
             </label>
           {/if}
           <p class="record-hint">Gist records at about 345 MB per hour (roughly 690 MB for two hours). Keep your Mac awake while recording; Gist also prevents idle sleep during recording and processing.</p>
-          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || !formatsLoaded || selectedFormats.size === 0 || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
+          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || !formatsLoaded || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
             Start recording
           </button>
         </div>
@@ -789,7 +789,7 @@
   {/if}
 
   <div class="format-checklist" role="group" aria-labelledby="note-formats-label">
-    <div id="note-formats-label" class="format-checklist-label">Notes to generate</div>
+    <div id="note-formats-label" class="format-checklist-label">Notes to generate <span class="text-muted">(optional)</span></div>
     <div class="format-checklist-items">
       {#if !formatsLoaded}
         <span class="text-muted">Loading note types...</span>
@@ -809,6 +809,9 @@
         {/each}
       {/if}
     </div>
+    {#if formatsLoaded && visibleFormats.length > 0}
+      <p class="format-checklist-help">Leave all note types unselected to save the transcript without generating notes.</p>
+    {/if}
   </div>
 
   {#if !$isRecording}
@@ -817,7 +820,7 @@
         <button
           class="btn btn-primary"
           onclick={start}
-          disabled={submitting || phase !== "idle" || !formatsLoaded || formatsLoadFailed || selectedFormats.size === 0 || (inputMethod === "text" ? !textDraft.trim() : !audioPath)}
+          disabled={submitting || phase !== "idle" || !formatsLoaded || formatsLoadFailed || (inputMethod === "text" ? !textDraft.trim() : !audioPath)}
         >
           {primaryActionLabel}
         </button>
