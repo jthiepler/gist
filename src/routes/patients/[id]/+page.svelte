@@ -196,7 +196,7 @@
       const settings = await loadSettings();
       const preferredFormats = options.formats || options.regenerateExisting
         ? []
-        : await getPatientFormats(patientId);
+        : (await getPatientFormats(patientId)) ?? [];
       const formatsToRefresh = selectNoteFormats(
         session.notes.map((note) => note.format),
         preferredFormats,

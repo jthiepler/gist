@@ -124,7 +124,9 @@
     if (phase === "generating") return "Generating notes...";
     if (selectedFormats.size === 0) {
       if (inputMethod === "audio_file") return "Transcribe and save transcript";
-      if (inputMethod === "text") return "Save transcript";
+      if (inputMethod === "text") {
+        return sourceKind === "session_transcript" ? "Save transcript" : "Save clinician note";
+      }
     }
     if (inputMethod === "audio_file") return "Transcribe and generate notes";
     if (inputMethod === "text") return "Save and generate notes";
@@ -160,21 +162,13 @@
   $effect(() => {
     (async () => {
       formatsLoadFailed = false;
-      const ok = await ensureSidecar();
-      if (!ok) {
-        formatsLoadFailed = true;
-        error = "The processing engine could not start, so note types could not be loaded.";
-        return;
-      }
       try {
         formats = await listNoteFormats();
         const saved = await getPatientFormats(patientId);
         const visibleNames = formats.filter((f) => !f.hidden).map((f) => f.name);
-        if (saved.length > 0) {
+        if (saved !== null) {
           const valid = saved.filter((n) => visibleNames.includes(n));
-          selectedFormats = new Set(
-            valid.length > 0 ? valid : ([visibleFormats[0]?.name].filter(Boolean) as string[])
-          );
+          selectedFormats = new Set(valid);
         } else {
           const first = visibleFormats[0];
           if (first) selectedFormats = new Set([first.name]);
@@ -182,7 +176,6 @@
       } catch (e) {
         console.error("Failed to load formats/patient formats:", e);
         formatsLoadFailed = true;
-        error = "Note types could not be loaded. Close and reopen this panel to try again.";
       }
       formatsLoaded = true;
 
@@ -295,10 +288,6 @@
 
   async function handleStartRecording() {
     if (startingRecording || phase !== "idle" || $isRecording) return;
-    if (!formatsLoaded) {
-      error = "Please wait for note types to load.";
-      return;
-    }
     if ($sidecarBusy) {
       error = "Another operation is in progress. Please wait or cancel it first.";
       return;
@@ -769,7 +758,7 @@
             </label>
           {/if}
           <p class="record-hint">Gist records at about 345 MB per hour (roughly 690 MB for two hours). Keep your Mac awake while recording; Gist also prevents idle sleep during recording and processing.</p>
-          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || !formatsLoaded || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
+          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
             Start recording
           </button>
         </div>
@@ -793,6 +782,8 @@
     <div class="format-checklist-items">
       {#if !formatsLoaded}
         <span class="text-muted">Loading note types...</span>
+      {:else if formatsLoadFailed}
+        <span class="text-muted">Note types are unavailable. You can still save the source without generating notes.</span>
       {:else if visibleFormats.length === 0}
         <span class="text-muted">No note types available.</span>
       {:else}
@@ -810,7 +801,7 @@
       {/if}
     </div>
     {#if formatsLoaded && visibleFormats.length > 0}
-      <p class="format-checklist-help">Leave all note types unselected to save the transcript without generating notes.</p>
+      <p class="format-checklist-help">Leave all note types unselected to save the source without generating notes.</p>
     {/if}
   </div>
 
@@ -820,7 +811,7 @@
         <button
           class="btn btn-primary"
           onclick={start}
-          disabled={submitting || phase !== "idle" || !formatsLoaded || formatsLoadFailed || (inputMethod === "text" ? !textDraft.trim() : !audioPath)}
+          disabled={submitting || phase !== "idle" || (inputMethod === "text" ? !textDraft.trim() : !audioPath)}
         >
           {primaryActionLabel}
         </button>
