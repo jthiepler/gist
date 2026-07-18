@@ -148,8 +148,8 @@ export async function getSystemMemoryBytes(): Promise<number> {
 
 // ── Note Format Templates ─────────────────────────────────────────────────
 
-export async function getPatientFormats(patientId: string): Promise<string[]> {
-  return invoke<string[]>("get_patient_formats", { patientId });
+export async function getPatientFormats(patientId: string): Promise<string[] | null> {
+  return invoke<string[] | null>("get_patient_formats", { patientId });
 }
 
 export async function setPatientFormats(patientId: string, formats: string[]): Promise<void> {

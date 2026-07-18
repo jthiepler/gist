@@ -1563,7 +1563,7 @@ async fn create_session_note(
 async fn get_patient_formats(
     db: State<'_, Mutex<Database>>,
     patient_id: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Option<Vec<String>>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let key = format!("patient_formats_{}", patient_id);
     let mut stmt = db
@@ -1586,8 +1586,9 @@ async fn get_patient_formats(
                         .collect(),
                 )
             })
+            .map(Some)
             .map_err(|e| e.to_string()),
-        _ => Ok(Vec::new()),
+        _ => Ok(None),
     }
 }
 
