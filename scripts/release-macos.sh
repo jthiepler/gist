@@ -124,6 +124,10 @@ fi
 
 echo "Verifying the signed app..."
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+if ! codesign -d --entitlements - "$APP_PATH" 2>&1 | grep -q "com.apple.security.device.audio-input"; then
+  echo "The signed app is missing the microphone audio-input entitlement." >&2
+  exit 1
+fi
 spctl --assess --type execute --verbose=4 "$APP_PATH"
 xcrun stapler validate "$APP_PATH"
 

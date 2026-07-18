@@ -287,8 +287,9 @@
   async function openMicrophonePrivacySettings() {
     try {
       await openUrl("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone");
-    } catch {
-      audioDeviceError = "Open System Settings, choose Privacy & Security, then allow Gist under Microphone.";
+    } catch (e) {
+      console.error("Failed to open microphone privacy settings:", e);
+      audioDeviceError = "Could not open System Settings. Open Privacy & Security > Microphone manually, then allow Gist.";
     }
   }
 
@@ -723,6 +724,7 @@
             <div class="error-banner" role="alert">
               <span>{audioDeviceError}</span>
               <button class="btn btn-sm" onclick={openMicrophonePrivacySettings}>Open Microphone Privacy Settings</button>
+              <button class="btn btn-sm" onclick={loadAudioDevices}>Try again</button>
             </div>
           {/if}
           <div class="form-group">
