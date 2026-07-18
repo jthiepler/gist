@@ -218,6 +218,10 @@ pub fn start_recording(
                             Ok(mixed) => mixed,
                             Err(error) => {
                                 IS_RECORDING.store(false, Ordering::Release);
+                                crate::update_tray_recording_state(
+                                    &app_handle,
+                                    crate::TrayRecordingState::Idle,
+                                );
                                 let _ = app_handle.emit(
                                     "recording-error",
                                     RecordingErrorPayload {

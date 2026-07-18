@@ -60,6 +60,7 @@
   import UpdatePrompt from "$lib/components/UpdatePrompt.svelte";
 
   let { children } = $props();
+  const isMenuBarWindow = getCurrentWindow().label === "menu-bar";
   let onboardingComplete = $state(false);
   let feedbackPromptPending = $state(false);
   let showFeedbackPrompt = $state(false);
@@ -92,7 +93,6 @@
       patient.name.toLocaleLowerCase().includes(patientSearch.trim().toLocaleLowerCase())
     )
   );
-
   function focusPatient(index: number) {
     const items = [...document.querySelectorAll<HTMLAnchorElement>(".patient-item")];
     if (items.length === 0) return;
@@ -306,6 +306,10 @@
   }
 
   onMount(async () => {
+    if (isMenuBarWindow) {
+      await loadAppearance();
+      return;
+    }
     try {
       const launch = await recordAppLaunch();
       launchCount = launch.launchCount;
@@ -582,6 +586,9 @@
   }
 </script>
 
+{#if isMenuBarWindow}
+  {@render children()}
+{:else}
 <div class="app-shell">
   <div
     class="window-drag-region"
@@ -769,4 +776,5 @@
       </div>
     {/each}
   </section>
+{/if}
 {/if}

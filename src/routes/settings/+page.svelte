@@ -5,6 +5,7 @@
     downloadModel,
     getSystemMemoryBytes,
     listModels,
+    setMenuBarEnabled,
   } from "$lib/rpc";
   import {
     activeOperation,
@@ -37,12 +38,12 @@
   let downloading = $state("");
   let deleting = $state("");
   let selectedLlm = $state(DEFAULT_LLM);
+  let menuBarEnabled = $state(true);
   let error = $state("");
   let saveState = $state<"idle" | "saving" | "saved">("idle");
   let pendingSaves = 0;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let saveQueue: Promise<void> = Promise.resolve();
-  let confirmRecordingConsent = $state(true);
   let developerFeatures = $state(false);
   let captureNoteDiagnostics = $state(false);
   let settingVersions = new Map<string, number>();
@@ -94,7 +95,7 @@
     if (s.defaultLlm && AVAILABLE_LLM_MODELS.some((model) => model.name === s.defaultLlm)) {
       selectedLlm = s.defaultLlm;
     }
-    confirmRecordingConsent = s.confirmRecordingConsent;
+    menuBarEnabled = s.menuBarEnabled;
     developerFeatures = s.developerFeaturesEnabled;
     captureNoteDiagnostics = s.captureNoteDiagnostics;
     appearance.set(s.appearance);
@@ -167,13 +168,17 @@
     }
   }
 
-  async function persistSetting(key: string, value: string): Promise<boolean> {
+  async function persistSetting(
+    key: string,
+    value: string,
+    write: () => Promise<void> = () => saveSetting(key, value),
+  ): Promise<boolean> {
     pendingSaves += 1;
     saveState = "saving";
     if (saveTimer) clearTimeout(saveTimer);
     error = "";
 
-    const save = saveQueue.then(() => saveSetting(key, value));
+    const save = saveQueue.then(write);
     saveQueue = save.catch(() => {});
     let succeeded = false;
 
@@ -206,19 +211,6 @@
     }
   }
 
-  async function toggleRecordingConsent() {
-    const previous = confirmRecordingConsent;
-    const version = (settingVersions.get("confirm_recording_consent") ?? 0) + 1;
-    settingVersions.set("confirm_recording_consent", version);
-    confirmRecordingConsent = !confirmRecordingConsent;
-    if (
-      !(await persistSetting("confirm_recording_consent", String(confirmRecordingConsent))) &&
-      settingVersions.get("confirm_recording_consent") === version
-    ) {
-      confirmRecordingConsent = previous;
-    }
-  }
-
   async function toggleNoteDiagnostics() {
     if (!developerFeatures) return;
     const previous = captureNoteDiagnostics;
@@ -232,6 +224,23 @@
       )) && settingVersions.get("capture_note_generation_diagnostics") === version
     ) {
       captureNoteDiagnostics = previous;
+    }
+  }
+
+  async function toggleMenuBar() {
+    const previous = menuBarEnabled;
+    const next = !previous;
+    const version = (settingVersions.get("menu_bar_enabled") ?? 0) + 1;
+    settingVersions.set("menu_bar_enabled", version);
+    menuBarEnabled = next;
+    if (
+      !(await persistSetting(
+        "menu_bar_enabled",
+        String(next),
+        () => setMenuBarEnabled(next),
+      )) && settingVersions.get("menu_bar_enabled") === version
+    ) {
+      menuBarEnabled = previous;
     }
   }
 
@@ -277,7 +286,7 @@
 
 <div class="workspace-header">
   <h2>Settings</h2>
-  <div class="header-meta">Manage AI models, appearance, and local privacy settings.</div>
+  <div class="header-meta">Manage AI models, appearance, and app controls.</div>
   <div class="settings-save-status" aria-live="polite">
     {#if saveState === "saving"}Saving changes…{:else if saveState === "saved"}Changes saved automatically{/if}
   </div>
@@ -417,26 +426,19 @@
       <option value="dark">Dark</option>
     </select>
   </div>
-
-</div>
-
-<div class="settings-section local-privacy-panel">
-  <h3>Local processing and storage</h3>
-  <p class="settings-help">Session audio, transcripts, and generated notes are processed and stored on this device. No session content is sent to a remote AI service.</p>
-  <p class="settings-help">An internet connection may be required to download local model files or application updates.</p>
   <div class="settings-row">
     <div>
-      <div class="setting-label">Recording consent confirmation</div>
-      <div class="setting-desc">Ask for confirmation before starting a new session recording.</div>
+      <div class="setting-label">Show Gist in the menu bar</div>
+      <div class="setting-desc">Start, pause, and stop recordings without opening the main window.</div>
     </div>
     <button
       type="button"
       class="toggle"
-      class:active={confirmRecordingConsent}
+      class:active={menuBarEnabled}
       role="switch"
-      aria-checked={confirmRecordingConsent}
-      aria-label="Recording consent confirmation"
-      onclick={toggleRecordingConsent}
+      aria-checked={menuBarEnabled}
+      aria-label="Show Gist in the menu bar"
+      onclick={toggleMenuBar}
     >
       <div class="toggle-knob"></div>
     </button>

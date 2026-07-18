@@ -11,11 +11,410 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    image::Image,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
+};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 mod audio;
+
+const TRAY_ID: &str = "gist-menu-bar";
+const MENU_BAR_WINDOW_LABEL: &str = "menu-bar";
+const MENU_BAR_ENABLED_SETTING: &str = "menu_bar_enabled";
+const TRAY_START_RECORDING_ID: &str = "gist-tray-start-recording";
+const TRAY_PAUSE_RECORDING_ID: &str = "gist-tray-pause-recording";
+const TRAY_STOP_RECORDING_ID: &str = "gist-tray-stop-recording";
+const TRAY_OPEN_ID: &str = "gist-tray-open";
+const TRAY_QUIT_ID: &str = "gist-tray-quit";
+
+#[derive(Clone, Copy)]
+pub(crate) enum TrayRecordingState {
+    Idle,
+    Recording,
+    Paused,
+}
+
+struct TrayMenuState {
+    status: MenuItem<tauri::Wry>,
+    start_recording: MenuItem<tauri::Wry>,
+    pause_recording: MenuItem<tauri::Wry>,
+    stop_recording: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+}
+
+struct TrayAnchorState(Mutex<Option<tauri::Rect>>);
+
+const MENU_BAR_WINDOW_WIDTH: f64 = 380.0;
+const MENU_BAR_WINDOW_HEIGHT: f64 = 620.0;
+
+fn tray_icon(state: TrayRecordingState) -> Image<'static> {
+    if matches!(state, TrayRecordingState::Idle) {
+        let source = Image::from_bytes(include_bytes!("../icons/gist-menu-bar-template.png"))
+            .expect("bundled menu-bar icon must be a valid PNG");
+        let mut rgba = Vec::with_capacity(source.rgba().len());
+        for pixel in source.rgba().chunks_exact(4) {
+            // The SVG thumbnail renderer supplies the glyph on an opaque white
+            // canvas. Convert luminance to coverage so only the black glyph is
+            // used as the macOS template image while retaining antialiased edges.
+            let luminance =
+                (77 * pixel[0] as u16 + 150 * pixel[1] as u16 + 29 * pixel[2] as u16) >> 8;
+            let coverage = 255_u16.saturating_sub(luminance);
+            let alpha = (coverage * pixel[3] as u16 / 255) as u8;
+            rgba.extend_from_slice(&[0, 0, 0, alpha]);
+        }
+        return Image::new_owned(rgba, source.width(), source.height());
+    }
+
+    const SIZE: u32 = 18;
+    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let index = ((y * SIZE + x) * 4) as usize;
+            let center_x = x as f32 + 0.5 - SIZE as f32 / 2.0;
+            let center_y = y as f32 + 0.5 - SIZE as f32 / 2.0;
+            let distance = (center_x * center_x + center_y * center_y).sqrt();
+
+            let (red, green, blue, alpha) = match state {
+                TrayRecordingState::Recording => {
+                    let alpha = ((6.2 - distance) * 255.0).clamp(0.0, 255.0) as u8;
+                    (220, 48, 53, alpha)
+                }
+                TrayRecordingState::Paused => {
+                    let ring = (4.2..=6.2).contains(&distance)
+                        || ((center_x.abs() >= 1.5 && center_x.abs() <= 2.7)
+                            && center_y.abs() <= 3.0);
+                    (220, 48, 53, if ring { 255 } else { 0 })
+                }
+                TrayRecordingState::Idle => unreachable!("idle icon returned above"),
+            };
+
+            rgba[index] = red;
+            rgba[index + 1] = green;
+            rgba[index + 2] = blue;
+            rgba[index + 3] = alpha;
+        }
+    }
+
+    Image::new_owned(rgba, SIZE, SIZE)
+}
+
+#[cfg(test)]
+mod tray_icon_tests {
+    use super::*;
+
+    #[test]
+    fn idle_icon_converts_white_canvas_to_transparency() {
+        let icon = tray_icon(TrayRecordingState::Idle);
+        let alpha_values = icon.rgba().chunks_exact(4).map(|pixel| pixel[3]);
+        let first_alpha = icon.rgba()[3];
+
+        assert_eq!((icon.width(), icon.height()), (36, 36));
+        assert_eq!(first_alpha, 0);
+        assert!(alpha_values.max().is_some_and(|alpha| alpha > 200));
+    }
+}
+
+pub(crate) fn update_tray_recording_state(app: &AppHandle, state: TrayRecordingState) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let is_idle = matches!(state, TrayRecordingState::Idle);
+        let tooltip = match state {
+            TrayRecordingState::Idle => "Gist",
+            TrayRecordingState::Recording => "Gist is recording",
+            TrayRecordingState::Paused => "Gist recording is paused",
+        };
+        let _ = tray.set_icon_with_as_template(Some(tray_icon(state)), is_idle);
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+
+    if let Some(menu) = app.try_state::<TrayMenuState>() {
+        let active = !matches!(state, TrayRecordingState::Idle);
+        let _ = menu.status.set_text(match state {
+            TrayRecordingState::Idle => "Gist is ready",
+            TrayRecordingState::Recording => "Recording in progress",
+            TrayRecordingState::Paused => "Recording paused",
+        });
+        let _ = menu.start_recording.set_enabled(!active);
+        let _ = menu.pause_recording.set_enabled(active);
+        let _ = menu.pause_recording.set_text(match state {
+            TrayRecordingState::Paused => "Resume Recording",
+            _ => "Pause Recording",
+        });
+        let _ = menu.stop_recording.set_enabled(active);
+        let _ = menu.quit.set_enabled(!active);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_tray_highlighted(app: &AppHandle, highlighted: bool) {
+    use objc2::MainThreadMarker;
+
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let _ = tray.with_inner_tray_icon(move |inner| {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Some(status_item) = inner.ns_status_item() else {
+            return;
+        };
+        if let Some(button) = status_item.button(mtm) {
+            button.highlight(highlighted);
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_tray_highlighted(_app: &AppHandle, _highlighted: bool) {}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(popover) = app.get_webview_window(MENU_BAR_WINDOW_LABEL) {
+        let _ = popover.hide();
+    }
+    set_tray_highlighted(app, false);
+
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn position_menu_bar_window(app: &AppHandle, window: &WebviewWindow, rect: tauri::Rect) {
+    let fallback_scale = window.scale_factor().unwrap_or(1.0);
+    let fallback_position = rect.position.to_physical::<f64>(fallback_scale);
+    let fallback_size = rect.size.to_physical::<f64>(fallback_scale);
+    let anchor_x = fallback_position.x + fallback_size.width / 2.0;
+    let anchor_y = fallback_position.y + fallback_size.height / 2.0;
+    let monitor = app.monitor_from_point(anchor_x, anchor_y).ok().flatten();
+    let scale = monitor
+        .as_ref()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(fallback_scale);
+    let position = rect.position.to_physical::<f64>(scale);
+    let size = rect.size.to_physical::<f64>(scale);
+    let popover_width = MENU_BAR_WINDOW_WIDTH * scale;
+    let margin = 8.0 * scale;
+    let mut x = position.x + size.width / 2.0 - popover_width / 2.0;
+    let y = position.y + size.height + 6.0 * scale;
+
+    if let Some(monitor) = monitor {
+        let work_area = monitor.work_area();
+        let min_x = work_area.position.x as f64 + margin;
+        let max_x =
+            work_area.position.x as f64 + work_area.size.width as f64 - popover_width - margin;
+        x = x.clamp(min_x, max_x.max(min_x));
+    }
+
+    let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+}
+
+fn show_menu_bar_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(MENU_BAR_WINDOW_LABEL) else {
+        return;
+    };
+    if let Some(anchor) = app
+        .try_state::<TrayAnchorState>()
+        .and_then(|state| state.0.lock().ok().and_then(|anchor| *anchor))
+    {
+        position_menu_bar_window(app, &window, anchor);
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = app.emit_to(MENU_BAR_WINDOW_LABEL, "menu-bar-opened", ());
+}
+
+fn toggle_menu_bar_window(app: &AppHandle, rect: tauri::Rect) {
+    if let Some(anchor) = app.try_state::<TrayAnchorState>() {
+        if let Ok(mut stored) = anchor.0.lock() {
+            *stored = Some(rect);
+        }
+    }
+    let Some(window) = app.get_webview_window(MENU_BAR_WINDOW_LABEL) else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        set_tray_highlighted(app, false);
+    } else {
+        position_menu_bar_window(app, &window, rect);
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = app.emit_to(MENU_BAR_WINDOW_LABEL, "menu-bar-opened", ());
+    }
+}
+
+fn setup_menu_bar_window(app: &mut tauri::App) -> tauri::Result<()> {
+    WebviewWindowBuilder::new(
+        app,
+        MENU_BAR_WINDOW_LABEL,
+        WebviewUrl::App("menu-bar".into()),
+    )
+    .title("Gist")
+    .inner_size(MENU_BAR_WINDOW_WIDTH, MENU_BAR_WINDOW_HEIGHT)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .shadow(true)
+    .always_on_top(true)
+    .visible_on_all_workspaces(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .visible(false)
+    .build()?;
+    app.manage(TrayAnchorState(Mutex::new(None)));
+    Ok(())
+}
+
+#[tauri::command]
+fn show_main_app(app: AppHandle) {
+    show_main_window(&app);
+}
+
+#[tauri::command]
+fn hide_menu_bar_window(app: AppHandle) {
+    if let Some(window) = app.get_webview_window(MENU_BAR_WINDOW_LABEL) {
+        let _ = window.hide();
+    }
+    set_tray_highlighted(&app, false);
+}
+
+fn setup_tray(app: &mut tauri::App, visible: bool) -> tauri::Result<()> {
+    let status = MenuItem::with_id(
+        app,
+        "gist-tray-status",
+        "Gist is ready",
+        false,
+        None::<&str>,
+    )?;
+    let start_recording = MenuItem::with_id(
+        app,
+        TRAY_START_RECORDING_ID,
+        "Start Recording…",
+        true,
+        None::<&str>,
+    )?;
+    let pause_recording_item = MenuItem::with_id(
+        app,
+        TRAY_PAUSE_RECORDING_ID,
+        "Pause Recording",
+        false,
+        None::<&str>,
+    )?;
+    let stop_recording_item = MenuItem::with_id(
+        app,
+        TRAY_STOP_RECORDING_ID,
+        "Stop Recording",
+        false,
+        None::<&str>,
+    )?;
+    let open = MenuItem::with_id(app, TRAY_OPEN_ID, "Open Gist", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit Gist", true, None::<&str>)?;
+    let first_separator = PredefinedMenuItem::separator(app)?;
+    let second_separator = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &status,
+            &first_separator,
+            &start_recording,
+            &pause_recording_item,
+            &stop_recording_item,
+            &second_separator,
+            &open,
+            &quit,
+        ],
+    )?;
+
+    let tray = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(tray_icon(TrayRecordingState::Idle))
+        .icon_as_template(true)
+        .tooltip("Gist")
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_START_RECORDING_ID => {
+                show_menu_bar_window(app);
+            }
+            TRAY_PAUSE_RECORDING_ID => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = if audio::recorder::get_recording_state().is_paused {
+                        resume_recording(app.clone()).await
+                    } else {
+                        pause_recording(app.clone()).await
+                    };
+                    if let Err(error) = result {
+                        log::error!("Menu-bar pause/resume failed: {error}");
+                        show_main_window(&app);
+                    }
+                });
+            }
+            TRAY_STOP_RECORDING_ID => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = {
+                        let db = app.state::<Mutex<Database>>();
+                        stop_recording(app.clone(), db).await
+                    };
+                    if let Err(error) = result {
+                        log::error!("Menu-bar stop failed: {error}");
+                        show_main_window(&app);
+                    }
+                });
+            }
+            TRAY_OPEN_ID => show_main_window(app),
+            TRAY_QUIT_ID => {
+                if audio::recorder::is_recording() {
+                    show_main_window(app);
+                } else {
+                    app.exit(0);
+                }
+            }
+            _ => {}
+        })
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                rect,
+                button,
+                button_state,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(anchor) = app.try_state::<TrayAnchorState>() {
+                    if let Ok(mut stored) = anchor.0.lock() {
+                        *stored = Some(rect);
+                    }
+                }
+
+                if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                    toggle_menu_bar_window(app, rect);
+                }
+            }
+        })
+        .build(app)?;
+    tray.set_visible(visible)?;
+
+    app.manage(TrayMenuState {
+        status,
+        start_recording,
+        pause_recording: pause_recording_item,
+        stop_recording: stop_recording_item,
+        quit,
+    });
+    update_tray_recording_state(app.handle(), TrayRecordingState::Idle);
+    Ok(())
+}
 
 // ── Database ──────────────────────────────────────────────────────────────
 
@@ -322,7 +721,6 @@ struct StartRecordingData {
     formats: Vec<String>,
     llm_model: String,
     thinking: bool,
-    diarize: bool,
     #[serde(default = "default_num_speakers")]
     num_speakers: i64,
     created_session: bool,
@@ -1648,6 +2046,86 @@ async fn set_setting(
     Ok(())
 }
 
+fn stored_menu_bar_enabled(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![MENU_BAR_ENABLED_SETTING],
+        |row| row.get::<_, String>(0),
+    )
+    .map(|value| value != "false")
+    .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod menu_bar_setting_tests {
+    use super::*;
+
+    #[test]
+    fn menu_bar_defaults_to_enabled_and_reads_saved_value() {
+        let conn = Connection::open_in_memory().expect("open test database");
+        conn.execute(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .expect("create settings table");
+
+        assert!(stored_menu_bar_enabled(&conn));
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, 'false')",
+            params![MENU_BAR_ENABLED_SETTING],
+        )
+        .expect("save disabled setting");
+        assert!(!stored_menu_bar_enabled(&conn));
+        conn.execute(
+            "UPDATE settings SET value = 'true' WHERE key = ?1",
+            params![MENU_BAR_ENABLED_SETTING],
+        )
+        .expect("save enabled setting");
+        assert!(stored_menu_bar_enabled(&conn));
+    }
+}
+
+#[tauri::command]
+fn set_menu_bar_enabled(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let tray = app
+        .tray_by_id(TRAY_ID)
+        .ok_or_else(|| "The Gist menu-bar item is unavailable.".to_string())?;
+
+    let previous = {
+        let db = db.lock().map_err(|e| e.to_string())?;
+        let previous = stored_menu_bar_enabled(&db.conn);
+        db.conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![MENU_BAR_ENABLED_SETTING, if enabled { "true" } else { "false" }],
+            )
+            .map_err(|e| e.to_string())?;
+        previous
+    };
+
+    if let Err(error) = tray.set_visible(enabled) {
+        if let Ok(db) = db.lock() {
+            let _ = db.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![MENU_BAR_ENABLED_SETTING, if previous { "true" } else { "false" }],
+            );
+        }
+        return Err(error.to_string());
+    }
+
+    if !enabled {
+        if let Some(window) = app.get_webview_window(MENU_BAR_WINDOW_LABEL) {
+            let _ = window.hide();
+        }
+        set_tray_highlighted(&app, false);
+    }
+    Ok(())
+}
+
 fn total_memory_bytes() -> Result<u64, String> {
     #[cfg(target_os = "macos")]
     {
@@ -2298,6 +2776,11 @@ async fn start_recording(
         .await
         .map_err(|e| e.to_string())?;
     ensure_recording_space(&app)?;
+    let diarize = match data.input_kind.as_str() {
+        "session_transcript" => true,
+        "clinician_note" => false,
+        input_kind => return Err(format!("Unsupported recording type: {input_kind}")),
+    };
     let num_speakers = validate_num_speakers(data.num_speakers)?;
     let id = Uuid::new_v4().to_string();
     let partial_path = recordings_dir(&app)?.join(format!("recording_{}.partial.wav", id));
@@ -2310,7 +2793,7 @@ async fn start_recording(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'recording', NULL, ?11, ?11)",
             params![
                 id, data.session_id, partial_path.to_string_lossy(), data.input_kind, formats_json,
-                data.llm_model, if data.thinking { 1 } else { 0 }, if data.diarize { 1 } else { 0 },
+                data.llm_model, if data.thinking { 1 } else { 0 }, if diarize { 1 } else { 0 },
                 num_speakers, if data.created_session { 1 } else { 0 }, now
             ],
         ).map_err(|e| e.to_string())?;
@@ -2329,6 +2812,7 @@ async fn start_recording(
         );
         return Err(error.to_string());
     }
+    update_tray_recording_state(&app, TrayRecordingState::Recording);
     let db = db.lock().map_err(|e| e.to_string())?;
     get_recording_job_by_id(&db.conn, &id)
 }
@@ -2339,6 +2823,7 @@ async fn stop_recording(
     db: State<'_, Mutex<Database>>,
 ) -> Result<audio::recorder::StopRecordingResult, String> {
     let result = audio::recorder::stop_recording(app.clone()).map_err(|e| e.to_string())?;
+    update_tray_recording_state(&app, TrayRecordingState::Idle);
     let partial_path = managed_recording_path(&app, &result.file_path)?;
     let final_path = partial_path.with_file_name(format!("recording_{}.wav", result.job_id));
     std::fs::rename(&partial_path, &final_path).map_err(|e| e.to_string())?;
@@ -2360,12 +2845,16 @@ async fn stop_recording(
 
 #[tauri::command]
 async fn pause_recording(app: AppHandle) -> Result<(), String> {
-    audio::recorder::pause_recording(app).map_err(|e| e.to_string())
+    audio::recorder::pause_recording(app.clone()).map_err(|e| e.to_string())?;
+    update_tray_recording_state(&app, TrayRecordingState::Paused);
+    Ok(())
 }
 
 #[tauri::command]
 async fn resume_recording(app: AppHandle) -> Result<(), String> {
-    audio::recorder::resume_recording(app).map_err(|e| e.to_string())
+    audio::recorder::resume_recording(app.clone()).map_err(|e| e.to_string())?;
+    update_tray_recording_state(&app, TrayRecordingState::Recording);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2393,6 +2882,7 @@ pub fn run() {
                 log::error!(target: "gist.database", "event=database_initialization_failed");
                 e
             })?;
+            let menu_bar_enabled = stored_menu_bar_enabled(&db.conn);
             app.manage(Mutex::new(db));
             app.manage(Arc::new(Mutex::new(SidecarState {
                 request_tx: None,
@@ -2403,7 +2893,27 @@ pub fn run() {
                 started: false,
                 busy: false,
             })));
+            setup_menu_bar_window(app)?;
+            setup_tray(app, menu_bar_enabled)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == MENU_BAR_WINDOW_LABEL {
+                if let tauri::WindowEvent::Focused(focused) = event {
+                    set_tray_highlighted(window.app_handle(), *focused);
+                    if !*focused {
+                        let _ = window.hide();
+                    }
+                }
+                return;
+            }
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             start_sidecar,
@@ -2429,6 +2939,7 @@ pub fn run() {
             set_patient_formats,
             get_setting,
             set_setting,
+            set_menu_bar_enabled,
             get_system_memory_bytes,
             pick_audio_file,
             export_session_diagnostics,
@@ -2450,7 +2961,23 @@ pub fn run() {
             resume_recording,
             is_recording,
             get_recording_state,
+            show_main_app,
+            hide_menu_bar_window,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if audio::recorder::is_recording() {
+                    api.prevent_exit();
+                    show_main_window(app);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => show_main_window(app),
+            _ => {}
+        });
 }

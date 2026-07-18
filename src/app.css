@@ -1911,8 +1911,6 @@ button, input, select, textarea, a {
 
 .session-metadata-grid .form-group { margin-bottom: 0; }
 .session-metadata-help { grid-column: 1 / -1; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
-.recording-consent { display: flex; align-items: flex-start; gap: 9px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-subtle); color: var(--text-muted); font-size: 12px; line-height: 1.45; }
-.recording-consent input { width: auto; margin-top: 2px; accent-color: var(--accent); }
 
 @media (max-width: 760px) {
   .session-metadata-grid { grid-template-columns: 1fr 1fr; }

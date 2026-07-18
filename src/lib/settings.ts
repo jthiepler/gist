@@ -4,7 +4,7 @@ import { appearance } from "./stores";
 export interface Settings {
   defaultLlm: string;
   appearance: "system" | "light" | "dark";
-  confirmRecordingConsent: boolean;
+  menuBarEnabled: boolean;
   developerFeaturesEnabled: boolean;
   captureNoteDiagnostics: boolean;
 }
@@ -12,7 +12,7 @@ export interface Settings {
 const DEFAULTS: Settings = {
   defaultLlm: "",
   appearance: "system",
-  confirmRecordingConsent: true,
+  menuBarEnabled: true,
   developerFeaturesEnabled: false,
   captureNoteDiagnostics: false,
 };
@@ -29,8 +29,8 @@ export async function loadSettings(): Promise<Settings> {
     if (llm) s.defaultLlm = llm;
     const ap = await getSetting("appearance");
     if (ap === "system" || ap === "light" || ap === "dark") s.appearance = ap;
-    const consent = await getSetting("confirm_recording_consent");
-    if (consent !== null) s.confirmRecordingConsent = consent === "true";
+    const menuBar = await getSetting("menu_bar_enabled");
+    if (menuBar !== null) s.menuBarEnabled = menuBar !== "false";
     if (s.developerFeaturesEnabled) {
       const diagnostics = await getSetting("capture_note_generation_diagnostics");
       if (diagnostics !== null) s.captureNoteDiagnostics = diagnostics === "true";
