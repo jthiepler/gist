@@ -56,7 +56,7 @@ impl SleepAssertion {
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .ok();
-            return Self { child };
+            Self { child }
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -114,16 +114,8 @@ pub fn get_recording_state() -> RecordingStatePayload {
     } else {
         false
     };
-    let file_path = if let Some(ref state) = *recorder {
-        Some(state.file_path.clone())
-    } else {
-        None
-    };
-    let job_id = if let Some(ref state) = *recorder {
-        Some(state.job_id.clone())
-    } else {
-        None
-    };
+    let file_path = (*recorder).as_ref().map(|state| state.file_path.clone());
+    let job_id = (*recorder).as_ref().map(|state| state.job_id.clone());
     RecordingStatePayload {
         is_recording: IS_RECORDING.load(Ordering::Acquire),
         is_paused,
@@ -306,7 +298,7 @@ fn drain_and_write(state: &mut RecordingState) -> Result<Vec<f32>> {
 
     let mixed = state.mixer.drain_mixed();
     if !mixed.is_empty() {
-        let should_flush = recorded_elapsed(state).as_secs() % 5 == 0;
+        let should_flush = recorded_elapsed(state).as_secs().is_multiple_of(5);
         if let Some(ref mut writer) = state.wav_writer {
             writer.write_samples(&mixed)?;
             if should_flush {
