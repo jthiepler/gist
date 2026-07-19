@@ -2165,7 +2165,7 @@ fn total_memory_bytes() -> Result<u64, String> {
         if result != 0 || size != std::mem::size_of::<u64>() || bytes == 0 {
             return Err("Could not determine system memory".into());
         }
-        return Ok(bytes);
+        Ok(bytes)
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -2899,9 +2899,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
-            let db = Database::new(&handle).map_err(|e| {
+            let db = Database::new(&handle).inspect_err(|_| {
                 log::error!(target: "gist.database", "event=database_initialization_failed");
-                e
             })?;
             let menu_bar_enabled = stored_menu_bar_enabled(&db.conn);
             app.manage(Mutex::new(db));
