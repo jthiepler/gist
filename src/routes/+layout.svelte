@@ -307,14 +307,18 @@
   }
 
   onMount(async () => {
-    unlistenAppearance = await listen<string>("appearance-changed", (event) => {
-      if (event.payload === "system" || event.payload === "light" || event.payload === "dark") {
-        appearance.set(event.payload);
+    try {
+      unlistenAppearance = await listen<string>("appearance-changed", (event) => {
+        if (event.payload === "system" || event.payload === "light" || event.payload === "dark") {
+          appearance.set(event.payload);
+        }
+      });
+      if (layoutDestroyed) {
+        unlistenAppearance();
+        return;
       }
-    });
-    if (layoutDestroyed) {
-      unlistenAppearance();
-      return;
+    } catch (e) {
+      console.error("Could not synchronize appearance between windows:", e);
     }
 
     await loadAppearance();

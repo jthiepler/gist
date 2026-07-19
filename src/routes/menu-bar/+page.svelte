@@ -29,7 +29,15 @@
   type View = "patients" | "target" | "recording" | "saved" | "failed";
   type TargetMode = "new" | "existing";
 
-  const now = new Date();
+  function currentSessionDateTime() {
+    const now = new Date();
+    return {
+      date: now.toLocaleDateString("en-CA"),
+      time: `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
+    };
+  }
+
+  const initialSessionDateTime = currentSessionDateTime();
   let view = $state<View>("patients");
   let patients = $state<Patient[]>([]);
   let patientSearch = $state("");
@@ -38,10 +46,8 @@
   let selectedSessionId = $state("");
   let recordingType = $state<SessionInputKind>("session_transcript");
   let targetMode = $state<TargetMode>("new");
-  let sessionDate = $state(now.toLocaleDateString("en-CA"));
-  let sessionTime = $state(
-    `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
-  );
+  let sessionDate = $state(initialSessionDateTime.date);
+  let sessionTime = $state(initialSessionDateTime.time);
   let sessionTitle = $state("");
   let numSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let inputDevices = $state<AudioDevice[]>([]);
@@ -60,6 +66,7 @@
   let elapsed = $state(0);
   let level = $state(0);
   let activeSession = $state<Session | null>(null);
+  let activeJobId = $state("");
   let activePatientName = $state("");
   let savedNeedsReview = $state(false);
   let unlisteners: UnlistenFn[] = [];
@@ -112,6 +119,13 @@
     return [formatSessionTitle(session), formatSessionMeta(session)].join(" · ");
   }
 
+  function resetNewSessionFields() {
+    const current = currentSessionDateTime();
+    sessionDate = current.date;
+    sessionTime = current.time;
+    sessionTitle = "";
+  }
+
   async function closePopover() {
     try {
       await invoke("hide_menu_bar_window");
@@ -135,12 +149,21 @@
       isPaused = state.is_paused;
       elapsed = state.elapsed_seconds;
       if (!state.is_recording) {
-        if (view === "recording") view = "saved";
+        if (view === "recording" && activeJobId) {
+          const job = await getRecordingJob(activeJobId);
+          if (job.state === "recorded" || job.state === "completed") {
+            view = "saved";
+          } else if (job.state === "failed") {
+            error = job.error || "The recording could not be completed.";
+            view = "failed";
+          }
+        }
         return;
       }
 
       view = "recording";
       if (state.job_id) {
+        activeJobId = state.job_id;
         const job = await getRecordingJob(state.job_id);
         activeSession = await getSession(job.session_id);
         activePatientName =
@@ -177,9 +200,15 @@
     const listeners: UnlistenFn[] = [];
     try {
       listeners.push(await listen("menu-bar-opened", () => {
+        if (view === "patients" && !isRecording) resetNewSessionFields();
         void refreshPopoverData();
       }));
       listeners.push(await onRecordingTick((data) => {
+        if (!isRecording) {
+          activeJobId = "";
+          activeSession = null;
+          activePatientName = "";
+        }
         isRecording = true;
         isPaused = data.is_paused;
         elapsed = data.elapsed_seconds;
@@ -188,6 +217,7 @@
       }));
       listeners.push(await onRecordingStopped((data) => {
         recordingAction = null;
+        activeJobId = data.job_id;
         isRecording = false;
         isPaused = false;
         elapsed = 0;
@@ -228,9 +258,16 @@
 
   async function selectPatient(patient: Patient) {
     const loadVersion = ++targetLoadVersion;
+    resetNewSessionFields();
     selectedPatient = patient;
     selectedSessionId = "";
     targetMode = "new";
+    sessions = [];
+    inputDevices = [];
+    outputDevices = [];
+    selectedInputDevice = "";
+    selectedOutputDevice = "";
+    selectedFormats = [];
     error = "";
     loadingTarget = true;
     view = "target";
@@ -268,6 +305,7 @@
     view = "patients";
     selectedPatient = null;
     sessions = [];
+    selectedSessionId = "";
     loadingTarget = false;
     error = "";
   }
@@ -292,7 +330,7 @@
       if (!session) throw new Error("Choose an existing session.");
       if (targetMode === "new") createdSession = session;
 
-      await startRecording(
+      const job = await startRecording(
         {
           session_id: session.id,
           input_kind: recordingType,
@@ -309,6 +347,7 @@
       );
 
       activeSession = session;
+      activeJobId = job.id;
       activePatientName = selectedPatient.name;
       savedNeedsReview = false;
       isRecording = true;
@@ -368,10 +407,14 @@
     targetLoadVersion += 1;
     view = "patients";
     selectedPatient = null;
+    sessions = [];
+    selectedSessionId = "";
     activeSession = null;
+    activeJobId = "";
     activePatientName = "";
     patientSearch = "";
     savedNeedsReview = false;
+    resetNewSessionFields();
     error = "";
   }
 </script>

@@ -43,8 +43,6 @@ struct TrayMenuState {
     quit: MenuItem<tauri::Wry>,
 }
 
-struct TrayAnchorState(Mutex<Option<tauri::Rect>>);
-
 struct TrayAnimationState {
     generation: AtomicU64,
     icon_update: Mutex<()>,
@@ -63,7 +61,8 @@ impl TrayInteractionState {
             .suppress_reopen_until
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+        *deadline = popover_visible
+            .then(|| std::time::Instant::now() + std::time::Duration::from_millis(500));
     }
 
     fn take_close_on_mouse_up(&self) -> bool {
@@ -75,14 +74,9 @@ impl TrayInteractionState {
             .suppress_reopen_until
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match *deadline {
-            Some(value) if value >= std::time::Instant::now() => true,
-            Some(_) => {
-                *deadline = None;
-                false
-            }
-            None => false,
-        }
+        deadline
+            .take()
+            .is_some_and(|value| value >= std::time::Instant::now())
     }
 }
 
@@ -174,6 +168,11 @@ mod tray_icon_tests {
         assert!(state.take_close_on_mouse_up());
         assert!(!state.take_close_on_mouse_up());
         assert!(state.should_suppress_reopen());
+        assert!(!state.should_suppress_reopen());
+
+        state.begin_click(false);
+        assert!(!state.take_close_on_mouse_up());
+        assert!(!state.should_suppress_reopen());
     }
 }
 
@@ -310,11 +309,6 @@ fn position_menu_bar_window(app: &AppHandle, window: &WebviewWindow, rect: tauri
 }
 
 fn toggle_menu_bar_window(app: &AppHandle, rect: tauri::Rect) {
-    if let Some(anchor) = app.try_state::<TrayAnchorState>() {
-        if let Ok(mut stored) = anchor.0.lock() {
-            *stored = Some(rect);
-        }
-    }
     let Some(window) = app.get_webview_window(MENU_BAR_WINDOW_LABEL) else {
         return;
     };
@@ -347,7 +341,6 @@ fn setup_menu_bar_window(app: &mut tauri::App) -> tauri::Result<()> {
     .focused(false)
     .visible(false)
     .build()?;
-    app.manage(TrayAnchorState(Mutex::new(None)));
     Ok(())
 }
 
@@ -403,12 +396,6 @@ fn setup_tray(app: &mut tauri::App, visible: bool) -> tauri::Result<()> {
             } = event
             {
                 let app = tray.app_handle();
-                if let Some(anchor) = app.try_state::<TrayAnchorState>() {
-                    if let Ok(mut stored) = anchor.0.lock() {
-                        *stored = Some(rect);
-                    }
-                }
-
                 if button == MouseButton::Left {
                     match button_state {
                         MouseButtonState::Down => {
