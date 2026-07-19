@@ -73,6 +73,7 @@
   let unlistenRecTick: UnlistenFn | null = null;
   let unlistenRecStopped: UnlistenFn | null = null;
   let unlistenRecError: UnlistenFn | null = null;
+  let unlistenAppearance: UnlistenFn | null = null;
   let recordingPollInterval: ReturnType<typeof setInterval> | null = null;
   let updateCheckTimeout: ReturnType<typeof setTimeout> | null = null;
   let updateCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -306,8 +307,27 @@
   }
 
   onMount(async () => {
+    unlistenAppearance = await listen<string>("appearance-changed", (event) => {
+      if (event.payload === "system" || event.payload === "light" || event.payload === "dark") {
+        appearance.set(event.payload);
+      }
+    });
+    if (layoutDestroyed) {
+      unlistenAppearance();
+      return;
+    }
+
+    await loadAppearance();
+    if (layoutDestroyed) return;
+    themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    handleSystemThemeChange = () => {
+      if (get(appearance) !== "system") return;
+      darkMode.set(themeMediaQuery?.matches ?? false);
+      document.documentElement.classList.toggle("dark", themeMediaQuery?.matches ?? false);
+    };
+    themeMediaQuery.addEventListener("change", handleSystemThemeChange);
+
     if (isMenuBarWindow) {
-      await loadAppearance();
       return;
     }
     try {
@@ -391,17 +411,6 @@
       return;
     }
 
-    // Load dark mode setting
-    await loadAppearance();
-    if (layoutDestroyed) return;
-    themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    handleSystemThemeChange = () => {
-      if (get(appearance) !== "system") return;
-      darkMode.set(themeMediaQuery?.matches ?? false);
-      document.documentElement.classList.toggle("dark", themeMediaQuery?.matches ?? false);
-    };
-    themeMediaQuery.addEventListener("change", handleSystemThemeChange);
-
     // Recording state sync — recover state after navigation/reload
     try {
       const state = await getRecordingState();
@@ -483,6 +492,7 @@
     unlistenRecTick?.();
     unlistenRecStopped?.();
     unlistenRecError?.();
+    unlistenAppearance?.();
     if (recordingPollInterval) clearInterval(recordingPollInterval);
     if (updateCheckTimeout) clearTimeout(updateCheckTimeout);
     if (updateCheckInterval) clearInterval(updateCheckInterval);

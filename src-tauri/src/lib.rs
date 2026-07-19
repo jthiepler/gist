@@ -10,10 +10,13 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
@@ -26,9 +29,6 @@ mod audio;
 const TRAY_ID: &str = "gist-menu-bar";
 const MENU_BAR_WINDOW_LABEL: &str = "menu-bar";
 const MENU_BAR_ENABLED_SETTING: &str = "menu_bar_enabled";
-const TRAY_START_RECORDING_ID: &str = "gist-tray-start-recording";
-const TRAY_PAUSE_RECORDING_ID: &str = "gist-tray-pause-recording";
-const TRAY_STOP_RECORDING_ID: &str = "gist-tray-stop-recording";
 const TRAY_OPEN_ID: &str = "gist-tray-open";
 const TRAY_QUIT_ID: &str = "gist-tray-quit";
 
@@ -40,19 +40,56 @@ pub(crate) enum TrayRecordingState {
 }
 
 struct TrayMenuState {
-    status: MenuItem<tauri::Wry>,
-    start_recording: MenuItem<tauri::Wry>,
-    pause_recording: MenuItem<tauri::Wry>,
-    stop_recording: MenuItem<tauri::Wry>,
     quit: MenuItem<tauri::Wry>,
 }
 
 struct TrayAnchorState(Mutex<Option<tauri::Rect>>);
 
+struct TrayAnimationState {
+    generation: AtomicU64,
+    icon_update: Mutex<()>,
+}
+
+struct TrayInteractionState {
+    close_on_mouse_up: AtomicBool,
+    suppress_reopen_until: Mutex<Option<std::time::Instant>>,
+}
+
+impl TrayInteractionState {
+    fn begin_click(&self, popover_visible: bool) {
+        self.close_on_mouse_up
+            .store(popover_visible, Ordering::Release);
+        let mut deadline = self
+            .suppress_reopen_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+    }
+
+    fn take_close_on_mouse_up(&self) -> bool {
+        self.close_on_mouse_up.swap(false, Ordering::AcqRel)
+    }
+
+    fn should_suppress_reopen(&self) -> bool {
+        let mut deadline = self
+            .suppress_reopen_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *deadline {
+            Some(value) if value >= std::time::Instant::now() => true,
+            Some(_) => {
+                *deadline = None;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
 const MENU_BAR_WINDOW_WIDTH: f64 = 380.0;
 const MENU_BAR_WINDOW_HEIGHT: f64 = 620.0;
 
-fn tray_icon(state: TrayRecordingState) -> Image<'static> {
+fn tray_icon(state: TrayRecordingState, opacity: f32) -> Image<'static> {
     if matches!(state, TrayRecordingState::Idle) {
         let source = Image::from_bytes(include_bytes!("../icons/gist-menu-bar-template.png"))
             .expect("bundled menu-bar icon must be a valid PNG");
@@ -80,17 +117,13 @@ fn tray_icon(state: TrayRecordingState) -> Image<'static> {
             let center_y = y as f32 + 0.5 - SIZE as f32 / 2.0;
             let distance = (center_x * center_x + center_y * center_y).sqrt();
 
+            let base_alpha = ((6.2 - distance) * 255.0).clamp(0.0, 255.0) as u8;
             let (red, green, blue, alpha) = match state {
                 TrayRecordingState::Recording => {
-                    let alpha = ((6.2 - distance) * 255.0).clamp(0.0, 255.0) as u8;
-                    (220, 48, 53, alpha)
+                    let alpha = (base_alpha as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
+                    (231, 76, 60, alpha)
                 }
-                TrayRecordingState::Paused => {
-                    let ring = (4.2..=6.2).contains(&distance)
-                        || ((center_x.abs() >= 1.5 && center_x.abs() <= 2.7)
-                            && center_y.abs() <= 3.0);
-                    (220, 48, 53, if ring { 255 } else { 0 })
-                }
+                TrayRecordingState::Paused => (224, 181, 100, base_alpha),
                 TrayRecordingState::Idle => unreachable!("idle icon returned above"),
             };
 
@@ -110,7 +143,7 @@ mod tray_icon_tests {
 
     #[test]
     fn idle_icon_converts_white_canvas_to_transparency() {
-        let icon = tray_icon(TrayRecordingState::Idle);
+        let icon = tray_icon(TrayRecordingState::Idle, 1.0);
         let alpha_values = icon.rgba().chunks_exact(4).map(|pixel| pixel[3]);
         let first_alpha = icon.rgba()[3];
 
@@ -118,34 +151,92 @@ mod tray_icon_tests {
         assert_eq!(first_alpha, 0);
         assert!(alpha_values.max().is_some_and(|alpha| alpha > 200));
     }
+
+    #[test]
+    fn active_icons_match_recording_card_colors_and_opacity() {
+        let recording = tray_icon(TrayRecordingState::Recording, 0.3);
+        let paused = tray_icon(TrayRecordingState::Paused, 1.0);
+        let center = ((9 * 18 + 9) * 4) as usize;
+
+        assert_eq!(&recording.rgba()[center..center + 3], &[231, 76, 60]);
+        assert!((75..=77).contains(&recording.rgba()[center + 3]));
+        assert_eq!(&paused.rgba()[center..center + 4], &[224, 181, 100, 255]);
+    }
+
+    #[test]
+    fn tray_click_that_starts_open_closes_only_once() {
+        let state = TrayInteractionState {
+            close_on_mouse_up: AtomicBool::new(false),
+            suppress_reopen_until: Mutex::new(None),
+        };
+
+        state.begin_click(true);
+        assert!(state.take_close_on_mouse_up());
+        assert!(!state.take_close_on_mouse_up());
+        assert!(state.should_suppress_reopen());
+    }
+}
+
+fn set_tray_icon(app: &AppHandle, state: TrayRecordingState, opacity: f32, generation: u64) {
+    let Some(animation) = app.try_state::<TrayAnimationState>() else {
+        return;
+    };
+    let _guard = animation
+        .icon_update
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if animation.generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let is_idle = matches!(state, TrayRecordingState::Idle);
+        let _ = tray.set_icon_with_as_template(Some(tray_icon(state, opacity)), is_idle);
+    }
+}
+
+fn start_tray_recording_pulse(app: &AppHandle, generation: u64) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let started = std::time::Instant::now();
+        loop {
+            let elapsed = started.elapsed().as_secs_f32();
+            let phase = (elapsed % 1.5) / 1.5;
+            let opacity = 0.65 + 0.35 * (phase * std::f32::consts::TAU).cos();
+            set_tray_icon(&app, TrayRecordingState::Recording, opacity, generation);
+
+            let Some(animation) = app.try_state::<TrayAnimationState>() else {
+                return;
+            };
+            if animation.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        }
+    });
 }
 
 pub(crate) fn update_tray_recording_state(app: &AppHandle, state: TrayRecordingState) {
+    let generation = app
+        .state::<TrayAnimationState>()
+        .generation
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    set_tray_icon(app, state, 1.0, generation);
+    if matches!(state, TrayRecordingState::Recording) {
+        start_tray_recording_pulse(app, generation);
+    }
+
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let is_idle = matches!(state, TrayRecordingState::Idle);
         let tooltip = match state {
             TrayRecordingState::Idle => "Gist",
             TrayRecordingState::Recording => "Gist is recording",
             TrayRecordingState::Paused => "Gist recording is paused",
         };
-        let _ = tray.set_icon_with_as_template(Some(tray_icon(state)), is_idle);
         let _ = tray.set_tooltip(Some(tooltip));
     }
 
     if let Some(menu) = app.try_state::<TrayMenuState>() {
         let active = !matches!(state, TrayRecordingState::Idle);
-        let _ = menu.status.set_text(match state {
-            TrayRecordingState::Idle => "Gist is ready",
-            TrayRecordingState::Recording => "Recording in progress",
-            TrayRecordingState::Paused => "Recording paused",
-        });
-        let _ = menu.start_recording.set_enabled(!active);
-        let _ = menu.pause_recording.set_enabled(active);
-        let _ = menu.pause_recording.set_text(match state {
-            TrayRecordingState::Paused => "Resume Recording",
-            _ => "Pause Recording",
-        });
-        let _ = menu.stop_recording.set_enabled(active);
         let _ = menu.quit.set_enabled(!active);
     }
 }
@@ -218,21 +309,6 @@ fn position_menu_bar_window(app: &AppHandle, window: &WebviewWindow, rect: tauri
     let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
 }
 
-fn show_menu_bar_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(MENU_BAR_WINDOW_LABEL) else {
-        return;
-    };
-    if let Some(anchor) = app
-        .try_state::<TrayAnchorState>()
-        .and_then(|state| state.0.lock().ok().and_then(|anchor| *anchor))
-    {
-        position_menu_bar_window(app, &window, anchor);
-    }
-    let _ = window.show();
-    let _ = window.set_focus();
-    let _ = app.emit_to(MENU_BAR_WINDOW_LABEL, "menu-bar-opened", ());
-}
-
 fn toggle_menu_bar_window(app: &AppHandle, rect: tauri::Rect) {
     if let Some(anchor) = app.try_state::<TrayAnchorState>() {
         if let Ok(mut stored) = anchor.0.lock() {
@@ -289,88 +365,24 @@ fn hide_menu_bar_window(app: AppHandle) {
 }
 
 fn setup_tray(app: &mut tauri::App, visible: bool) -> tauri::Result<()> {
-    let status = MenuItem::with_id(
-        app,
-        "gist-tray-status",
-        "Gist is ready",
-        false,
-        None::<&str>,
-    )?;
-    let start_recording = MenuItem::with_id(
-        app,
-        TRAY_START_RECORDING_ID,
-        "Start Recording…",
-        true,
-        None::<&str>,
-    )?;
-    let pause_recording_item = MenuItem::with_id(
-        app,
-        TRAY_PAUSE_RECORDING_ID,
-        "Pause Recording",
-        false,
-        None::<&str>,
-    )?;
-    let stop_recording_item = MenuItem::with_id(
-        app,
-        TRAY_STOP_RECORDING_ID,
-        "Stop Recording",
-        false,
-        None::<&str>,
-    )?;
+    app.manage(TrayAnimationState {
+        generation: AtomicU64::new(0),
+        icon_update: Mutex::new(()),
+    });
+    app.manage(TrayInteractionState {
+        close_on_mouse_up: AtomicBool::new(false),
+        suppress_reopen_until: Mutex::new(None),
+    });
     let open = MenuItem::with_id(app, TRAY_OPEN_ID, "Open Gist", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit Gist", true, None::<&str>)?;
-    let first_separator = PredefinedMenuItem::separator(app)?;
-    let second_separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &status,
-            &first_separator,
-            &start_recording,
-            &pause_recording_item,
-            &stop_recording_item,
-            &second_separator,
-            &open,
-            &quit,
-        ],
-    )?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
 
     let tray = TrayIconBuilder::with_id(TRAY_ID)
-        .icon(tray_icon(TrayRecordingState::Idle))
+        .icon(tray_icon(TrayRecordingState::Idle, 1.0))
         .icon_as_template(true)
         .tooltip("Gist")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            TRAY_START_RECORDING_ID => {
-                show_menu_bar_window(app);
-            }
-            TRAY_PAUSE_RECORDING_ID => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let result = if audio::recorder::get_recording_state().is_paused {
-                        resume_recording(app.clone()).await
-                    } else {
-                        pause_recording(app.clone()).await
-                    };
-                    if let Err(error) = result {
-                        log::error!("Menu-bar pause/resume failed: {error}");
-                        show_main_window(&app);
-                    }
-                });
-            }
-            TRAY_STOP_RECORDING_ID => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let result = {
-                        let db = app.state::<Mutex<Database>>();
-                        stop_recording(app.clone(), db).await
-                    };
-                    if let Err(error) = result {
-                        log::error!("Menu-bar stop failed: {error}");
-                        show_main_window(&app);
-                    }
-                });
-            }
             TRAY_OPEN_ID => show_main_window(app),
             TRAY_QUIT_ID => {
                 if audio::recorder::is_recording() {
@@ -397,21 +409,35 @@ fn setup_tray(app: &mut tauri::App, visible: bool) -> tauri::Result<()> {
                     }
                 }
 
-                if button == MouseButton::Left && button_state == MouseButtonState::Up {
-                    toggle_menu_bar_window(app, rect);
+                if button == MouseButton::Left {
+                    match button_state {
+                        MouseButtonState::Down => {
+                            let popover_visible = app
+                                .get_webview_window(MENU_BAR_WINDOW_LABEL)
+                                .and_then(|window| window.is_visible().ok())
+                                .unwrap_or(false);
+                            app.state::<TrayInteractionState>()
+                                .begin_click(popover_visible);
+                        }
+                        MouseButtonState::Up => {
+                            if app.state::<TrayInteractionState>().take_close_on_mouse_up() {
+                                if let Some(window) = app.get_webview_window(MENU_BAR_WINDOW_LABEL)
+                                {
+                                    let _ = window.hide();
+                                }
+                                set_tray_highlighted(app, false);
+                            } else {
+                                toggle_menu_bar_window(app, rect);
+                            }
+                        }
+                    }
                 }
             }
         })
         .build(app)?;
     tray.set_visible(visible)?;
 
-    app.manage(TrayMenuState {
-        status,
-        start_recording,
-        pause_recording: pause_recording_item,
-        stop_recording: stop_recording_item,
-        quit,
-    });
+    app.manage(TrayMenuState { quit });
     update_tray_recording_state(app.handle(), TrayRecordingState::Idle);
     Ok(())
 }
@@ -2032,17 +2058,25 @@ async fn get_setting(
 
 #[tauri::command]
 async fn set_setting(
+    app: AppHandle,
     db: State<'_, Mutex<Database>>,
     key: String,
     value: String,
 ) -> Result<(), String> {
-    let db = db.lock().map_err(|e| e.to_string())?;
-    db.conn
-        .execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-            params![key, value],
-        )
-        .map_err(|e| e.to_string())?;
+    {
+        let db = db.lock().map_err(|e| e.to_string())?;
+        db.conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![key, value],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    if key == "appearance" {
+        if let Err(error) = app.emit("appearance-changed", value) {
+            log::warn!("Appearance was saved, but window synchronization failed: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -2977,7 +3011,14 @@ pub fn run() {
             tauri::RunEvent::Reopen {
                 has_visible_windows: false,
                 ..
-            } => show_main_window(app),
+            } => {
+                let suppress = app
+                    .try_state::<TrayInteractionState>()
+                    .is_some_and(|state| state.should_suppress_reopen());
+                if !suppress {
+                    show_main_window(app);
+                }
+            }
             _ => {}
         });
 }
