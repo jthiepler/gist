@@ -60,6 +60,7 @@
   import UpdatePrompt from "$lib/components/UpdatePrompt.svelte";
 
   let { children } = $props();
+  const isMenuBarWindow = getCurrentWindow().label === "menu-bar";
   let onboardingComplete = $state(false);
   let feedbackPromptPending = $state(false);
   let showFeedbackPrompt = $state(false);
@@ -72,6 +73,7 @@
   let unlistenRecTick: UnlistenFn | null = null;
   let unlistenRecStopped: UnlistenFn | null = null;
   let unlistenRecError: UnlistenFn | null = null;
+  let unlistenAppearance: UnlistenFn | null = null;
   let recordingPollInterval: ReturnType<typeof setInterval> | null = null;
   let updateCheckTimeout: ReturnType<typeof setTimeout> | null = null;
   let updateCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -92,7 +94,6 @@
       patient.name.toLocaleLowerCase().includes(patientSearch.trim().toLocaleLowerCase())
     )
   );
-
   function focusPatient(index: number) {
     const items = [...document.querySelectorAll<HTMLAnchorElement>(".patient-item")];
     if (items.length === 0) return;
@@ -307,6 +308,33 @@
 
   onMount(async () => {
     try {
+      unlistenAppearance = await listen<string>("appearance-changed", (event) => {
+        if (event.payload === "system" || event.payload === "light" || event.payload === "dark") {
+          appearance.set(event.payload);
+        }
+      });
+      if (layoutDestroyed) {
+        unlistenAppearance();
+        return;
+      }
+    } catch (e) {
+      console.error("Could not synchronize appearance between windows:", e);
+    }
+
+    await loadAppearance();
+    if (layoutDestroyed) return;
+    themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    handleSystemThemeChange = () => {
+      if (get(appearance) !== "system") return;
+      darkMode.set(themeMediaQuery?.matches ?? false);
+      document.documentElement.classList.toggle("dark", themeMediaQuery?.matches ?? false);
+    };
+    themeMediaQuery.addEventListener("change", handleSystemThemeChange);
+
+    if (isMenuBarWindow) {
+      return;
+    }
+    try {
       const launch = await recordAppLaunch();
       launchCount = launch.launchCount;
       feedbackPromptPending = launch.shouldPrompt;
@@ -386,17 +414,6 @@
       unlistenState();
       return;
     }
-
-    // Load dark mode setting
-    await loadAppearance();
-    if (layoutDestroyed) return;
-    themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    handleSystemThemeChange = () => {
-      if (get(appearance) !== "system") return;
-      darkMode.set(themeMediaQuery?.matches ?? false);
-      document.documentElement.classList.toggle("dark", themeMediaQuery?.matches ?? false);
-    };
-    themeMediaQuery.addEventListener("change", handleSystemThemeChange);
 
     // Recording state sync — recover state after navigation/reload
     try {
@@ -479,6 +496,7 @@
     unlistenRecTick?.();
     unlistenRecStopped?.();
     unlistenRecError?.();
+    unlistenAppearance?.();
     if (recordingPollInterval) clearInterval(recordingPollInterval);
     if (updateCheckTimeout) clearTimeout(updateCheckTimeout);
     if (updateCheckInterval) clearInterval(updateCheckInterval);
@@ -582,6 +600,9 @@
   }
 </script>
 
+{#if isMenuBarWindow}
+  {@render children()}
+{:else}
 <div class="app-shell">
   <div
     class="window-drag-region"
@@ -769,4 +790,5 @@
       </div>
     {/each}
   </section>
+{/if}
 {/if}

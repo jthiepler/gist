@@ -142,6 +142,10 @@ export async function setSetting(key: string, value: string): Promise<void> {
   return invoke<void>("set_setting", { key, value });
 }
 
+export async function setMenuBarEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>("set_menu_bar_enabled", { enabled });
+}
+
 export async function getSystemMemoryBytes(): Promise<number> {
   return invoke<number>("get_system_memory_bytes");
 }
@@ -284,7 +288,6 @@ export interface StartRecordingData {
   formats: string[];
   llm_model: string;
   thinking: boolean;
-  diarize: boolean;
   num_speakers: number;
   created_session: boolean;
 }

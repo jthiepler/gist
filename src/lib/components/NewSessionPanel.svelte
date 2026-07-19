@@ -16,7 +16,6 @@
   } from "$lib/rpc";
   import { ensureSidecar } from "$lib/ensureSidecar";
   import {
-    DEFAULT_DIARIZATION_ENABLED,
     DEFAULT_DIARIZATION_SPEAKERS,
     DIARIZATION_SPEAKER_COUNTS,
   } from "$lib/diarization";
@@ -67,7 +66,6 @@
 
   let sourceKind = $state<SessionInputKind>("session_transcript");
   let inputMethod = $state<InputMethod>("audio_file");
-  let diarizeSession = $state(DEFAULT_DIARIZATION_ENABLED);
   let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let audioPath = $state("");
   let textDraft = $state("");
@@ -88,8 +86,6 @@
 
   let defaultLlm = $state("");
   let thinking = $state(false);
-  let confirmRecordingConsent = $state(true);
-  let recordingConsentConfirmed = $state(false);
 
   let audioDevices = $state<AudioDevice[]>([]);
   let inputDevices = $state<AudioDevice[]>([]);
@@ -181,7 +177,6 @@
 
       const s = await loadSettings();
       if (s.defaultLlm) defaultLlm = s.defaultLlm;
-      confirmRecordingConsent = s.confirmRecordingConsent;
     })();
   });
 
@@ -211,7 +206,6 @@
       sourceKind = "clinician_note";
       inputMethod = "text";
     }
-    diarizeSession = sourceKind === "session_transcript" && DEFAULT_DIARIZATION_ENABLED;
     error = "";
     if ((inputMethod === "recording" || inputMethod === "dictation") && audioDevices.length === 0) {
       loadAudioDevices();
@@ -251,7 +245,6 @@
     if (ctx && ctx.patientId === patientId && $isRecording) {
       sourceKind = ctx.inputKind;
       inputMethod = ctx.inputKind === "clinician_note" ? "dictation" : "recording";
-      diarizeSession = ctx.diarize ?? false;
       diarizationSpeakers = ctx.numSpeakers ?? DEFAULT_DIARIZATION_SPEAKERS;
     }
   });
@@ -293,10 +286,6 @@
       return;
     }
     error = "";
-    if (confirmRecordingConsent && !recordingConsentConfirmed) {
-      error = "Confirm recording consent before starting.";
-      return;
-    }
     if (inputDevices.length === 0) {
       error = "A microphone is required to record. Check macOS Privacy & Security, then try again.";
       return;
@@ -328,7 +317,7 @@
         defaultLlm,
         thinking,
         inputKind: sourceKind,
-        diarize: sourceKind === "session_transcript" && diarizeSession,
+        diarize: sourceKind === "session_transcript",
         numSpeakers: diarizationSpeakers,
         session: createdSession,
         isNewSession: true,
@@ -339,7 +328,6 @@
         formats: sortedFormats,
         llm_model: defaultLlm,
         thinking,
-        diarize: ctx.diarize,
         num_speakers: ctx.numSpeakers,
         created_session: true,
       },
@@ -456,7 +444,7 @@
       try {
         const result = await transcribe(
           audioPath,
-          sourceKind === "session_transcript" && diarizeSession,
+          sourceKind === "session_transcript",
           diarizationSpeakers,
           defaultLlm,
         );
@@ -667,20 +655,14 @@
           />
           <button class="btn" onclick={pickFile} disabled={phase !== "idle"}>Browse</button>
         </div>
-        <label class="option-checkbox">
-          <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
-          <span>Identify speakers (experimental)</span>
+        <label class="diarization-speaker-select" for="new-session-speaker-count">
+          <span>Number of speakers</span>
+          <select id="new-session-speaker-count" bind:value={diarizationSpeakers} disabled={phase !== "idle"}>
+            {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+              <option value={speakerCount}>{speakerCount}</option>
+            {/each}
+          </select>
         </label>
-        {#if diarizeSession}
-          <label class="diarization-speaker-select" for="new-session-speaker-count">
-            <span>Number of speakers</span>
-            <select id="new-session-speaker-count" bind:value={diarizationSpeakers} disabled={phase !== "idle"}>
-              {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
-                <option value={speakerCount}>{speakerCount}</option>
-              {/each}
-            </select>
-          </label>
-        {/if}
       </div>
     </div>
   {:else if inputMethod === "recording" || inputMethod === "dictation"}
@@ -736,29 +718,17 @@
             <p class="record-hint">Computer audio capture requires macOS 14.2+. Gist will stop and show an error if it cannot capture the selected device.</p>
           {/if}
           {#if sourceKind === "session_transcript"}
-            <label class="option-checkbox">
-              <input type="checkbox" bind:checked={diarizeSession} disabled={phase !== "idle"} />
-              <span>Identify speakers (experimental)</span>
-            </label>
-            {#if diarizeSession}
-              <label class="diarization-speaker-select" for="new-session-recording-speaker-count">
-                <span>Number of speakers</span>
-                <select id="new-session-recording-speaker-count" bind:value={diarizationSpeakers} disabled={phase !== "idle"}>
-                  {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
-                    <option value={speakerCount}>{speakerCount}</option>
-                  {/each}
-                </select>
-              </label>
-            {/if}
-          {/if}
-          {#if confirmRecordingConsent}
-            <label class="recording-consent">
-              <input type="checkbox" bind:checked={recordingConsentConfirmed} disabled={phase !== "idle"} />
-              <span>I have confirmed consent to record according to my organization’s and jurisdiction’s requirements.</span>
+            <label class="diarization-speaker-select" for="new-session-recording-speaker-count">
+              <span>Number of speakers</span>
+              <select id="new-session-recording-speaker-count" bind:value={diarizationSpeakers} disabled={phase !== "idle"}>
+                {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+                  <option value={speakerCount}>{speakerCount}</option>
+                {/each}
+              </select>
             </label>
           {/if}
           <p class="record-hint">Gist records at about 345 MB per hour (roughly 690 MB for two hours). Keep your Mac awake while recording; Gist also prevents idle sleep during recording and processing.</p>
-          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
+          <button class="btn btn-primary record-start-btn" onclick={handleStartRecording} disabled={startingRecording || phase !== "idle" || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice)}>
             Start recording
           </button>
         </div>

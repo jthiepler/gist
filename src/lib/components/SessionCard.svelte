@@ -26,7 +26,6 @@
   } from "$lib/rpc";
   import { ensureSidecar } from "$lib/ensureSidecar";
   import {
-    DEFAULT_DIARIZATION_ENABLED,
     DEFAULT_DIARIZATION_SPEAKERS,
     DIARIZATION_SPEAKER_COUNTS,
   } from "$lib/diarization";
@@ -92,7 +91,6 @@
   let noteDraft = $state("");
   let inputDraft = $state("");
   let inputAudioPath = $state("");
-  let diarizeInput = $state(DEFAULT_DIARIZATION_ENABLED);
   let diarizationSpeakers = $state<number>(DEFAULT_DIARIZATION_SPEAKERS);
   let noteEditorEl = $state<HTMLTextAreaElement | null>(null);
   let inputEditorEl = $state<HTMLTextAreaElement | null>(null);
@@ -109,8 +107,6 @@
   let transcriptSearch = $state("");
   let defaultLlm = $state("");
   let thinking = $state(false);
-  let confirmRecordingConsent = $state(true);
-  let recordingConsentConfirmed = $state(false);
   let pendingInputRefreshSession = $state<Session | null>(null);
   let openSessionMenu = $state(false);
   let openNoteMenu = $state(false);
@@ -265,7 +261,6 @@
     addingInputKind = null;
     inputDraft = "";
     inputAudioPath = "";
-    diarizeInput = DEFAULT_DIARIZATION_ENABLED;
     diarizationSpeakers = DEFAULT_DIARIZATION_SPEAKERS;
   });
 
@@ -699,7 +694,6 @@
     editingInputId = null;
     addingInputKind = kind;
     inputMethod = method;
-    diarizeInput = kind === "session_transcript" && DEFAULT_DIARIZATION_ENABLED;
     diarizationSpeakers = DEFAULT_DIARIZATION_SPEAKERS;
     inputStatus = "";
     openInputMenu = null;
@@ -717,7 +711,6 @@
   async function loadExistingInputSettings() {
     const settings = await loadSettings();
     defaultLlm = settings.defaultLlm;
-    confirmRecordingConsent = settings.confirmRecordingConsent;
   }
 
   async function exportDiagnostics() {
@@ -1046,7 +1039,7 @@
       await loadExistingInputSettings();
       const result = await transcribe(
         inputAudioPath,
-        kind === "session_transcript" && diarizeInput,
+        kind === "session_transcript",
         diarizationSpeakers,
         defaultLlm,
       );
@@ -1106,11 +1099,6 @@
       inputStatus = "Select a computer-audio device before starting the session recording.";
       return;
     }
-    if (confirmRecordingConsent && !recordingConsentConfirmed) {
-      inputStatus = "Confirm recording consent before starting.";
-      return;
-    }
-
     try {
       const ctx: RecordingContext = {
         patientId: session.patient_id,
@@ -1118,7 +1106,7 @@
         defaultLlm,
         thinking,
         inputKind: kind,
-        diarize: kind === "session_transcript" && diarizeInput,
+        diarize: kind === "session_transcript",
         numSpeakers: diarizationSpeakers,
         session,
       };
@@ -1128,7 +1116,6 @@
         formats: ctx.formats,
         llm_model: defaultLlm,
         thinking,
-        diarize: ctx.diarize,
         num_speakers: ctx.numSpeakers,
         created_session: false,
       },
@@ -1143,7 +1130,6 @@
       addingInputKind = kind;
       inputMethod = method;
       inputStatus = "";
-      recordingConsentConfirmed = false;
     } catch (e) {
       inputStatus = `Failed to start ${method === "dictation" ? "dictation" : "recording"}: ${String(e)}`;
       recordingContext.set(null);
@@ -1696,20 +1682,14 @@
                           <button class="btn" onclick={pickInputAudioFile} disabled={processingInput}>Browse</button>
                         </div>
                         {#if addingInputKind === "session_transcript"}
-                          <label class="option-checkbox">
-                            <input type="checkbox" bind:checked={diarizeInput} disabled={processingInput} />
-                            <span>Identify speakers (experimental)</span>
+                          <label class="diarization-speaker-select" for={`input-file-speaker-count-${session.id}`}>
+                            <span>Number of speakers</span>
+                            <select id={`input-file-speaker-count-${session.id}`} bind:value={diarizationSpeakers} disabled={processingInput}>
+                              {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+                                <option value={speakerCount}>{speakerCount}</option>
+                              {/each}
+                            </select>
                           </label>
-                          {#if diarizeInput}
-                            <label class="diarization-speaker-select" for={`input-file-speaker-count-${session.id}`}>
-                              <span>Number of speakers</span>
-                              <select id={`input-file-speaker-count-${session.id}`} bind:value={diarizationSpeakers} disabled={processingInput}>
-                                {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
-                                  <option value={speakerCount}>{speakerCount}</option>
-                                {/each}
-                              </select>
-                            </label>
-                          {/if}
                         {/if}
                         <div class="editor-footer">
                           <button class="btn btn-sm btn-primary" onclick={() => saveAudioInput(addingInputKind!)} disabled={processingInput || !inputAudioPath}>
@@ -1761,29 +1741,17 @@
                               </div>
                             {/if}
                             {#if addingInputKind === "session_transcript"}
-                              <label class="option-checkbox">
-                                <input type="checkbox" bind:checked={diarizeInput} />
-                                <span>Identify speakers (experimental)</span>
-                              </label>
-                              {#if diarizeInput}
-                                <label class="diarization-speaker-select" for={`input-recording-speaker-count-${session.id}`}>
-                                  <span>Number of speakers</span>
-                                  <select id={`input-recording-speaker-count-${session.id}`} bind:value={diarizationSpeakers}>
-                                    {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
-                                      <option value={speakerCount}>{speakerCount}</option>
-                                    {/each}
-                                  </select>
-                                </label>
-                              {/if}
-                            {/if}
-                            {#if confirmRecordingConsent}
-                              <label class="recording-consent">
-                                <input type="checkbox" bind:checked={recordingConsentConfirmed} disabled={processingInput} />
-                                <span>I have confirmed consent to record according to my organization’s and jurisdiction’s requirements.</span>
+                              <label class="diarization-speaker-select" for={`input-recording-speaker-count-${session.id}`}>
+                                <span>Number of speakers</span>
+                                <select id={`input-recording-speaker-count-${session.id}`} bind:value={diarizationSpeakers}>
+                                  {#each DIARIZATION_SPEAKER_COUNTS as speakerCount}
+                                    <option value={speakerCount}>{speakerCount}</option>
+                                  {/each}
+                                </select>
                               </label>
                             {/if}
                             <p class="record-hint">About 345 MB per hour (roughly 690 MB for two hours). Gist prevents idle sleep while recording and processing.</p>
-                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")} disabled={processingInput || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice) || (confirmRecordingConsent && !recordingConsentConfirmed)}>
+                            <button class="btn btn-primary record-start-btn" onclick={() => startExistingRecording(addingInputKind!, inputMethod === "dictation" ? "dictation" : "recording")} disabled={processingInput || inputDevices.length === 0 || (inputMethod === "recording" && !selectedOutputDevice)}>
                               Start recording
                             </button>
                           </div>
