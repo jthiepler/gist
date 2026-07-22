@@ -372,7 +372,6 @@
 
 <div class="workspace-header">
   <h2>Settings</h2>
-  <div class="header-meta">Manage AI models, appearance, and app controls.</div>
   <div class="settings-save-status" aria-live="polite">
     {#if saveState === "saving"}Saving changes…{:else if saveState === "saved"}Changes saved automatically{/if}
   </div>
@@ -388,8 +387,7 @@
   <div class="model-group">
     <div class="model-group-title">Note-writing model</div>
     <p class="text-muted settings-help">
-      Models are downloaded once and run on this device. Qwen 3.5 4B is always used for evidence extraction;
-      your selected model writes the final note.
+      Models are downloaded once and run on this device.
     </p>
 
     <table class="model-table">
@@ -533,21 +531,17 @@
 
 <div class="settings-section">
   <h3>Data and backups</h3>
-  <p class="settings-help">
-    Backups are designed for restoring Gist on another Mac. Record archives contain simple patient and session
-    folders with ordinary text documents for long-term access without Gist. Audio and developer diagnostics are never included.
-  </p>
-  <div class="settings-row">
+  <div class="settings-row data-passphrase-row">
     <div>
       <div class="setting-label">Export or restore passphrase</div>
-      <div class="setting-desc">Optional. New encrypted exports require at least 12 characters. Restore accepts the original passphrase used by older Gist versions. Gist cannot recover a forgotten passphrase.</div>
+      <div class="setting-desc">Optional. Use at least 12 characters to encrypt a new export. Gist cannot recover a forgotten passphrase.</div>
     </div>
     <input
       class="data-passphrase-input"
       type="password"
       bind:value={dataPassphrase}
       autocomplete="new-password"
-      placeholder="Leave blank for no encryption"
+      placeholder="Optional passphrase"
       aria-label="Export or restore passphrase"
       disabled={dataOperation !== ""}
     />
@@ -576,14 +570,12 @@
   <div class="settings-row">
     <div>
       <div class="setting-label">Restore a Gist backup</div>
-      <div class="setting-desc">Validate a backup, preserve the current library as a rollback copy, and replace all current records. Unfinished recording recoveries must be processed or discarded first.</div>
+      <div class="setting-desc">Validate a backup, preserve the current library as a rollback copy, and replace all current records.</div>
     </div>
     <button class="btn btn-danger" type="button" onclick={handleRestore} disabled={dataOperation !== "" || $sidecarBusy}>
       {dataOperation === "restore" ? "Restoring…" : "Restore backup"}
     </button>
   </div>
-  <p class="text-muted settings-help">These files contain sensitive clinical information. Store them only in an appropriately secured location.</p>
-  <p class="text-muted settings-help">Unfinished recordings are kept locally for recovery for up to seven days, then deleted automatically. They are never included in either export.</p>
 </div>
 
 <div class="settings-section">

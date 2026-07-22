@@ -2900,7 +2900,22 @@ textarea {
 }
 
 .data-passphrase-input {
-  width: min(320px, 42vw);
+  width: min(420px, 100%);
+}
+
+.data-passphrase-row {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 12px;
+  margin: 4px 0 8px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-subtle);
+}
+
+.data-passphrase-row .setting-label {
+  font-weight: 600;
 }
 
 .error-text {
