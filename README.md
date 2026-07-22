@@ -151,20 +151,14 @@ Settings provides two data-portability workflows:
   no Markdown, JSON, internal IDs, or model details and opens with everyday
   applications such as TextEdit or Microsoft Word.
 
-Both formats exclude audio, models, caches, logs, recovery jobs, developer
-diagnostics, and application settings such as model selection, onboarding,
-appearance, menu-bar behavior, and feedback state. The restorable backup keeps
-model provenance attached to existing notes as clinical history, but it never
-causes a model to be selected or downloaded on restore; the readable archive
-omits model details entirely. The exports contain sensitive clinical
-information and must be stored in an appropriately secured location. Either
-export can optionally be wrapped in standard authenticated `age` encryption
-using a portable passphrase of at least 12 characters; Gist does not store or
-recover that passphrase.
-
-Gist will not restore a backup while an unfinished recording is waiting for
-recovery. Process or discard that recording first so restore cannot silently
-remove the only recoverable copy.
+Both formats exclude audio, models, caches, logs, recovery jobs, and application
+settings such as model selection, onboarding, appearance, menu-bar behavior,
+and feedback state. The restorable backup keeps model provenance attached to
+existing notes as clinical history, but it never causes a model to be selected
+or downloaded on restore; the readable archive omits model details entirely.
+Either export can optionally be wrapped in standard authenticated `age`
+encryption using a portable passphrase of at least 12 characters; Gist does not
+store or recover that passphrase.
 
 ## What works today
 
@@ -182,7 +176,8 @@ remove the only recoverable copy.
 - Custom note templates and prompts, with controls for which templates appear
   in the session workflow
 - Local client and session history
-- Plain-text export
+- Restorable backups for moving the complete written library between Macs
+- Human-readable record archives organized as plainly named text files
 - Downloadable 4B and 9B local note-writing models
 
 ### Speaker identification
