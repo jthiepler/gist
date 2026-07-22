@@ -4,11 +4,13 @@ import { DEFAULT_DIARIZATION_SPEAKERS } from "./diarization";
 import type {
   GenerateNotesResult,
   DiagnosticExportResult,
+  DataExportResult,
   ModelsResult,
   NoteFormatTemplate,
   NoteGenerationFormat,
   NoteGenerationSource,
   RecordingJob,
+  RestoreResult,
   Session,
   SessionInput,
   SessionNote,
@@ -122,6 +124,22 @@ export async function exportSessionDiagnostics(
   sessionId: string,
 ): Promise<DiagnosticExportResult | null> {
   return invoke<DiagnosticExportResult | null>("export_session_diagnostics", { sessionId });
+}
+
+export async function exportBackup(passphrase: string | null): Promise<DataExportResult | null> {
+  return invoke<DataExportResult | null>("export_backup", { passphrase });
+}
+
+export async function exportHumanArchive(passphrase: string | null): Promise<DataExportResult | null> {
+  return invoke<DataExportResult | null>("export_human_archive", { passphrase });
+}
+
+export async function pickBackupForRestore(passphrase: string | null): Promise<DataExportResult | null> {
+  return invoke<DataExportResult | null>("pick_backup_for_restore", { passphrase });
+}
+
+export async function restoreBackup(path: string, passphrase: string | null): Promise<RestoreResult> {
+  return invoke<RestoreResult>("restore_backup", { path, passphrase });
 }
 
 export async function downloadModel(model: string): Promise<void> {

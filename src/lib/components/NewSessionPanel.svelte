@@ -489,7 +489,7 @@
         source: startsFromText ? SESSION_INPUT_SOURCES.typed : SESSION_INPUT_SOURCES.uploadAudio,
         title: sourceLabel,
         text: sourceText,
-        audio_file: startsFromAudioFile ? audioPath : null,
+        audio_file: null,
         duration_seconds: startsFromAudioFile ? duration : null,
         include_in_notes: true,
       });

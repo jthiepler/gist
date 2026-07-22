@@ -108,6 +108,10 @@ All names and clinical material shown in these screenshots are synthetic.
 
 - Gist has no account, cloud sync, telemetry, or subscription.
 - Client records are stored in a local SQLite database.
+- Recorded audio is transient: Gist deletes it after the transcript has been
+  committed. Interrupted recordings are retained for recovery for at most
+  seven days and are never included in backups or exports. Uploaded audio
+  remains user-owned and Gist does not retain a copy or durable path to it.
 - Audio transcription runs with Parakeet TDT through `mlx-audio`.
 - Speaker diarization runs with `pyannote` Community-1; a local language model
   then makes a best-effort practitioner/patient role assignment.
@@ -129,7 +133,38 @@ Local processing reduces the number of parties and systems that handle
 clinical data. It does **not**, by itself, make a clinician or practice
 compliant with HIPAA or any other regulation. Device security, access control,
 backups, consent, retention, and the way the app is used remain the
-practitioner's responsibility.
+practitioner’s responsibility.
+
+## Backups and record archives
+
+Settings provides two data-portability workflows:
+
+- A `.gistbackup` contains a checksummed SQLite snapshot for restoring the
+  complete written Gist library on another Mac, including customized versions
+  of built-in templates, completely custom templates, and patient template
+  preferences. Restore validates and stages the snapshot before replacing the
+  current library, keeps the destination Mac's current application settings,
+  and retains a local rollback copy of the pre-restore database.
+- A human-readable ZIP contains a `Start Here.txt` guide, plainly named patient
+  and session folders, and ordinary `.txt` documents for session information,
+  source texts, current notes, note history, and custom templates. It contains
+  no Markdown, JSON, internal IDs, or model details and opens with everyday
+  applications such as TextEdit or Microsoft Word.
+
+Both formats exclude audio, models, caches, logs, recovery jobs, developer
+diagnostics, and application settings such as model selection, onboarding,
+appearance, menu-bar behavior, and feedback state. The restorable backup keeps
+model provenance attached to existing notes as clinical history, but it never
+causes a model to be selected or downloaded on restore; the readable archive
+omits model details entirely. The exports contain sensitive clinical
+information and must be stored in an appropriately secured location. Either
+export can optionally be wrapped in standard authenticated `age` encryption
+using a portable passphrase of at least 12 characters; Gist does not store or
+recover that passphrase.
+
+Gist will not restore a backup while an unfinished recording is waiting for
+recovery. Process or discard that recording first so restore cannot silently
+remove the only recoverable copy.
 
 ## What works today
 
@@ -331,6 +366,10 @@ private practitioners who have tried the workflow. You can complete the
 [gist@jthiepler.com](mailto:gist@jthiepler.com), or use
 [GitHub Issues](https://github.com/jthiepler/gist/issues) for technical reports.
 Documentation improvements and focused code contributions are also welcome.
+Developers and coding agents working on persistence, pipeline formats, audio
+retention, backup, restore, or archives must follow the engineering contract in
+[DATA_LIFECYCLE.md](DATA_LIFECYCLE.md). General repository workflow and
+validation requirements live in [AGENTS.md](AGENTS.md).
 
 Please never include protected health information or real client material in
 an issue, discussion, commit, or pull request.

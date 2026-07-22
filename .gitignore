@@ -63,5 +63,10 @@ __pycache__/
 /samples/
 test*.md
 
+# User data exports and encrypted artifacts
+*.gistbackup
+*.age
+gist-record-archive-*.zip
+
 # Local reference checkout
 /meetily/

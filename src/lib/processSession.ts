@@ -122,7 +122,9 @@ export async function processSessionFromAudio(
         source,
         title: SESSION_INPUT_LABELS[ctx.inputKind],
         text: transcript,
-        audio_file: audioPath,
+        // Recorded audio is referenced only until the transcript commit has
+        // succeeded. Uploaded files are user-owned and are never retained.
+        audio_file: ctx.jobId ? audioPath : null,
         duration_seconds: duration,
         include_in_notes: true,
       });
@@ -131,18 +133,17 @@ export async function processSessionFromAudio(
       ? session
       : (await getSession(session.id)) ?? session;
     sessionUpdate.set(updatedSession);
+    if (ctx.jobId) {
+      await completeRecordingJob(ctx.jobId);
+      updatedSession = (await getSession(session.id)) ?? updatedSession;
+      sessionUpdate.set(updatedSession);
+    }
   } catch (e) {
     resetProgress();
     throw new Error(`Failed to save session: ${String(e)}`);
   }
 
   if (!ctx.isNewSession && !ctx.regenerateExisting) {
-    try {
-      if (ctx.jobId) await completeRecordingJob(ctx.jobId);
-    } catch (e) {
-      resetProgress();
-      throw new Error(`Source was saved, but recording recovery could not be completed: ${String(e)}`);
-    }
     progressPercent.set(100);
     resetProgress();
     return updatedSession;
@@ -159,7 +160,6 @@ export async function processSessionFromAudio(
       verb: ctx.isNewSession ? "Generating" : "Updating",
       onSessionUpdate: (nextSession) => sessionUpdate.set(nextSession),
     });
-    if (ctx.jobId) await completeRecordingJob(ctx.jobId);
     progressPercent.set(100);
     resetProgress();
     return processedSession;

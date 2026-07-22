@@ -41,6 +41,7 @@ export interface SessionNote {
   note: string | null;
   llm_model: string | null;
   created_at: string;
+  updated_at: string | null;
 }
 
 export interface RecordingJob {
@@ -140,3 +141,14 @@ export interface DiagnosticExportResult {
   path: string;
   run_count: number;
 }
+
+export interface RecordCounts {
+  patient_count: number;
+  session_count: number;
+}
+
+export interface DataExportResult extends RecordCounts {
+  path: string;
+}
+
+export type RestoreResult = RecordCounts;

@@ -33,6 +33,7 @@
   import {
     getSessionDurationSeconds,
     getInputLabel,
+    isTranscribedInputSource,
     SESSION_INPUT_LABELS,
     SESSION_INPUT_SOURCES,
   } from "$lib/sessionInputs";
@@ -203,7 +204,7 @@
       session.updated_at,
       session.created_at,
       ...session.inputs.map((input) => input.updated_at),
-      ...session.notes.map((note) => note.created_at),
+      ...session.notes.map((note) => note.updated_at ?? note.created_at),
     ].filter(Boolean) as string[];
     const latest = timestamps.sort((a, b) => Date.parse(b) - Date.parse(a))[0];
     return latest ? new Date(latest).toLocaleDateString([], { month: "short", day: "numeric" }) : "";
@@ -229,7 +230,7 @@
       0,
     );
     const oldestNoteUpdate = Math.min(
-      ...session.notes.map((note) => Date.parse(note.created_at)),
+      ...session.notes.map((note) => Date.parse(note.updated_at ?? note.created_at)),
     );
     return latestSourceUpdate > oldestNoteUpdate;
   });
@@ -450,7 +451,11 @@
   function sourceMetadata(input: SessionInput) {
     const parts: string[] = [];
     if (input.duration_seconds) parts.push(`${Math.round(input.duration_seconds / 60)} min`);
-    parts.push(input.source === "typed" ? "Clinician authored" : input.audio_file ? "Transcribed locally" : "Text source");
+    parts.push(input.source === SESSION_INPUT_SOURCES.typed
+      ? "Clinician authored"
+      : isTranscribedInputSource(input.source)
+        ? "Transcribed locally"
+        : "Text source");
     parts.push(`Added ${new Date(input.created_at).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}`);
     return parts.join(" · ");
   }
@@ -1051,7 +1056,7 @@
         source: SESSION_INPUT_SOURCES.uploadAudio,
         title: SESSION_INPUT_LABELS[kind],
         text: result.transcript,
-        audio_file: inputAudioPath,
+        audio_file: null,
         duration_seconds: result.duration,
         include_in_notes: true,
       });
