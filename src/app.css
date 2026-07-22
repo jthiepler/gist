@@ -2899,6 +2899,16 @@ textarea {
   margin-top: 2px;
 }
 
+.data-passphrase-input {
+  width: min(320px, 42vw);
+}
+
+.error-text {
+  margin: 8px 0;
+  color: var(--error);
+  font-size: 12px;
+}
+
 .model-table {
   width: 100%;
   overflow: hidden;

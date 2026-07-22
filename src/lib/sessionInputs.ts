@@ -12,6 +12,16 @@ export const SESSION_INPUT_SOURCES = {
   dictation: "dictation",
 } as const;
 
+const TRANSCRIBED_INPUT_SOURCES = new Set<string>([
+  SESSION_INPUT_SOURCES.uploadAudio,
+  SESSION_INPUT_SOURCES.recording,
+  SESSION_INPUT_SOURCES.dictation,
+]);
+
+export function isTranscribedInputSource(source: string): boolean {
+  return TRANSCRIBED_INPUT_SOURCES.has(source);
+}
+
 const INPUT_ORDER: Record<string, number> = {
   session_transcript: 0,
   clinician_note: 1,

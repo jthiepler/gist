@@ -3,8 +3,12 @@
   import {
     deleteModel,
     downloadModel,
+    exportBackup,
+    exportHumanArchive,
     getSystemMemoryBytes,
     listModels,
+    pickBackupForRestore,
+    restoreBackup,
     setMenuBarEnabled,
   } from "$lib/rpc";
   import {
@@ -25,13 +29,17 @@
   } from "$lib/models";
   import { loadSettings, saveSetting } from "$lib/settings";
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import { confirm, message } from "@tauri-apps/plugin-dialog";
+  import { relaunch } from "@tauri-apps/plugin-process";
   import {
     FEEDBACK_EMAIL_URL,
     FEEDBACK_GITHUB_URL,
     FEEDBACK_SURVEY_URL,
     dismissFeedbackPrompt,
   } from "$lib/feedback";
-  import type { ModelsResult } from "$lib/types";
+  import type { ModelsResult, RecordCounts } from "$lib/types";
+
+  type DataOperation = "backup" | "archive" | "restore";
 
   let models = $state<ModelsResult>(createModelState());
   let modelStatus = $state<"unknown" | "loading" | "ready">("unknown");
@@ -51,6 +59,11 @@
   let modelRefreshInFlight = false;
   let stopBusySubscription: (() => void) | undefined;
   let totalMemoryGb = $state<number | null>(null);
+  let dataOperation = $state<"" | DataOperation>("");
+  let dataPassphrase = $state("");
+  let validExportPassphrase = $derived(
+    dataPassphrase.trim().length === 0 || Array.from(dataPassphrase.trim()).length >= 12,
+  );
   let recommendedLlm = $derived(
     totalMemoryGb === null ? null : recommendedLlmForMemory(totalMemoryGb),
   );
@@ -282,6 +295,79 @@
       error = `Could not open feedback link: ${String(e)}`;
     }
   }
+
+  function currentDataPassphrase(): string | null {
+    return dataPassphrase.trim().length === 0 ? null : dataPassphrase;
+  }
+
+  function recordCountSummary(result: RecordCounts): string {
+    return `${result.patient_count} patient${result.patient_count === 1 ? "" : "s"} and ${result.session_count} session${result.session_count === 1 ? "" : "s"}`;
+  }
+
+  async function runDataOperation(
+    operation: DataOperation,
+    failureMessage: string,
+    action: (passphrase: string | null) => Promise<void>,
+  ) {
+    if (dataOperation) return;
+    dataOperation = operation;
+    error = "";
+    try {
+      await action(currentDataPassphrase());
+    } catch (e) {
+      error = `${failureMessage}: ${String(e)}`;
+    } finally {
+      dataPassphrase = "";
+      dataOperation = "";
+    }
+  }
+
+  async function handleBackupExport() {
+    await runDataOperation("backup", "Could not create backup", async (passphrase) => {
+      const result = await exportBackup(passphrase);
+      if (result) {
+        await message(
+          `Backed up ${recordCountSummary(result)}.\n\n${result.path}`,
+          { title: "Backup created", kind: "info" },
+        );
+      }
+    });
+  }
+
+  async function handleArchiveExport() {
+    await runDataOperation("archive", "Could not create record archive", async (passphrase) => {
+      const result = await exportHumanArchive(passphrase);
+      if (result) {
+        await message(
+          `Exported a readable archive containing ${recordCountSummary(result)}.\n\n${result.path}`,
+          { title: "Record archive created", kind: "info" },
+        );
+      }
+    });
+  }
+
+  async function handleRestore() {
+    await runDataOperation("restore", "Could not restore backup", async (passphrase) => {
+      const backup = await pickBackupForRestore(passphrase);
+      if (!backup) return;
+      const approved = await confirm(
+        `This backup contains ${recordCountSummary(backup)}.\n\nRestoring replaces the entire current Gist library. Gist will keep an automatic rollback copy of the current library.`,
+        {
+          title: "Replace current library?",
+          kind: "warning",
+          okLabel: "Restore and replace",
+          cancelLabel: "Cancel",
+        },
+      );
+      if (!approved) return;
+      const result = await restoreBackup(backup.path, passphrase);
+      await message(
+        `Restored ${recordCountSummary(result)}. Gist will now restart.`,
+        { title: "Backup restored", kind: "info" },
+      );
+      await relaunch();
+    });
+  }
 </script>
 
 <div class="workspace-header">
@@ -443,6 +529,61 @@
       <div class="toggle-knob"></div>
     </button>
   </div>
+</div>
+
+<div class="settings-section">
+  <h3>Data and backups</h3>
+  <p class="settings-help">
+    Backups are designed for restoring Gist on another Mac. Record archives contain simple patient and session
+    folders with ordinary text documents for long-term access without Gist. Audio and developer diagnostics are never included.
+  </p>
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Export or restore passphrase</div>
+      <div class="setting-desc">Optional. New encrypted exports require at least 12 characters. Restore accepts the original passphrase used by older Gist versions. Gist cannot recover a forgotten passphrase.</div>
+    </div>
+    <input
+      class="data-passphrase-input"
+      type="password"
+      bind:value={dataPassphrase}
+      autocomplete="new-password"
+      placeholder="Leave blank for no encryption"
+      aria-label="Export or restore passphrase"
+      disabled={dataOperation !== ""}
+    />
+  </div>
+  {#if !validExportPassphrase}
+    <p class="error-text">New encrypted exports require at least 12 characters. Shorter passphrases can only be used to restore an existing backup.</p>
+  {/if}
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Restorable Gist backup</div>
+      <div class="setting-desc">Create a verified snapshot of patients, sessions, sources, notes, revisions, and custom templates.</div>
+    </div>
+    <button class="btn btn-primary" type="button" onclick={handleBackupExport} disabled={dataOperation !== "" || $sidecarBusy || !validExportPassphrase}>
+      {dataOperation === "backup" ? "Creating…" : "Create backup"}
+    </button>
+  </div>
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Human-readable record archive</div>
+      <div class="setting-desc">Export an easy-to-browse ZIP of plainly named folders and text files. Leave the passphrase blank for a normal ZIP that opens without special software.</div>
+    </div>
+    <button class="btn" type="button" onclick={handleArchiveExport} disabled={dataOperation !== "" || $sidecarBusy || !validExportPassphrase}>
+      {dataOperation === "archive" ? "Exporting…" : "Export archive"}
+    </button>
+  </div>
+  <div class="settings-row">
+    <div>
+      <div class="setting-label">Restore a Gist backup</div>
+      <div class="setting-desc">Validate a backup, preserve the current library as a rollback copy, and replace all current records. Unfinished recording recoveries must be processed or discarded first.</div>
+    </div>
+    <button class="btn btn-danger" type="button" onclick={handleRestore} disabled={dataOperation !== "" || $sidecarBusy}>
+      {dataOperation === "restore" ? "Restoring…" : "Restore backup"}
+    </button>
+  </div>
+  <p class="text-muted settings-help">These files contain sensitive clinical information. Store them only in an appropriately secured location.</p>
+  <p class="text-muted settings-help">Unfinished recordings are kept locally for recovery for up to seven days, then deleted automatically. They are never included in either export.</p>
 </div>
 
 <div class="settings-section">

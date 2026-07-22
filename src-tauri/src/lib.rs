@@ -1,13 +1,14 @@
-use chrono::Local;
-use rusqlite::{params, Connection, Row};
+use chrono::{DateTime, Duration, Local, Utc};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -25,6 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 mod audio;
+mod data_management;
 
 const TRAY_ID: &str = "gist-menu-bar";
 const MENU_BAR_WINDOW_LABEL: &str = "menu-bar";
@@ -488,7 +490,7 @@ fn fetch_session_inputs(conn: &Connection, session_id: &str) -> Result<Vec<Sessi
 
 fn fetch_session_notes(conn: &Connection, session_id: &str) -> Result<Vec<SessionNote>, String> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, format, note, llm_model, created_at FROM session_notes WHERE session_id = ?1 ORDER BY format ASC",
+        "SELECT id, session_id, format, note, llm_model, created_at, updated_at FROM session_notes WHERE session_id = ?1 ORDER BY format ASC",
     ).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![session_id], |row| {
@@ -499,6 +501,7 @@ fn fetch_session_notes(conn: &Connection, session_id: &str) -> Result<Vec<Sessio
                 note: row.get(3)?,
                 llm_model: row.get(4)?,
                 created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -510,105 +513,434 @@ struct Database {
     conn: Connection,
 }
 
+// Released migrations are append-only compatibility code. Add migrate_to_vN,
+// test every supported upgrade path, and follow DATA_LIFECYCLE.md before
+// incrementing this value.
+const LATEST_DATABASE_SCHEMA_VERSION: i64 = 3;
+
+fn table_has_column(tx: &Transaction<'_>, table: &str, column: &str) -> Result<bool, String> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+fn decode_patient_formats(value: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|format| !format.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn migrate_to_v1(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS patients (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+            date TEXT NOT NULL,
+            start_time TEXT,
+            title TEXT,
+            session_type TEXT,
+            updated_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_inputs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            title TEXT NOT NULL,
+            text TEXT NOT NULL,
+            audio_file TEXT,
+            duration_seconds REAL,
+            transcription_model TEXT,
+            include_in_notes INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS evidence_ledger_cache (
+            source_id TEXT PRIMARY KEY REFERENCES session_inputs(id) ON DELETE CASCADE,
+            source_fingerprint TEXT NOT NULL,
+            model_identity TEXT NOT NULL,
+            pipeline_version TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS note_formats (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            prompt TEXT NOT NULL,
+            is_builtin INTEGER DEFAULT 0,
+            hidden INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS session_notes (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            format TEXT NOT NULL,
+            note TEXT,
+            llm_model TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            finalized_at TEXT,
+            UNIQUE(session_id, format)
+        );
+        CREATE TABLE IF NOT EXISTS note_revisions (
+            id TEXT PRIMARY KEY,
+            note_id TEXT NOT NULL REFERENCES session_notes(id) ON DELETE CASCADE,
+            revision_number INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            llm_model TEXT,
+            created_at TEXT NOT NULL,
+            supersedes_revision_id TEXT REFERENCES note_revisions(id),
+            amendment_reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS patient_note_formats (
+            patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+            format_name TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            PRIMARY KEY(patient_id, format_name)
+        );
+        CREATE TABLE IF NOT EXISTS recording_jobs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            audio_file TEXT NOT NULL,
+            input_kind TEXT NOT NULL,
+            formats_json TEXT NOT NULL,
+            llm_model TEXT NOT NULL,
+            thinking INTEGER NOT NULL,
+            diarize INTEGER NOT NULL,
+            num_speakers INTEGER NOT NULL DEFAULT 2,
+            created_session INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+    )
+    .map_err(|e| e.to_string())?;
+
+    for (table, column, definition) in [
+        ("patients", "updated_at", "updated_at TEXT"),
+        ("sessions", "start_time", "start_time TEXT"),
+        ("sessions", "title", "title TEXT"),
+        ("sessions", "session_type", "session_type TEXT"),
+        ("sessions", "updated_at", "updated_at TEXT"),
+        ("note_formats", "hidden", "hidden INTEGER DEFAULT 0"),
+        ("note_formats", "updated_at", "updated_at TEXT"),
+        ("session_notes", "updated_at", "updated_at TEXT"),
+        ("session_notes", "finalized_at", "finalized_at TEXT"),
+        (
+            "recording_jobs",
+            "num_speakers",
+            "num_speakers INTEGER NOT NULL DEFAULT 2",
+        ),
+    ] {
+        if !table_has_column(&tx, table, column)? {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    tx.execute(
+        "UPDATE patients SET updated_at = created_at WHERE updated_at IS NULL",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE note_formats SET updated_at = created_at WHERE updated_at IS NULL",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE session_notes SET updated_at = created_at WHERE updated_at IS NULL",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    let legacy_notes = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, note, llm_model, created_at
+                 FROM session_notes
+                 WHERE note IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM note_revisions WHERE note_id = session_notes.id)",
+            )
+            .map_err(|e| e.to_string())?;
+        let notes = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        notes
+    };
+    for (note_id, content, llm_model, created_at) in legacy_notes {
+        tx.execute(
+            "INSERT INTO note_revisions (id, note_id, revision_number, content, llm_model, created_at)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                note_id,
+                content,
+                llm_model,
+                created_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let legacy_patient_formats = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT substr(key, length('patient_formats_') + 1), value
+                 FROM settings WHERE key GLOB 'patient_formats_*'",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    for (patient_id, serialized_formats) in legacy_patient_formats {
+        let patient_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM patients WHERE id = ?1)",
+                params![patient_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !patient_exists {
+            continue;
+        }
+        for (position, format_name) in decode_patient_formats(&serialized_formats)
+            .into_iter()
+            .enumerate()
+        {
+            tx.execute(
+                "INSERT OR IGNORE INTO patient_note_formats (patient_id, format_name, position)
+                 VALUES (?1, ?2, ?3)",
+                params![patient_id, format_name, position as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![format!("patient_formats_{patient_id}")],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.pragma_update(None, "user_version", 1)
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn migrate_to_v2(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // Early development builds briefly created a second migration ledger.
+    // SQLite's user_version is the single source of truth.
+    tx.execute_batch("DROP TABLE IF EXISTS schema_migrations")
+        .map_err(|e| e.to_string())?;
+    tx.pragma_update(None, "user_version", 2)
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn migrate_to_v3(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    if !table_has_column(&tx, "note_revisions", "revision_number")? {
+        tx.execute_batch(
+            "ALTER TABLE note_revisions
+             ADD COLUMN revision_number INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute_batch(
+        "WITH ranked AS (
+            SELECT rowid AS revision_rowid,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY note_id
+                       ORDER BY julianday(created_at), rowid
+                   ) AS position
+            FROM note_revisions
+         )
+         UPDATE note_revisions
+         SET revision_number = (
+             SELECT position FROM ranked
+             WHERE ranked.revision_rowid = note_revisions.rowid
+         );
+         DROP INDEX IF EXISTS note_revisions_note_created;
+         CREATE UNIQUE INDEX IF NOT EXISTS note_revisions_note_number
+             ON note_revisions(note_id, revision_number);",
+    )
+    .map_err(|e| e.to_string())?;
+    tx.pragma_update(None, "user_version", 3)
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn migrate_database(conn: &mut Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA secure_delete = ON;
+         PRAGMA trusted_schema = OFF;",
+    )
+    .map_err(|e| e.to_string())?;
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version > LATEST_DATABASE_SCHEMA_VERSION {
+        return Err(format!(
+            "This Gist data library uses schema version {version}, but this app supports up to version {LATEST_DATABASE_SCHEMA_VERSION}."
+        ));
+    }
+    if version < 1 {
+        migrate_to_v1(conn)?;
+    }
+    if version < 2 {
+        migrate_to_v2(conn)?;
+    }
+    if version < 3 {
+        migrate_to_v3(conn)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod database_migration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_notes_receive_an_initial_immutable_revision() {
+        let mut conn = Connection::open_in_memory().expect("database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE patients (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, patient_id TEXT NOT NULL REFERENCES patients(id), date TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE TABLE session_notes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), format TEXT NOT NULL, note TEXT, llm_model TEXT, created_at TEXT NOT NULL, UNIQUE(session_id, format));
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO patients VALUES ('patient', 'Patient', '2026-01-01T00:00:00Z');
+             INSERT INTO sessions VALUES ('session', 'patient', '2026-01-02', '2026-01-02T00:00:00Z');
+             INSERT INTO session_notes VALUES ('note', 'session', 'SOAP', 'Original note', 'model', '2026-01-02T01:00:00Z');
+             INSERT INTO settings VALUES ('patient_formats_patient', '[\"SOAP\",\"DAP\"]');",
+        )
+        .expect("legacy schema");
+
+        migrate_database(&mut conn).expect("migration");
+        let (content, model): (String, Option<String>) = conn
+            .query_row(
+                "SELECT content, llm_model FROM note_revisions WHERE note_id = 'note'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("revision");
+        assert_eq!(content, "Original note");
+        assert_eq!(model.as_deref(), Some("model"));
+        let migrated_formats = conn
+            .prepare(
+                "SELECT format_name FROM patient_note_formats WHERE patient_id = 'patient' ORDER BY position",
+            )
+            .expect("format query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("formats")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("format rows");
+        assert_eq!(migrated_formats, vec!["SOAP", "DAP"]);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = 'patient_formats_patient'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("legacy preference count"),
+            0
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            LATEST_DATABASE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v2_removes_the_redundant_migration_ledger() {
+        let mut conn = Connection::open_in_memory().expect("database");
+        conn.execute_batch(
+            "CREATE TABLE note_revisions (
+                 id TEXT PRIMARY KEY,
+                 note_id TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 llm_model TEXT,
+                 created_at TEXT NOT NULL,
+                 supersedes_revision_id TEXT,
+                 amendment_reason TEXT
+             );
+             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+             PRAGMA user_version = 1;",
+        )
+        .expect("v1 schema marker");
+
+        migrate_database(&mut conn).expect("migration");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("table count"),
+            0
+        );
+    }
+}
+
 impl Database {
     fn new(app: &AppHandle) -> Result<Self, String> {
         let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        if let Err(error) = data_management::cleanup_stale_data_operation_directories(&app_dir) {
+            log::warn!("Private data-operation cleanup could not finish: {error}");
+        }
         let db_path = app_dir.join("gist.db");
-        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS patients (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-                date TEXT NOT NULL,
-                start_time TEXT,
-                title TEXT,
-                session_type TEXT,
-                updated_at TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS session_inputs (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                kind TEXT NOT NULL,
-                source TEXT NOT NULL,
-                title TEXT NOT NULL,
-                text TEXT NOT NULL,
-                audio_file TEXT,
-                duration_seconds REAL,
-                transcription_model TEXT,
-                include_in_notes INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS evidence_ledger_cache (
-                source_id TEXT PRIMARY KEY REFERENCES session_inputs(id) ON DELETE CASCADE,
-                source_fingerprint TEXT NOT NULL,
-                model_identity TEXT NOT NULL,
-                pipeline_version TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS note_formats (
-                id TEXT PRIMARY KEY,
-                name TEXT UNIQUE NOT NULL,
-                prompt TEXT NOT NULL,
-                is_builtin INTEGER DEFAULT 0,
-                hidden INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
-             CREATE TABLE IF NOT EXISTS session_notes (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                format TEXT NOT NULL,
-                note TEXT,
-                llm_model TEXT,
-                created_at TEXT NOT NULL,
-                UNIQUE(session_id, format)
-            );
-             CREATE TABLE IF NOT EXISTS recording_jobs (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                audio_file TEXT NOT NULL,
-                input_kind TEXT NOT NULL,
-                formats_json TEXT NOT NULL,
-                llm_model TEXT NOT NULL,
-                thinking INTEGER NOT NULL,
-                diarize INTEGER NOT NULL,
-                num_speakers INTEGER NOT NULL DEFAULT 2,
-                created_session INTEGER NOT NULL,
-                state TEXT NOT NULL,
-                error TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );",
-        )
-        .map_err(|e| e.to_string())?;
-
-        let _ = conn.execute(
-            "ALTER TABLE note_formats ADD COLUMN hidden INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN start_time TEXT", []);
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", []);
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN session_type TEXT", []);
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE recording_jobs ADD COLUMN num_speakers INTEGER NOT NULL DEFAULT 2",
-            [],
-        );
+        let mut conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+        migrate_database(&mut conn)?;
+        data_management::verify_current_database(&conn)?;
 
         // Built-in templates contain format-specific instructions only. Keep them
         // synchronized with the bundled catalog; UI customization creates a
@@ -625,17 +957,21 @@ impl Database {
             if builtin_exists == 0 {
                 let id = Uuid::new_v4().to_string();
                 conn.execute(
-                    "INSERT INTO note_formats (id, name, prompt, is_builtin, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
+                    "INSERT INTO note_formats (id, name, prompt, is_builtin, created_at, updated_at) VALUES (?1, ?2, ?3, 1, ?4, ?4)",
                     params![id, name, prompt, now],
                 )
                 .map_err(|e| e.to_string())?;
             } else {
                 conn.execute(
-                    "UPDATE note_formats SET prompt = ?1 WHERE name = ?2 AND is_builtin = 1",
-                    params![prompt, name],
+                    "UPDATE note_formats SET prompt = ?1, updated_at = ?3 WHERE name = ?2 AND is_builtin = 1",
+                    params![prompt, name, now],
                 )
                 .map_err(|e| e.to_string())?;
             }
+        }
+
+        if let Err(error) = cleanup_transient_audio(app, &conn, None) {
+            log::warn!("Transient recording cleanup could not finish: {error}");
         }
 
         Ok(Database { conn })
@@ -691,6 +1027,7 @@ struct SessionNote {
     note: Option<String>,
     llm_model: Option<String>,
     created_at: String,
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1621,7 +1958,7 @@ async fn create_patient(
     let now = Local::now().to_rfc3339();
     db.conn
         .execute(
-            "INSERT INTO patients (id, name, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO patients (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
             params![id, data.name, now],
         )
         .map_err(|e| e.to_string())?;
@@ -1638,8 +1975,8 @@ async fn update_patient(db: State<'_, Mutex<Database>>, data: UpdatePatient) -> 
     let affected = db
         .conn
         .execute(
-            "UPDATE patients SET name = ?1 WHERE id = ?2",
-            params![data.name, data.id],
+            "UPDATE patients SET name = ?1, updated_at = ?3 WHERE id = ?2",
+            params![data.name, data.id, Local::now().to_rfc3339()],
         )
         .map_err(|e| e.to_string())?;
     if affected == 0 {
@@ -1671,8 +2008,12 @@ async fn delete_patient(
     let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM sessions WHERE patient_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM patients WHERE id = ?1", params![id])
+    let deleted = tx
+        .execute("DELETE FROM patients WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    if deleted != 1 {
+        return Err("Patient not found".into());
+    }
     tx.commit().map_err(|e| e.to_string())?;
     drop(db);
     if let Err(error) = remove_managed_audio_files(&app, paths) {
@@ -1792,9 +2133,13 @@ async fn delete_session(
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let paths = audio_paths_for_session(&db.conn, &id)?;
-    db.conn
+    let deleted = db
+        .conn
         .execute("DELETE FROM sessions WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    if deleted != 1 {
+        return Err("Session not found".into());
+    }
     drop(db);
     if let Err(error) = remove_managed_audio_files(&app, paths) {
         log::warn!("Session was deleted, but managed audio cleanup failed: {error}");
@@ -1805,6 +2150,27 @@ async fn delete_session(
     Ok(())
 }
 
+fn retained_recording_reference(
+    conn: &Connection,
+    session_id: &str,
+    audio_file: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(path) = audio_file else {
+        return Ok(None);
+    };
+    let is_recoverable_recording: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM recording_jobs
+                WHERE session_id = ?1 AND audio_file = ?2 AND state != 'completed'
+             )",
+            params![session_id, path],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(is_recoverable_recording.then(|| path.to_string()))
+}
+
 #[tauri::command]
 async fn create_session_input(
     db: State<'_, Mutex<Database>>,
@@ -1813,6 +2179,8 @@ async fn create_session_input(
     let db = db.lock().map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
     let now = Local::now().to_rfc3339();
+    let audio_file =
+        retained_recording_reference(&db.conn, &data.session_id, data.audio_file.as_deref())?;
     db.conn
         .execute(
             "INSERT INTO session_inputs (
@@ -1826,7 +2194,7 @@ async fn create_session_input(
                 data.source,
                 data.title,
                 data.text,
-                data.audio_file,
+                audio_file,
                 data.duration_seconds,
                 data.transcription_model,
                 if data.include_in_notes { 1 } else { 0 },
@@ -1933,6 +2301,101 @@ fn get_session_input_by_id(conn: &Connection, id: &str) -> Result<SessionInput, 
     .map_err(|e| e.to_string())
 }
 
+struct ExistingNoteRevisionState {
+    note_id: String,
+    content: Option<String>,
+    llm_model: Option<String>,
+    latest_revision_id: Option<String>,
+    latest_revision_number: Option<i64>,
+}
+
+fn store_session_note(
+    conn: &Connection,
+    session_id: String,
+    format: String,
+    note: String,
+    llm_model: Option<String>,
+) -> Result<SessionNote, String> {
+    let now = Local::now().to_rfc3339();
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let existing: Option<ExistingNoteRevisionState> = tx
+        .query_row(
+            "SELECT n.id, n.note, n.llm_model,
+                    (SELECT r.id FROM note_revisions r WHERE r.note_id = n.id ORDER BY r.revision_number DESC LIMIT 1),
+                    (SELECT MAX(r.revision_number) FROM note_revisions r WHERE r.note_id = n.id)
+             FROM session_notes n WHERE n.session_id = ?1 AND n.format = ?2",
+            params![session_id, format],
+            |row| {
+                Ok(ExistingNoteRevisionState {
+                    note_id: row.get(0)?,
+                    content: row.get(1)?,
+                    llm_model: row.get(2)?,
+                    latest_revision_id: row.get(3)?,
+                    latest_revision_number: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let unchanged = existing.as_ref().is_some_and(|current| {
+        current.content.as_deref() == Some(note.as_str()) && current.llm_model == llm_model
+    });
+    let note_id = existing
+        .as_ref()
+        .map(|current| current.note_id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let (previous_revision, revision_number) = existing
+        .map(|current| {
+            (
+                current.latest_revision_id,
+                current.latest_revision_number.unwrap_or(0) + 1,
+            )
+        })
+        .unwrap_or((None, 1));
+
+    if !unchanged {
+        tx.execute(
+            "INSERT INTO session_notes (id, session_id, format, note, llm_model, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(session_id, format) DO UPDATE SET note = ?4, llm_model = ?5, updated_at = ?6",
+            params![note_id, session_id, format, note, llm_model, now],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO note_revisions (id, note_id, revision_number, content, llm_model, created_at, supersedes_revision_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                note_id,
+                revision_number,
+                note,
+                llm_model,
+                now,
+                previous_revision
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let row = tx
+        .query_row(
+            "SELECT id, session_id, format, note, llm_model, created_at, updated_at FROM session_notes WHERE session_id = ?1 AND format = ?2",
+            params![session_id, format],
+            |row| Ok(SessionNote {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                format: row.get(2)?,
+                note: row.get(3)?,
+                llm_model: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(row)
+}
+
 #[tauri::command]
 async fn create_session_note(
     db: State<'_, Mutex<Database>>,
@@ -1942,32 +2405,78 @@ async fn create_session_note(
     llm_model: Option<String>,
 ) -> Result<SessionNote, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let id = Uuid::new_v4().to_string();
-    let now = Local::now().to_rfc3339();
-    db.conn
-        .execute(
-            "INSERT INTO session_notes (id, session_id, format, note, llm_model, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(session_id, format) DO UPDATE SET note = ?4, llm_model = ?5, created_at = ?6",
-            params![id, session_id, format, note, llm_model, now],
+    store_session_note(&db.conn, session_id, format, note, llm_model)
+}
+
+#[cfg(test)]
+mod note_revision_tests {
+    use super::*;
+
+    #[test]
+    fn no_op_note_saves_do_not_create_duplicate_revisions() {
+        let mut conn = Connection::open_in_memory().expect("database");
+        migrate_database(&mut conn).expect("schema");
+        let patient_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO patients (id, name, created_at, updated_at) VALUES (?1, 'Patient', ?2, ?2)",
+            params![patient_id, "2026-01-01T00:00:00Z"],
         )
-        .map_err(|e| e.to_string())?;
-    // Fetch the actual row back so id/created_at are correct on conflict
-    let row = db.conn
-        .query_row(
-            "SELECT id, session_id, format, note, llm_model, created_at FROM session_notes WHERE session_id = ?1 AND format = ?2",
-            params![session_id, format],
-            |row| Ok(SessionNote {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                format: row.get(2)?,
-                note: row.get(3)?,
-                llm_model: row.get(4)?,
-                created_at: row.get(5)?,
-            }),
+        .expect("patient");
+        conn.execute(
+            "INSERT INTO sessions (id, patient_id, date, created_at, updated_at) VALUES (?1, ?2, '2026-01-01', ?3, ?3)",
+            params![session_id, patient_id, "2026-01-01T00:00:00Z"],
         )
-        .map_err(|e| e.to_string())?;
-    Ok(row)
+        .expect("session");
+
+        store_session_note(
+            &conn,
+            session_id.clone(),
+            "SOAP".into(),
+            "First".into(),
+            Some("model".into()),
+        )
+        .expect("first revision");
+        store_session_note(
+            &conn,
+            session_id.clone(),
+            "SOAP".into(),
+            "First".into(),
+            Some("model".into()),
+        )
+        .expect("no-op save");
+        store_session_note(
+            &conn,
+            session_id,
+            "SOAP".into(),
+            "Second".into(),
+            Some("model".into()),
+        )
+        .expect("second revision");
+
+        let revision_count = conn
+            .query_row("SELECT COUNT(*) FROM note_revisions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("revision count");
+        assert_eq!(revision_count, 2);
+        let revision_numbers = conn
+            .prepare("SELECT revision_number FROM note_revisions ORDER BY revision_number")
+            .expect("revision query")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("revision numbers")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("revision number rows");
+        assert_eq!(revision_numbers, vec![1, 2]);
+        let linked_revisions = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_revisions WHERE supersedes_revision_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("linked revision count");
+        assert_eq!(linked_revisions, 1);
+    }
 }
 
 #[tauri::command]
@@ -1976,31 +2485,21 @@ async fn get_patient_formats(
     patient_id: String,
 ) -> Result<Option<Vec<String>>, String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let key = format!("patient_formats_{}", patient_id);
-    let mut stmt = db
+    let mut format_stmt = db
         .conn
-        .prepare("SELECT value FROM settings WHERE key = ?1")
+        .prepare(
+            "SELECT format_name FROM patient_note_formats WHERE patient_id = ?1 ORDER BY position",
+        )
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query_map(params![key], |row| row.get::<_, String>(0))
+    let formats = format_stmt
+        .query_map(params![patient_id], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    match rows.next() {
-        Some(Ok(v)) => serde_json::from_str::<Vec<String>>(&v)
-            .or_else(|_| {
-                // Migrate values written by versions that used comma-delimited
-                // storage. New values are JSON so custom names can contain commas.
-                Ok::<Vec<String>, serde_json::Error>(
-                    v.split(',')
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                )
-            })
-            .map(Some)
-            .map_err(|e| e.to_string()),
-        _ => Ok(None),
+    if !formats.is_empty() {
+        return Ok(Some(formats));
     }
+    Ok(None)
 }
 
 #[tauri::command]
@@ -2010,14 +2509,40 @@ async fn set_patient_formats(
     formats: Vec<String>,
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let key = format!("patient_formats_{}", patient_id);
-    let value = serde_json::to_string(&formats).map_err(|e| e.to_string())?;
-    db.conn
-        .execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
-            params![key, value],
+    let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let patient_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM patients WHERE id = ?1)",
+            params![patient_id],
+            |row| row.get(0),
         )
         .map_err(|e| e.to_string())?;
+    if !patient_exists {
+        return Err("Patient not found".into());
+    }
+    tx.execute(
+        "DELETE FROM patient_note_formats WHERE patient_id = ?1",
+        params![patient_id],
+    )
+    .map_err(|e| e.to_string())?;
+    for (position, format_name) in formats.iter().enumerate() {
+        let format_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM note_formats WHERE name = ?1)",
+                params![format_name],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !format_exists {
+            return Err(format!("Unknown note format: {format_name}"));
+        }
+        tx.execute(
+            "INSERT INTO patient_note_formats (patient_id, format_name, position) VALUES (?1, ?2, ?3)",
+            params![patient_id, format_name, position as i64],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2230,7 +2755,7 @@ async fn create_note_format(
     let now = Local::now().to_rfc3339();
     db.conn
         .execute(
-            "INSERT INTO note_formats (id, name, prompt, is_builtin, hidden, created_at) VALUES (?1, ?2, ?3, 0, 0, ?4)",
+            "INSERT INTO note_formats (id, name, prompt, is_builtin, hidden, created_at, updated_at) VALUES (?1, ?2, ?3, 0, 0, ?4, ?4)",
             params![id, data.name, data.prompt, now],
         )
         .map_err(|e| e.to_string())?;
@@ -2251,32 +2776,44 @@ async fn update_note_format(
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    // Get old name to cascade rename in session_notes
-    let old_name: Option<String> = tx
+    // Built-in definitions are app-owned. User customization creates a
+    // separate custom template so catalog synchronization cannot overwrite it.
+    let existing: Option<(String, bool)> = tx
         .query_row(
-            "SELECT name FROM note_formats WHERE id = ?1",
+            "SELECT name, is_builtin != 0 FROM note_formats WHERE id = ?1",
             params![data.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .ok();
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((old_name, is_builtin)) = existing else {
+        return Err("Format not found".into());
+    };
+    if is_builtin {
+        return Err(
+            "Built-in formats cannot be edited directly. Create a customized copy instead.".into(),
+        );
+    }
     let affected = tx
         .execute(
-            "UPDATE note_formats SET name = ?1, prompt = ?2 WHERE id = ?3",
-            params![data.name, data.prompt, data.id],
+            "UPDATE note_formats SET name = ?1, prompt = ?2, updated_at = ?4 WHERE id = ?3",
+            params![data.name, data.prompt, data.id, Local::now().to_rfc3339()],
         )
         .map_err(|e| e.to_string())?;
     if affected == 0 {
         return Err("Format not found".into());
     }
-    // Cascade rename session_notes if name changed
-    if let Some(old) = old_name {
-        if old != data.name {
-            tx.execute(
-                "UPDATE session_notes SET format = ?1 WHERE format = ?2",
-                params![data.name, old],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+    if old_name != data.name {
+        tx.execute(
+            "UPDATE session_notes SET format = ?1 WHERE format = ?2",
+            params![data.name, old_name],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE patient_note_formats SET format_name = ?1 WHERE format_name = ?2",
+            params![data.name, old_name],
+        )
+        .map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
@@ -2320,23 +2857,32 @@ async fn delete_note_format(db: State<'_, Mutex<Database>>, id: String) -> Resul
             name, note_count
         ));
     }
-    db.conn
-        .execute("DELETE FROM note_formats WHERE id = ?1", params![id])
+    let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_note_formats WHERE format_name = ?1",
+        params![name],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM note_formats WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 async fn reset_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    let name: String = db
+    let (name, is_builtin): (String, bool) = db
         .conn
         .query_row(
-            "SELECT name FROM note_formats WHERE id = ?1",
+            "SELECT name, is_builtin != 0 FROM note_formats WHERE id = ?1",
             params![id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
+    if !is_builtin {
+        return Err("Only built-in formats can be reset.".into());
+    }
     let default_prompt = default_formats()
         .into_iter()
         .find(|(default_name, _)| default_name == &name)
@@ -2345,8 +2891,8 @@ async fn reset_note_format(db: State<'_, Mutex<Database>>, id: String) -> Result
         Some(prompt) => {
             db.conn
                 .execute(
-                    "UPDATE note_formats SET prompt = ?1 WHERE id = ?2",
-                    params![prompt, id],
+                    "UPDATE note_formats SET prompt = ?1, updated_at = ?3 WHERE id = ?2",
+                    params![prompt, id, Local::now().to_rfc3339()],
                 )
                 .map_err(|e| e.to_string())?;
             Ok(())
@@ -2361,12 +2907,16 @@ async fn toggle_note_format_hidden(
     id: String,
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    db.conn
+    let affected = db
+        .conn
         .execute(
-            "UPDATE note_formats SET hidden = NOT hidden WHERE id = ?1",
-            params![id],
+            "UPDATE note_formats SET hidden = NOT hidden, updated_at = ?2 WHERE id = ?1",
+            params![id, Local::now().to_rfc3339()],
         )
         .map_err(|e| e.to_string())?;
+    if affected != 1 {
+        return Err("Format not found".into());
+    }
     Ok(())
 }
 
@@ -2458,6 +3008,168 @@ async fn export_session_diagnostics(
     }))
 }
 
+async fn choose_save_path(
+    app: &AppHandle,
+    filter_name: &str,
+    extensions: &[&str],
+    file_name: String,
+) -> Result<Option<PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter(filter_name, extensions)
+        .set_file_name(file_name)
+        .save_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let selected = rx.await.map_err(|e| e.to_string())?;
+    selected
+        .map(|path| path.into_path().map_err(|e| e.to_string()))
+        .transpose()
+}
+
+#[tauri::command]
+async fn export_backup(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    passphrase: Option<String>,
+) -> Result<Option<data_management::ExportResult>, String> {
+    if audio::recorder::is_recording() {
+        return Err("Finish the current recording before creating a backup.".into());
+    }
+    let Some(path) = choose_save_path(
+        &app,
+        "Gist backup",
+        &["gistbackup", "age"],
+        format!(
+            "gist-backup-{}.gistbackup{}",
+            Local::now().format("%Y-%m-%d"),
+            if passphrase
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                ".age"
+            } else {
+                ""
+            }
+        ),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if audio::recorder::is_recording() {
+        return Err("Finish the current recording before creating a backup.".into());
+    }
+    let workspace = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let app_version = app.package_info().version.to_string();
+    let db = db.lock().map_err(|e| e.to_string())?;
+    data_management::export_backup(
+        &db.conn,
+        &path,
+        &app_version,
+        &workspace,
+        passphrase.as_deref(),
+    )
+    .map(Some)
+}
+
+#[tauri::command]
+async fn export_human_archive(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    passphrase: Option<String>,
+) -> Result<Option<data_management::ExportResult>, String> {
+    if audio::recorder::is_recording() {
+        return Err("Finish the current recording before creating an archive.".into());
+    }
+    let Some(path) = choose_save_path(
+        &app,
+        "ZIP archive",
+        &["zip", "age"],
+        format!(
+            "gist-record-archive-{}.zip{}",
+            Local::now().format("%Y-%m-%d"),
+            if passphrase
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                ".age"
+            } else {
+                ""
+            }
+        ),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if audio::recorder::is_recording() {
+        return Err("Finish the current recording before creating an archive.".into());
+    }
+    let workspace = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let app_version = app.package_info().version.to_string();
+    let db = db.lock().map_err(|e| e.to_string())?;
+    data_management::export_human_archive(
+        &db.conn,
+        &path,
+        &app_version,
+        &workspace,
+        passphrase.as_deref(),
+    )
+    .map(Some)
+}
+
+#[tauri::command]
+async fn pick_backup_for_restore(
+    app: AppHandle,
+    passphrase: Option<String>,
+) -> Result<Option<data_management::ExportResult>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Gist backup", &["gistbackup", "age"])
+        .pick_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let selected = rx.await.map_err(|e| e.to_string())?;
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    let workspace = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    data_management::inspect_backup(&path, &workspace, passphrase.as_deref()).map(Some)
+}
+
+#[tauri::command]
+async fn restore_backup(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    path: String,
+    passphrase: Option<String>,
+) -> Result<data_management::RestoreResult, String> {
+    if audio::recorder::is_recording() {
+        return Err("Finish the current recording before restoring a backup.".into());
+    }
+    let source = PathBuf::from(path);
+    let workspace = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut db = db.lock().map_err(|e| e.to_string())?;
+    if has_unfinished_recording_jobs(&db.conn)? {
+        return Err(
+            "Process or discard all unfinished recording recoveries before restoring a backup."
+                .into(),
+        );
+    }
+    let result =
+        data_management::restore_backup(&mut db.conn, &source, &workspace, passphrase.as_deref())?;
+    if let Err(error) = cleanup_transient_audio(&app, &db.conn, None) {
+        log::warn!("Backup was restored, but transient audio cleanup could not finish: {error}");
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -2487,6 +3199,9 @@ fn recordings_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let directory = app_dir.join("recordings");
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| e.to_string())?;
     Ok(directory)
 }
 
@@ -2557,6 +3272,15 @@ fn get_recording_job_by_id(conn: &Connection, id: &str) -> Result<RecordingJob, 
         .map_err(|e| e.to_string())
 }
 
+fn has_unfinished_recording_jobs(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recording_jobs WHERE state != 'completed')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn repair_partial_wav(path: &Path) -> Result<(), String> {
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if metadata.len() < 44 {
@@ -2584,6 +3308,94 @@ fn repair_partial_wav(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn is_managed_recording_filename(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(remainder) = name.strip_prefix("recording_") else {
+        return false;
+    };
+    let id = remainder
+        .strip_suffix(".partial.wav")
+        .or_else(|| remainder.strip_suffix(".wav"));
+    id.is_some_and(|value| Uuid::parse_str(value).is_ok())
+}
+
+#[cfg(test)]
+mod transient_audio_tests {
+    use super::*;
+
+    #[test]
+    fn only_gist_recording_names_are_managed() {
+        assert!(is_managed_recording_filename(Path::new(
+            "recording_00000000-0000-4000-8000-000000000001.wav"
+        )));
+        assert!(is_managed_recording_filename(Path::new(
+            "recording_00000000-0000-4000-8000-000000000001.partial.wav"
+        )));
+        assert!(!is_managed_recording_filename(Path::new("recording.wav")));
+        assert!(!is_managed_recording_filename(Path::new(
+            "backup.gistbackup"
+        )));
+    }
+
+    #[test]
+    fn only_recovery_jobs_can_persist_audio_references() {
+        let mut conn = Connection::open_in_memory().expect("database");
+        migrate_database(&mut conn).expect("schema");
+        let patient_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::new_v4().to_string();
+        let other_session_id = Uuid::new_v4().to_string();
+        let job_id = Uuid::new_v4().to_string();
+        let path = format!("/tmp/recording_{job_id}.wav");
+        conn.execute(
+            "INSERT INTO patients (id, name, created_at, updated_at) VALUES (?1, 'Patient', ?2, ?2)",
+            params![patient_id, "2026-01-01T00:00:00Z"],
+        )
+        .expect("patient");
+        for id in [&session_id, &other_session_id] {
+            conn.execute(
+                "INSERT INTO sessions (id, patient_id, date, created_at, updated_at) VALUES (?1, ?2, '2026-01-01', ?3, ?3)",
+                params![id, patient_id, "2026-01-01T00:00:00Z"],
+            )
+            .expect("session");
+        }
+        conn.execute(
+            "INSERT INTO recording_jobs (
+                id, session_id, audio_file, input_kind, formats_json, llm_model,
+                thinking, diarize, num_speakers, created_session, state,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'session_transcript', '[]', 'model', 0, 1, 2, 0, 'recorded', ?4, ?4)",
+            params![job_id, session_id, path, "2026-01-01T00:00:00Z"],
+        )
+        .expect("recording job");
+
+        assert!(has_unfinished_recording_jobs(&conn).expect("unfinished recording check"));
+
+        assert_eq!(
+            retained_recording_reference(&conn, &session_id, Some(&path))
+                .expect("recording reference"),
+            Some(path.clone())
+        );
+        assert_eq!(
+            retained_recording_reference(&conn, &other_session_id, Some(&path))
+                .expect("other-session reference"),
+            None
+        );
+        assert_eq!(
+            retained_recording_reference(&conn, &session_id, Some("/tmp/upload.wav"))
+                .expect("uploaded reference"),
+            None
+        );
+        conn.execute(
+            "UPDATE recording_jobs SET state = 'completed' WHERE id = ?1",
+            params![job_id],
+        )
+        .expect("complete recording job");
+        assert!(!has_unfinished_recording_jobs(&conn).expect("completed recording check"));
+    }
+}
+
 fn managed_recording_path(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
     let root = recordings_dir(app)?
         .canonicalize()
@@ -2595,6 +3407,13 @@ fn managed_recording_path(app: &AppHandle, path: &str) -> Result<PathBuf, String
         return Err(
             "Refusing to operate on an audio file outside Gist's recordings folder.".into(),
         );
+    }
+    if !is_managed_recording_filename(&candidate) {
+        return Err("Refusing to operate on an unrecognized recording file.".into());
+    }
+    if std::fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err("Refusing to follow a symbolic link for a managed recording.".into());
     }
     Ok(candidate)
 }
@@ -2657,6 +3476,126 @@ fn remove_managed_audio_files(app: &AppHandle, paths: Vec<String>) -> Result<(),
     }
 }
 
+fn remove_orphaned_recordings(app: &AppHandle, conn: &Connection) -> Result<(), String> {
+    let directory = recordings_dir(app)?;
+    let mut stmt = conn
+        .prepare("SELECT audio_file FROM recording_jobs")
+        .map_err(|e| e.to_string())?;
+    let referenced = stmt
+        .query_map([], |row| Ok(PathBuf::from(row.get::<_, String>(0)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut failures = Vec::new();
+    for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if referenced.contains(&path)
+            || !is_managed_recording_filename(&path)
+            || (!file_type.is_file() && !file_type.is_symlink())
+        {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(&path) {
+            failures.push(format!("{} ({error})", path.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not remove orphaned transient recording(s): {}",
+            failures.join(", ")
+        ))
+    }
+}
+
+// Recovery age is measured from original creation, never extended by retries.
+// Audio remains transient and is excluded from every durable export; see
+// DATA_LIFECYCLE.md before changing this policy.
+const RECORDING_RECOVERY_TTL_DAYS: i64 = 7;
+
+fn cleanup_transient_audio(
+    app: &AppHandle,
+    conn: &Connection,
+    active_job_id: Option<&str>,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, audio_file, state, created_at, session_id, created_session FROM recording_jobs",
+        )
+        .map_err(|e| e.to_string())?;
+    let jobs = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)? != 0,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+
+    let cutoff = Utc::now() - Duration::days(RECORDING_RECOVERY_TTL_DAYS);
+    for (id, audio_file, state, created_at, session_id, created_session) in jobs {
+        if active_job_id == Some(id.as_str()) {
+            continue;
+        }
+        let expired = DateTime::parse_from_rfc3339(&created_at)
+            .map(|value| value.with_timezone(&Utc) < cutoff)
+            .unwrap_or(true);
+        if state != "completed" && !expired {
+            continue;
+        }
+        let managed_path = managed_recording_path(app, &audio_file).ok();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE session_inputs SET audio_file = NULL WHERE audio_file = ?1",
+            params![audio_file],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM recording_jobs WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        if created_session {
+            tx.execute(
+                "DELETE FROM sessions
+                 WHERE id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM session_inputs WHERE session_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM session_notes WHERE session_id = ?1)",
+                params![session_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        if let Some(path) = managed_path {
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    // Paths to user-uploaded audio were retained by older versions. They are
+    // not Gist-owned recovery material and must not remain in durable records.
+    conn.execute(
+        "UPDATE session_inputs
+         SET audio_file = NULL
+         WHERE audio_file IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM recording_jobs r WHERE r.audio_file = session_inputs.audio_file
+           )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    remove_orphaned_recordings(app, conn)
+}
+
 #[tauri::command]
 async fn list_recoverable_recording_jobs(
     app: AppHandle,
@@ -2664,6 +3603,7 @@ async fn list_recoverable_recording_jobs(
 ) -> Result<Vec<RecordingJob>, String> {
     let active_job_id = audio::recorder::get_recording_state().job_id;
     let db = db.lock().map_err(|e| e.to_string())?;
+    cleanup_transient_audio(&app, &db.conn, active_job_id.as_deref())?;
     let sql = format!(
         "SELECT {} FROM recording_jobs WHERE state IN ('recording', 'recorded', 'failed') ORDER BY created_at ASC",
         RECORDING_JOB_COLUMNS
@@ -2724,12 +3664,38 @@ async fn get_recording_job(
 }
 
 #[tauri::command]
-async fn complete_recording_job(db: State<'_, Mutex<Database>>, id: String) -> Result<(), String> {
+async fn complete_recording_job(
+    app: AppHandle,
+    db: State<'_, Mutex<Database>>,
+    id: String,
+) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
-    db.conn.execute(
+    let job = get_recording_job_by_id(&db.conn, &id)?;
+    let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE session_inputs SET audio_file = NULL WHERE audio_file = ?1",
+        params![job.audio_file],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
         "UPDATE recording_jobs SET state = 'completed', error = NULL, updated_at = ?1 WHERE id = ?2",
         params![Local::now().to_rfc3339(), id],
-    ).map_err(|e| e.to_string())?;
+    )
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    let path = managed_recording_path(&app, &job.audio_file)?;
+    if path.exists() {
+        if let Err(error) = std::fs::remove_file(&path) {
+            log::warn!(
+                "A completed transient recording will be cleaned up on next launch: {error}"
+            );
+            return Ok(());
+        }
+    }
+    db.conn
+        .execute("DELETE FROM recording_jobs WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2755,18 +3721,29 @@ async fn discard_recording_job(
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| e.to_string())?;
     let job = get_recording_job_by_id(&db.conn, &id)?;
-    let path = managed_recording_path(&app, &job.audio_file)?;
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-    }
-    db.conn
+    let managed_path = managed_recording_path(&app, &job.audio_file).ok();
+    let tx = db.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let deleted = tx
         .execute("DELETE FROM recording_jobs WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    if deleted != 1 {
+        return Err("The recording recovery record no longer exists.".into());
+    }
     if job.created_session {
-        db.conn.execute(
+        tx.execute(
             "DELETE FROM sessions WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM session_inputs WHERE session_id = ?1) AND NOT EXISTS (SELECT 1 FROM session_notes WHERE session_id = ?1)",
             params![job.session_id],
         ).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    if let Some(path) = managed_path {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "The recovery record was discarded, but its transient audio file could not be removed: {error}"
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -2849,10 +3826,26 @@ async fn stop_recording(
     let final_path = partial_path.with_file_name(format!("recording_{}.wav", result.job_id));
     std::fs::rename(&partial_path, &final_path).map_err(|e| e.to_string())?;
     let db = db.lock().map_err(|e| e.to_string())?;
-    db.conn.execute(
-        "UPDATE recording_jobs SET audio_file = ?1, state = 'recorded', error = NULL, updated_at = ?2 WHERE id = ?3",
-        params![final_path.to_string_lossy(), Local::now().to_rfc3339(), result.job_id],
-    ).map_err(|e| e.to_string())?;
+    let metadata_update = db
+        .conn
+        .execute(
+            "UPDATE recording_jobs SET audio_file = ?1, state = 'recorded', error = NULL, updated_at = ?2 WHERE id = ?3",
+            params![final_path.to_string_lossy(), Local::now().to_rfc3339(), result.job_id],
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|affected| {
+            (affected == 1)
+                .then_some(())
+                .ok_or_else(|| "The recording recovery record no longer exists.".to_string())
+        });
+    if let Err(error) = metadata_update {
+        if let Err(rollback_error) = std::fs::rename(&final_path, &partial_path) {
+            log::error!(
+                "Recording metadata update failed ({error}) and its file rename could not be rolled back ({rollback_error})"
+            );
+        }
+        return Err(error);
+    }
     let finalized = audio::recorder::StopRecordingResult {
         job_id: result.job_id,
         file_path: final_path.to_string_lossy().into_owned(),
@@ -2963,6 +3956,10 @@ pub fn run() {
             get_system_memory_bytes,
             pick_audio_file,
             export_session_diagnostics,
+            export_backup,
+            export_human_archive,
+            pick_backup_for_restore,
+            restore_backup,
             list_note_formats,
             create_note_format,
             update_note_format,

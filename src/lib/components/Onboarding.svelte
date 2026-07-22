@@ -272,7 +272,7 @@
       {:else if step === 2}
         <div class="onboarding-eyebrow">Privacy</div>
         <h1>Your data stays under your control</h1>
-        <p class="onboarding-lead">Recordings, transcripts, client records, and generated notes are stored and processed locally. Gist does not upload them or use them for training.</p>
+        <p class="onboarding-lead">Transcripts, client records, and generated notes are stored and processed locally. Gist deletes its own recordings after transcription, except for short-lived interrupted-recording recovery. Imported audio remains in its original location; Gist neither copies nor deletes it. Gist does not upload clinical data or use it for training.</p>
 
         <div class="local-flow" aria-label="Session material is processed locally into an editable note">
           <div class="local-flow-node">Session material</div>

@@ -1,5 +1,16 @@
 # Third-Party Notices
 
+## Backup and encryption libraries
+
+Gist uses the Rust implementations of
+[`age`](https://github.com/str4d/rage) (MIT or Apache-2.0),
+[`sha2`](https://github.com/RustCrypto/hashes) (MIT or Apache-2.0),
+[`tempfile`](https://github.com/Stebalien/tempfile) (MIT or Apache-2.0), and
+[`zip`](https://github.com/zip-rs/zip2) (MIT) to create, validate, encrypt, and
+stage data exports. Their source code and license texts are available from the
+linked upstream projects and the corresponding crates published on
+[crates.io](https://crates.io/).
+
 ## pyannote Community-1
 
 Gist can use the locally bundled `pyannote/speaker-diarization-community-1`
